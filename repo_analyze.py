@@ -69,10 +69,6 @@ def main():
     
     # Check AArch64 packages
     for basename, arm_data in arm_bases.items():
-        # Debug specific packages
-        if basename in ['linux-rpi-16k', 'linux-rpi']:
-            print(f"DEBUG: Processing {basename} from AArch64 {arm_data['repo']}")
-        
         if basename in x86_bases:
             x86_data = x86_bases[basename]
             
@@ -122,23 +118,6 @@ def main():
             if not is_provided:
                 # Package only in AArch64 and not provided by x86_64
                 arm_only.append(f"{basename}: {arm_data['version']} ({arm_data['repo']})")
-            else:
-                # Debug: show why package was not reported as AArch64-only
-                if basename in ['linux-rpi-16k', 'linux-rpi', 'raspberrypi-utils']:
-                    print(f"DEBUG: {basename} not reported as AArch64-only because:")
-                    for pkg_name, pkg_data in arm_packages.items():
-                        if pkg_data['basename'] == basename:
-                            if pkg_name in x86_packages:
-                                print(f"  - Package '{pkg_name}' exists in x86_64")
-                            elif pkg_name in x86_provides:
-                                print(f"  - Package '{pkg_name}' is provided by x86_64 package '{x86_provides[pkg_name]}'")
-                            for provide in pkg_data.get('provides', []):
-                                provide_name = provide.split('=')[0].split('<')[0].split('>')[0]
-                                if provide_name in x86_packages:
-                                    print(f"  - Provides '{provide_name}' exists as x86_64 package")
-                                elif provide_name in x86_provides:
-                                    print(f"  - Provides '{provide_name}' is provided by x86_64 package '{x86_provides[provide_name]}'")
-                            break
     
     # Output
     if repo_mismatches:

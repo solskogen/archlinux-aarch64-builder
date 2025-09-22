@@ -660,7 +660,13 @@ if __name__ == "__main__":
         # Track packages by basename to detect duplicates across repositories
         package_basenames = {}
         
-        for repo in ["core", "extra"]:
+        # Only parse the requested repository if --rebuild-repo is specified
+        if args.rebuild_repo:
+            repos_to_parse = [args.rebuild_repo]
+        else:
+            repos_to_parse = ["core", "extra"]
+        
+        for repo in repos_to_parse:
             packages = parse_state_repo(repo)
             
             # Check for basenames that exist in multiple repositories
@@ -686,9 +692,12 @@ if __name__ == "__main__":
                     'repo': 'extra'
                 }
     
-    # Always download ARM databases for comparison (unless using --packages)
-    if args.packages:
-        print("Skipping aarch64 database download (using --packages)")
+    # Always download ARM databases for comparison (unless using --packages or --rebuild-repo)
+    if args.packages or args.rebuild_repo:
+        if args.packages:
+            print("Skipping aarch64 database download (using --packages)")
+        else:
+            print("Skipping aarch64 database download (using --rebuild-repo)")
         arm_packages = {}
     else:
         print("Downloading aarch64 databases...")
@@ -755,8 +764,15 @@ if __name__ == "__main__":
     if args.rebuild_repo:
         print(f"Rebuilding all packages from {args.rebuild_repo} repository...")
         repo_packages = []
+        # Exclude core toolchain packages that are handled by bootstrap_toolchain.py
+        toolchain_packages = {'gcc', 'binutils', 'glibc'}
+        
         for pkg_name, pkg_data in x86_packages.items():
             if pkg_data['repo'] == args.rebuild_repo:
+                # Skip core toolchain packages
+                if pkg_data['basename'] in toolchain_packages:
+                    continue
+                    
                 # Skip blacklisted packages
                 blacklist_reason = None
                 if blacklist:
@@ -777,7 +793,7 @@ if __name__ == "__main__":
                         'depends': pkg_data['depends'],
                         'makedepends': pkg_data['makedepends'],
                         'provides': pkg_data['provides'],
-                        'force_latest': use_latest,
+                        'force_latest': args.use_latest,
                         'use_aur': False
                     })
         newer_packages = repo_packages
@@ -864,8 +880,8 @@ if __name__ == "__main__":
     
     print("Keeping downloaded database files...")
     
-    # Check if any critical bootstrap toolchain packages need updates
-    if sorted_packages:
+    # Check if any critical bootstrap toolchain packages need updates (skip for --rebuild-repo)
+    if sorted_packages and not args.rebuild_repo:
         critical_toolchain_packages = ['linux-api-headers', 'gcc', 'binutils']
         outdated_toolchain = []
         
