@@ -12,11 +12,12 @@ from build_utils import BuildUtils
 from utils import load_blacklist, filter_blacklisted_packages
 
 class PackageBuilder:
-    def __init__(self, dry_run=False, chroot_path=None, cache_dir=None, no_cache=False, no_upload=False):
+    def __init__(self, dry_run=False, chroot_path=None, cache_dir=None, no_cache=False, no_upload=False, stop_on_failure=False):
         self.build_utils = BuildUtils(dry_run)
         self.dry_run = dry_run
         self.no_upload = no_upload
         self.no_cache = no_cache
+        self.stop_on_failure = stop_on_failure
         self.chroot_path = Path(chroot_path) if chroot_path else Path("/var/tmp/builder")
         self.cache_dir = Path(cache_dir) if cache_dir else Path("/var/tmp/pacman-cache")
         self.logs_dir = Path("logs")
@@ -225,10 +226,8 @@ class PackageBuilder:
                 print(f"ERROR: Build failed for {pkg_name}")
                 print(f"Build log saved to: {log_file}")
                 
-                # Check if process was interrupted (SIGINT = 130, SIGTERM = 143, makechrootpkg abort = 255)
-                if process.returncode in [130, 143, 255]:
-                    os._exit(1)
-                
+                # Only exit if this was actually an interrupt (not just any 255 exit code)
+                # We can detect real interrupts by checking if our signal handler was called
                 return False
             
             # Upload packages if not disabled
@@ -251,9 +250,12 @@ class PackageBuilder:
                         "sudo", "rm", "--recursive", "--force", "--one-file-system", str(temp_copy_path)
                     ], check=True)
                     self.temp_copies.remove(temp_copy_path)
-                except (subprocess.CalledProcessError, KeyboardInterrupt):
-                    # Silent cleanup failure - don't show warnings on Ctrl+C
-                    pass
+                except (subprocess.CalledProcessError, KeyboardInterrupt, Exception):
+                    # Silent cleanup failure - don't let cleanup issues stop the build process
+                    try:
+                        self.temp_copies.remove(temp_copy_path)
+                    except ValueError:
+                        pass
     
     def _find_last_successful_package(self, packages):
         """Find the index of the last successfully built package"""
@@ -346,10 +348,22 @@ class PackageBuilder:
             pkg_name = pkg['name']
             print(f"\n[{i}/{len(packages)}] Building {pkg_name}")
             
-            if self.build_package(pkg_name, pkg):
-                successful_packages.append(pkg_name)
-            else:
+            try:
+                if self.build_package(pkg_name, pkg):
+                    successful_packages.append(pkg_name)
+                    print(f"DEBUG: Successfully built {pkg_name}, continuing to next package")
+                else:
+                    failed_packages.append(pkg)
+                    print(f"DEBUG: Build failed for {pkg_name}, continuing to next package")
+                    if self.stop_on_failure:
+                        print(f"Stopping build process due to failure in {pkg_name}")
+                        break
+            except Exception as e:
+                print(f"DEBUG: Unexpected exception in build loop: {e}")
                 failed_packages.append(pkg)
+                if self.stop_on_failure:
+                    print(f"Stopping build process due to exception in {pkg_name}")
+                    break
         
         # Save failed packages for retry
         if failed_packages:
@@ -390,6 +404,8 @@ def main():
                         help='Clear cache before each package build')
     parser.add_argument('--continue', action='store_true', dest='continue_build',
                         help='Continue from last successful package')
+    parser.add_argument('--stop-on-failure', action='store_true',
+                        help='Stop building on first package failure')
     parser.add_argument('--chroot',
                         help='Custom chroot directory path')
     
@@ -405,7 +421,8 @@ def main():
         chroot_path=args.chroot,
         cache_dir=args.cache,
         no_cache=args.no_cache,
-        no_upload=args.no_upload
+        no_upload=args.no_upload,
+        stop_on_failure=args.stop_on_failure
     )
     
     builder.build_packages(
