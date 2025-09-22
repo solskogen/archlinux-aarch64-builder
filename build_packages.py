@@ -116,6 +116,17 @@ class PackageBuilder:
             print(f"ERROR: PKGBUILD not found at {pkgbuild_path}")
             return False
         
+        # Import GPG keys if present
+        keys_dir = pkg_dir / "keys" / "pgp"
+        if keys_dir.exists():
+            print("Importing GPG keys...")
+            for key_file in keys_dir.glob("*.asc"):
+                try:
+                    subprocess.run(["gpg", "--import", str(key_file)], check=True)
+                    print(f"Imported GPG key: {key_file.name}")
+                except subprocess.CalledProcessError as e:
+                    print(f"Warning: Failed to import GPG key {key_file}: {e}")
+        
         # Clear cache if no-cache mode
         if self.no_cache:
             print("Clearing pacman cache...")
@@ -351,10 +362,8 @@ class PackageBuilder:
             try:
                 if self.build_package(pkg_name, pkg):
                     successful_packages.append(pkg_name)
-                    print(f"DEBUG: Successfully built {pkg_name}, continuing to next package")
                 else:
                     failed_packages.append(pkg)
-                    print(f"DEBUG: Build failed for {pkg_name}, continuing to next package")
                     if self.stop_on_failure:
                         print(f"Stopping build process due to failure in {pkg_name}")
                         break
