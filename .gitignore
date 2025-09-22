@@ -1,0 +1,7 @@
+*.json
+chroot-config/
+*.db
+logs/
+pkgbuilds/
+__pycache__/
+state/

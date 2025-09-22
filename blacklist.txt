@@ -1,0 +1,33 @@
+# Blacklisted packages - one per line
+# Lines starting with # are ignored
+
+# Packages that need more help
+pacman
+
+# Problematic packages that fail to build
+vi
+libassuan
+haskell-*
+ghc
+389-ds-base
+go-swagger
+deno
+intel-compute-runtime
+telegram-desktop
+forgejo
+
+# Architecture-specific packages
+grub
+linux
+
+# Packages we don't support (yet)
+linux-lts
+
+# Packages that don't make sense on aarch64
+syslinux
+aarch64*
+crash
+
+# Note: Bootstrap toolchain packages (gcc, binutils, glibc, etc.) are 
+# automatically excluded from normal builds but can still be detected
+# for bootstrap warnings. Use --bootstrap-toolchain to build them.
