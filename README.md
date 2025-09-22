@@ -36,7 +36,6 @@ This automated build system maintains an AArch64 port of Arch Linux by continuou
 - **Clean Chroot Builds**: Uses `makechrootpkg` with isolated build environments
 - **Cross-Architecture**: Builds x86_64 packages on AArch64 using `--ignorearch`
 - **Test Dependencies**: Automatically handles `checkdepends` using temporary chroot copies when `!check` is used
-- **Parallel Compilation**: Configured for maximum performance with `MAKEFLAGS="-j32"`
 - **Dependency Management**: Builds packages in topological dependency order
 - **S3 Integration**: Uploads built packages to hosted staging repository
 - **Configurable Cache**: Custom pacman cache directory for build optimization
