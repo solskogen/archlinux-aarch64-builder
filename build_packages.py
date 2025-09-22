@@ -6,6 +6,7 @@ import os
 import subprocess
 import signal
 import argparse
+import time
 from pathlib import Path
 from build_utils import BuildUtils
 from utils import load_blacklist, filter_blacklisted_packages
@@ -20,16 +21,6 @@ class PackageBuilder:
         self.cache_dir = Path(cache_dir) if cache_dir else Path("/var/tmp/pacman-cache")
         self.logs_dir = Path("logs")
         self.temp_copies = []
-        
-        # Set up signal handlers for cleanup
-        signal.signal(signal.SIGINT, self._signal_handler)
-        signal.signal(signal.SIGTERM, self._signal_handler)
-    
-    def _signal_handler(self, signum, frame):
-        """Clean up temporary chroot copies on interruption"""
-        print(f"\nReceived signal {signum}, cleaning up...")
-        self._cleanup_temp_copies()
-        sys.exit(1)
     
     def _cleanup_temp_copies(self):
         """Clean up any temporary chroot copies"""
@@ -96,6 +87,13 @@ class PackageBuilder:
         print(f"Building {pkg_name}")
         print(f"{'='*60}")
         
+        # Check that root chroot exists
+        root_chroot = self.chroot_path / "root"
+        if not root_chroot.exists():
+            print(f"ERROR: Root chroot {root_chroot} does not exist")
+            print("Run setup_chroot() first or create with mkarchroot")
+            return False
+        
         pkg_dir = Path("pkgbuilds") / pkg_name
         if not pkg_dir.exists():
             print(f"ERROR: Package directory {pkg_dir} not found")
@@ -114,73 +112,79 @@ class PackageBuilder:
                     "sudo", "rm", "-rf", str(self.cache_dir / "*")
                 ])
         
+        # Set SOURCE_DATE_EPOCH for reproducible builds
+        env = os.environ.copy()
+        env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
+        
+        # Parse PKGBUILD for makedepends
+        makedepends = []
+        with open(pkgbuild_path, 'r') as f:
+            pkgbuild_content = f.read()
+            
+            # Extract makedepends - handle single line and multi-line arrays
+            lines = pkgbuild_content.split('\n')
+            in_makedepends = False
+            
+            for line in lines:
+                line = line.strip()
+                
+                if line.startswith('makedepends=('):
+                    # Single line: makedepends=('pkg1' 'pkg2' "pkg3")
+                    if line.endswith(')'):
+                        # Complete on one line
+                        deps_str = line[len('makedepends=('):-1]
+                        makedepends.extend(self._parse_package_list(deps_str))
+                    else:
+                        # Multi-line array starts
+                        in_makedepends = True
+                        deps_str = line[len('makedepends=('):]
+                        makedepends.extend(self._parse_package_list(deps_str))
+                elif in_makedepends:
+                    if line.endswith(')'):
+                        # Multi-line array ends
+                        deps_str = line[:-1]
+                        makedepends.extend(self._parse_package_list(deps_str))
+                        in_makedepends = False
+                    else:
+                        # Continue multi-line array
+                        makedepends.extend(self._parse_package_list(line))
+        
+        # Create unique temporary chroot name
+        import random
+        temp_id = random.randint(1000000, 9999999)
+        temp_copy_name = f"temp-{pkg_name}-{temp_id}"
+        temp_copy_path = self.chroot_path / temp_copy_name
+        self.temp_copies.append(temp_copy_path)
+        
         try:
-            # Set SOURCE_DATE_EPOCH for reproducible builds
-            env = os.environ.copy()
-            env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
+            # Rsync root chroot to temporary chroot
+            print(f"Creating temporary chroot: {temp_copy_name}")
+            subprocess.run([
+                "sudo", "rsync", "-a", "--delete", "-q", "-W", "-x", 
+                f"{root_chroot}/", str(temp_copy_path) + "/"
+            ], check=True)
             
-            # Check if package has checkdepends and uses !check
-            checkdepends = []
-            uses_nocheck = False
+            # Install makedepends if any
+            if makedepends:
+                print(f"Installing makedepends: {' '.join(makedepends)}")
+                subprocess.run([
+                    "arch-nspawn", str(temp_copy_path),
+                    "pacman", "-S", "--noconfirm"
+                ] + makedepends, check=True, env=env)
             
-            with open(pkgbuild_path, 'r') as f:
-                pkgbuild_content = f.read()
-                if 'checkdepends=' in pkgbuild_content:
-                    # Extract checkdepends (simplified parsing)
-                    for line in pkgbuild_content.split('\n'):
-                        if line.strip().startswith('checkdepends='):
-                            # Simple extraction - would need proper bash parsing for complex cases
-                            pass
-                if '!check' in pkgbuild_content:
-                    uses_nocheck = True
-            
-            # Build command
+            # Build with temporary chroot
             cmd = [
-                "makechrootpkg", "-c", "-u", "-r", str(self.chroot_path),
+                "makechrootpkg", "-l", temp_copy_name, "-r", str(self.chroot_path),
                 "--", "--ignorearch"
             ]
             
-            # Handle checkdepends if needed
-            temp_copy_path = None
-            if checkdepends and uses_nocheck:
-                # Create temporary chroot copy
-                temp_copy_name = f"temp-{pkg_name}"
-                temp_copy_path = self.chroot_path / temp_copy_name
-                self.temp_copies.append(temp_copy_path)
-                
-                print(f"Creating temporary chroot copy: {temp_copy_name}")
-                # Use rsync with sudo like makechrootpkg does for non-btrfs
-                subprocess.run([
-                    "sudo", "rsync", "-a", "--delete", "-q", "-W", "-x", 
-                    f"{self.chroot_path}/root/", str(temp_copy_path)
-                ], check=True)
-                
-                # Always update chroot packages first
-                print("Updating chroot packages...")
-                subprocess.run([
-                    "arch-nspawn", str(temp_copy_path),
-                    "pacman", "-Syu", "--noconfirm"
-                ], check=True, env=env)
-                
-                # Install checkdepends
-                if checkdepends:
-                    print(f"Installing checkdepends: {' '.join(checkdepends)}")
-                    subprocess.run([
-                        "arch-nspawn", str(temp_copy_path),
-                        "pacman", "-S", "--noconfirm"
-                    ] + checkdepends, check=True, env=env)
-                
-                # Use temporary copy
-                cmd = [
-                    "makechrootpkg", "-l", temp_copy_name, "-r", str(self.chroot_path),
-                    "--", "--ignorearch"
-                ]
-            
             # Execute build
             print(f"Running: {' '.join(cmd)}")
-            process = subprocess.run(
-                cmd, cwd=pkg_dir, env=env
-            )
+            process = subprocess.run(cmd, cwd=pkg_dir, env=env, check=False)
+            
+            # Check if process was interrupted (SIGINT = 130, SIGTERM = 143, makechrootpkg abort = 255)
+            if process.returncode in [130, 143, 255]:
+                sys.exit(1)
             
             if process.returncode != 0:
                 # Write build log on failure
@@ -199,25 +203,6 @@ class PackageBuilder:
                 print(f"Build log saved to: {log_file}")
                 return False
             
-            # Clean up temporary chroot copy
-            if temp_copy_path and temp_copy_path in self.temp_copies:
-                try:
-                    # Check if we have sudo access before attempting cleanup
-                    result = subprocess.run([
-                        "sudo", "-n", "test", "-d", str(temp_copy_path)
-                    ], capture_output=True)
-                    
-                    if result.returncode == 0:
-                        # Use rm with sudo and --one-file-system like makechrootpkg does
-                        subprocess.run([
-                            "sudo", "rm", "--recursive", "--force", "--one-file-system", str(temp_copy_path)
-                        ], check=True)
-                        print(f"Cleaned up temporary chroot: {temp_copy_path}")
-                    
-                    self.temp_copies.remove(temp_copy_path)
-                except subprocess.CalledProcessError as e:
-                    print(f"Warning: Failed to clean up temporary chroot {temp_copy_path}: {e}")
-            
             # Upload packages if not disabled
             if not self.no_upload:
                 target_repo = f"{pkg_data.get('repo', 'extra')}-testing"
@@ -228,19 +213,56 @@ class PackageBuilder:
             return True
             
         except subprocess.CalledProcessError as e:
-            # Write build log on failure
-            self.logs_dir.mkdir(exist_ok=True)
-            timestamp = subprocess.run(['date', '+%Y%m%d-%H%M%S'], capture_output=True, text=True).stdout.strip()
-            log_file = self.logs_dir / f"{pkg_name}-{timestamp}-build.log"
-            self.build_utils.cleanup_old_logs(pkg_name)
-            
-            with open(log_file, 'w') as f:
-                f.write(f"Build failed for {pkg_name}\n")
-                f.write(f"Exception: {e}\n")
-            
-            print(f"ERROR: Build failed for {pkg_name}: {e}")
-            print(f"Build log saved to: {log_file}")
+            print(f"ERROR: Failed to prepare build environment: {e}")
             return False
+        finally:
+            # Clean up temporary chroot copy
+            if temp_copy_path in self.temp_copies:
+                try:
+                    subprocess.run([
+                        "sudo", "rm", "--recursive", "--force", "--one-file-system", str(temp_copy_path)
+                    ], check=True)
+                    print(f"Cleaned up temporary chroot: {temp_copy_path}")
+                    self.temp_copies.remove(temp_copy_path)
+                except subprocess.CalledProcessError as e:
+                    print(f"Warning: Failed to clean up temporary chroot {temp_copy_path}: {e}")
+    
+    def _find_last_successful_package(self, packages):
+        """Find the index of the last successfully built package"""
+        if not self.logs_dir.exists():
+            return None
+        
+        # Look for successful builds by checking for built packages in pkgbuilds directories
+        for i in reversed(range(len(packages))):
+            pkg_name = packages[i]['name']
+            pkg_dir = Path("pkgbuilds") / pkg_name
+            
+            # Check if package was built (has .pkg.tar.* files)
+            if pkg_dir.exists():
+                built_packages = list(pkg_dir.glob("*.pkg.tar.*"))
+                if built_packages:
+                    # Check if any built packages are newer than PKGBUILD (indicating recent build)
+                    pkgbuild_path = pkg_dir / "PKGBUILD"
+                    if pkgbuild_path.exists():
+                        pkgbuild_mtime = pkgbuild_path.stat().st_mtime
+                        for pkg_file in built_packages:
+                            if pkg_file.stat().st_mtime > pkgbuild_mtime:
+                                return i
+        
+        return None
+    
+    def _parse_package_list(self, deps_str):
+        """Parse package list handling single quotes, double quotes, and no quotes"""
+        if not deps_str.strip():
+            return []
+        
+        packages = []
+        # Split by whitespace and clean up quotes
+        for pkg in deps_str.split():
+            pkg = pkg.strip().strip('\'"')
+            if pkg:
+                packages.append(pkg)
+        return packages
     
     def build_packages(self, packages_file, blacklist_file=None, continue_build=False):
         """Build all packages from JSON file"""
@@ -271,8 +293,16 @@ class PackageBuilder:
         # Handle continue mode
         start_index = 0
         if continue_build:
-            # Find last successful package (simplified - would need proper state tracking)
-            print("Continue mode not fully implemented - starting from beginning")
+            # Look for last successful package in build logs
+            last_successful = self._find_last_successful_package(packages)
+            if last_successful is not None:
+                start_index = last_successful + 1
+                if start_index >= len(packages):
+                    print("All packages already built successfully")
+                    return
+                print(f"Continuing from package {start_index + 1}: {packages[start_index]['name']}")
+            else:
+                print("No previous successful builds found, starting from beginning")
         
         print(f"Building {len(packages)} packages...")
         
@@ -350,16 +380,11 @@ def main():
         no_upload=args.no_upload
     )
     
-    try:
-        builder.build_packages(
-            args.json,
-            args.blacklist,
-            args.continue_build
-        )
-    except KeyboardInterrupt:
-        print("\nBuild interrupted by user")
-        builder._cleanup_temp_copies()
-        sys.exit(1)
+    builder.build_packages(
+        args.json,
+        args.blacklist,
+        args.continue_build
+    )
 
 if __name__ == "__main__":
     main()
