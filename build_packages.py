@@ -179,8 +179,7 @@ class PackageBuilder:
             # Execute build
             print(f"Running: {' '.join(cmd)}")
             process = subprocess.run(
-                cmd, cwd=pkg_dir, env=env, 
-                capture_output=True, text=True
+                cmd, cwd=pkg_dir, env=env
             )
             
             if process.returncode != 0:
@@ -194,10 +193,7 @@ class PackageBuilder:
                     f.write(f"Build failed for {pkg_name}\n")
                     f.write(f"Command: {' '.join(cmd)}\n")
                     f.write(f"Return code: {process.returncode}\n\n")
-                    f.write("STDOUT:\n")
-                    f.write(process.stdout)
-                    f.write("\nSTDERR:\n")
-                    f.write(process.stderr)
+                    f.write("Output was streamed to console during build\n")
                 
                 print(f"ERROR: Build failed for {pkg_name}")
                 print(f"Build log saved to: {log_file}")
