@@ -53,8 +53,11 @@ class PackageBuilder:
         """Set up or update the build chroot"""
         if not self.chroot_path.exists():
             print(f"Creating chroot at {self.chroot_path}")
+            self.chroot_path.mkdir(parents=True, exist_ok=True)
             self.build_utils.run_command([
                 "sudo", "mkarchroot", 
+                "-C", "chroot-config/pacman.conf",
+                "-M", "chroot-config/makepkg.conf",
                 str(self.chroot_path / "root"),
                 "base-devel"
             ])
