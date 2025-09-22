@@ -375,17 +375,18 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
             if missing_packages_mode and is_missing:
                 blacklisted_missing.append(basename)
             skipped_packages.append(f"{basename} ({blacklist_reason})")
-            # Still add to output but mark as skipped - ensure all required fields are present
-            newer_in_x86.append({
-                'name': basename,
-                'force_latest': use_latest,
-                'use_aur': use_aur,
-                'skip': 1,
-                'depends': x86_data.get('depends', []),
-                'makedepends': x86_data.get('makedepends', []),
-                'provides': x86_data.get('provides', []),
-                **x86_data
-            })
+            # Only add blacklisted packages to output if explicitly requested
+            if force_packages and basename in force_packages:
+                newer_in_x86.append({
+                    'name': basename,
+                    'force_latest': use_latest,
+                    'use_aur': use_aur,
+                    'skip': 1,
+                    'depends': x86_data.get('depends', []),
+                    'makedepends': x86_data.get('makedepends', []),
+                    'provides': x86_data.get('provides', []),
+                    **x86_data
+                })
             continue
         
         # Skip bootstrap-only packages unless explicitly forced
@@ -849,7 +850,13 @@ if __name__ == "__main__":
             print(f"\nBuild Statistics:")
             print(f"Total packages to build: {len(buildable_packages)}")
             if len(sorted_packages) > len(buildable_packages):
-                print(f"Blacklisted packages (included in JSON): {len(sorted_packages) - len(buildable_packages)}")
+                blacklisted_requested = len(sorted_packages) - len(buildable_packages)
+                print(f"Skipped {blacklisted_requested} blacklisted packages marked for upgrade:")
+                for pkg in sorted_packages:
+                    if pkg.get('skip', 0) == 1:
+                        print(f"  - {pkg['name']} ({pkg.get('blacklist_reason', 'blacklisted')})")
+            if skipped_packages:
+                print(f"Skipped {len(skipped_packages)} total blacklisted packages")
             print(f"Total build stages: {max_stage + 1}")
             print(f"Packages per stage:")
             for stage in sorted(stage_counts.keys()):

@@ -21,6 +21,17 @@ class PackageBuilder:
         self.cache_dir = Path(cache_dir) if cache_dir else Path("/var/tmp/pacman-cache")
         self.logs_dir = Path("logs")
         self.temp_copies = []
+        self.current_process = None
+        
+        # Set up signal handler for immediate exit
+        signal.signal(signal.SIGINT, self._signal_handler)
+    
+    def _signal_handler(self, signum, frame):
+        """Immediate exit on Ctrl+C"""
+        if self.current_process:
+            self.current_process.terminate()
+            self.current_process.kill()
+        os._exit(1)
     
     def _cleanup_temp_copies(self):
         """Clean up any temporary chroot copies"""
@@ -108,46 +119,49 @@ class PackageBuilder:
         if self.no_cache:
             print("Clearing pacman cache...")
             if self.cache_dir.exists():
-                self.build_utils.run_command([
-                    "sudo", "rm", "-rf", str(self.cache_dir / "*")
-                ])
+                import shutil
+                for item in self.cache_dir.iterdir():
+                    if item.is_file():
+                        item.unlink()
+                    elif item.is_dir():
+                        shutil.rmtree(item)
         
         # Set SOURCE_DATE_EPOCH for reproducible builds
         env = os.environ.copy()
         env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
         
-        # Parse PKGBUILD for makedepends
-        makedepends = []
+        # Parse PKGBUILD for checkdepends
+        checkdepends = []
         with open(pkgbuild_path, 'r') as f:
             pkgbuild_content = f.read()
             
-            # Extract makedepends - handle single line and multi-line arrays
+            # Extract checkdepends - handle single line and multi-line arrays
             lines = pkgbuild_content.split('\n')
-            in_makedepends = False
+            in_checkdepends = False
             
             for line in lines:
                 line = line.strip()
                 
-                if line.startswith('makedepends=('):
-                    # Single line: makedepends=('pkg1' 'pkg2' "pkg3")
+                if line.startswith('checkdepends=('):
+                    # Single line: checkdepends=('pkg1' 'pkg2' "pkg3")
                     if line.endswith(')'):
                         # Complete on one line
-                        deps_str = line[len('makedepends=('):-1]
-                        makedepends.extend(self._parse_package_list(deps_str))
+                        deps_str = line[len('checkdepends=('):-1]
+                        checkdepends.extend(self._parse_package_list(deps_str))
                     else:
                         # Multi-line array starts
-                        in_makedepends = True
-                        deps_str = line[len('makedepends=('):]
-                        makedepends.extend(self._parse_package_list(deps_str))
-                elif in_makedepends:
+                        in_checkdepends = True
+                        deps_str = line[len('checkdepends=('):]
+                        checkdepends.extend(self._parse_package_list(deps_str))
+                elif in_checkdepends:
                     if line.endswith(')'):
                         # Multi-line array ends
                         deps_str = line[:-1]
-                        makedepends.extend(self._parse_package_list(deps_str))
-                        in_makedepends = False
+                        checkdepends.extend(self._parse_package_list(deps_str))
+                        in_checkdepends = False
                     else:
                         # Continue multi-line array
-                        makedepends.extend(self._parse_package_list(line))
+                        checkdepends.extend(self._parse_package_list(line))
         
         # Create unique temporary chroot name
         import random
@@ -159,18 +173,24 @@ class PackageBuilder:
         try:
             # Rsync root chroot to temporary chroot
             print(f"Creating temporary chroot: {temp_copy_name}")
-            subprocess.run([
-                "sudo", "rsync", "-a", "--delete", "-q", "-W", "-x", 
-                f"{root_chroot}/", str(temp_copy_path) + "/"
-            ], check=True)
-            
-            # Install makedepends if any
-            if makedepends:
-                print(f"Installing makedepends: {' '.join(makedepends)}")
+            try:
                 subprocess.run([
-                    "arch-nspawn", str(temp_copy_path),
-                    "pacman", "-S", "--noconfirm"
-                ] + makedepends, check=True, env=env)
+                    "sudo", "rsync", "-a", "--delete", "-q", "-W", "-x", 
+                    f"{root_chroot}/", str(temp_copy_path) + "/"
+                ], check=True)
+            except KeyboardInterrupt:
+                sys.exit(1)
+            
+            # Install checkdepends if any
+            if checkdepends:
+                print(f"Installing checkdepends: {' '.join(checkdepends)}")
+                try:
+                    subprocess.run([
+                        "arch-nspawn", str(temp_copy_path),
+                        "pacman", "-S", "--noconfirm"
+                    ] + checkdepends, check=True, env=env)
+                except KeyboardInterrupt:
+                    sys.exit(1)
             
             # Build with temporary chroot
             cmd = [
@@ -180,11 +200,14 @@ class PackageBuilder:
             
             # Execute build
             print(f"Running: {' '.join(cmd)}")
-            process = subprocess.run(cmd, cwd=pkg_dir, env=env, check=False)
+            self.current_process = subprocess.Popen(cmd, cwd=pkg_dir, env=env, preexec_fn=os.setpgrp)
             
-            # Check if process was interrupted (SIGINT = 130, SIGTERM = 143, makechrootpkg abort = 255)
-            if process.returncode in [130, 143, 255]:
-                sys.exit(1)
+            # Poll process to allow signal handling
+            while self.current_process.poll() is None:
+                time.sleep(0.1)
+            
+            process = self.current_process
+            self.current_process = None
             
             if process.returncode != 0:
                 # Write build log on failure
@@ -201,6 +224,11 @@ class PackageBuilder:
                 
                 print(f"ERROR: Build failed for {pkg_name}")
                 print(f"Build log saved to: {log_file}")
+                
+                # Check if process was interrupted (SIGINT = 130, SIGTERM = 143, makechrootpkg abort = 255)
+                if process.returncode in [130, 143, 255]:
+                    os._exit(1)
+                
                 return False
             
             # Upload packages if not disabled
@@ -222,10 +250,10 @@ class PackageBuilder:
                     subprocess.run([
                         "sudo", "rm", "--recursive", "--force", "--one-file-system", str(temp_copy_path)
                     ], check=True)
-                    print(f"Cleaned up temporary chroot: {temp_copy_path}")
                     self.temp_copies.remove(temp_copy_path)
-                except subprocess.CalledProcessError as e:
-                    print(f"Warning: Failed to clean up temporary chroot {temp_copy_path}: {e}")
+                except (subprocess.CalledProcessError, KeyboardInterrupt):
+                    # Silent cleanup failure - don't show warnings on Ctrl+C
+                    pass
     
     def _find_last_successful_package(self, packages):
         """Find the index of the last successfully built package"""
