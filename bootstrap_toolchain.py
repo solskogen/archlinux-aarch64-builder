@@ -13,13 +13,10 @@ import shutil
 import argparse
 import signal
 from pathlib import Path
-from build_utils import BuildUtils
+from build_utils import BuildUtils, BUILD_ROOT, CACHE_PATH
 
 class BootstrapBuilder(BuildUtils):
     """Bootstrap toolchain package builder"""
-    
-    DEFAULT_CHROOT_PATH = "/var/tmp/builder"
-    DEFAULT_CACHE_PATH = "/var/tmp/pacman-cache"
     
     # Toolchain packages in build order (some repeated for multi-pass builds)
     TOOLCHAIN_PACKAGES = [
@@ -30,7 +27,7 @@ class BootstrapBuilder(BuildUtils):
     
     REQUIRED_TOOLS = ['makechrootpkg', 'pkgctl', 'repo-upload', 'arch-nspawn']
     
-    def __init__(self, chroot_path=DEFAULT_CHROOT_PATH, cache_path=DEFAULT_CACHE_PATH, dry_run=False):
+    def __init__(self, chroot_path=BUILD_ROOT, cache_path=CACHE_PATH, dry_run=False):
         super().__init__(dry_run)
         self.chroot_path = Path(chroot_path)
         self.cache_path = Path(cache_path)
@@ -139,6 +136,7 @@ class BootstrapBuilder(BuildUtils):
             process = subprocess.Popen([
                 "makechrootpkg",
                 "-r", str(self.chroot_path),
+                "-d", str(self.cache_path),  # Use custom cache directory
                 "-c",  # Clean chroot
                 "-u",  # Update chroot before building
                 "--", "--ignorearch",
@@ -339,10 +337,10 @@ class BootstrapBuilder(BuildUtils):
 
 def main():
     parser = argparse.ArgumentParser(description='Bootstrap build toolchain packages')
-    parser.add_argument('--chroot', default=BootstrapBuilder.DEFAULT_CHROOT_PATH,
-                       help=f'Chroot path (default: {BootstrapBuilder.DEFAULT_CHROOT_PATH})')
-    parser.add_argument('--cache', default=BootstrapBuilder.DEFAULT_CACHE_PATH,
-                       help=f'Pacman cache directory (default: {BootstrapBuilder.DEFAULT_CACHE_PATH})')
+    parser.add_argument('--chroot', default=BUILD_ROOT,
+                       help=f'Chroot path (default: {BUILD_ROOT})')
+    parser.add_argument('--cache', default=CACHE_PATH,
+                       help=f'Pacman cache directory (default: {CACHE_PATH})')
     parser.add_argument('--dry-run', action='store_true',
                        help='Show what would be done without actually building')
     

@@ -8,7 +8,7 @@ import signal
 import argparse
 import time
 from pathlib import Path
-from build_utils import BuildUtils
+from build_utils import BuildUtils, BUILD_ROOT, CACHE_PATH
 from utils import load_blacklist, filter_blacklisted_packages
 
 class PackageBuilder:
@@ -18,8 +18,8 @@ class PackageBuilder:
         self.no_upload = no_upload
         self.no_cache = no_cache
         self.stop_on_failure = stop_on_failure
-        self.chroot_path = Path(chroot_path) if chroot_path else Path("/var/tmp/builder")
-        self.cache_dir = Path(cache_dir) if cache_dir else Path("/var/tmp/pacman-cache")
+        self.chroot_path = Path(chroot_path) if chroot_path else Path(BUILD_ROOT)
+        self.cache_dir = Path(cache_dir) if cache_dir else Path(CACHE_PATH)
         self.logs_dir = Path("logs")
         self.temp_copies = []
         self.current_process = None
@@ -61,6 +61,7 @@ class PackageBuilder:
                 "sudo", "mkarchroot", 
                 "-C", "chroot-config/pacman.conf",
                 "-M", "chroot-config/makepkg.conf",
+                "-c", str(self.cache_dir),
                 str(self.chroot_path / "root"),
                 "base-devel"
             ])
@@ -276,6 +277,13 @@ class PackageBuilder:
                         self.temp_copies.remove(temp_copy_path)
                     except ValueError:
                         pass
+            
+            # Clean up lock files created during this build
+            for lock_file in self.chroot_path.glob("*.lock"):
+                try:
+                    lock_file.unlink()
+                except Exception:
+                    pass
     
     def _find_last_successful_package(self, packages):
         """Find the index of the last successfully built package"""

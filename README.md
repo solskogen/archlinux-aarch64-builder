@@ -348,7 +348,7 @@ git clone <special-glibc-repo> pkgbuilds/glibc
 The `build_packages.py` script:
 
 - Uses existing chroot environment or creates new one if needed
-- Configures custom pacman cache directory (default: `/var/tmp/pacman-cache`)
+- Configures custom pacman cache directory (default: `/var/tmp/builder/pacman-cache`)
 - For packages with checkdepends (when `!check` is used in PKGBUILD):
   - Creates temporary chroot copy using `sudo rsync`
   - Installs checkdepends with `sudo arch-nspawn` and `pacman -Syy`
@@ -534,11 +534,11 @@ which makechrootpkg pkgctl git rsync
 
 **Chroot Issues**
 ```bash
-# Remove corrupted chroot:
+# Remove entire build environment:
 sudo rm -rf /var/tmp/builder
 
-# Clear cache:
-sudo rm -rf /var/tmp/pacman-cache/*
+# Or just clear cache:
+sudo rm -rf /var/tmp/builder/pacman-cache/*
 ```
 
 **GPG Key Issues**
@@ -785,7 +785,7 @@ git clone <special-glibc-repo> pkgbuilds/glibc
 The `build_packages.py` script:
 
 - Uses existing chroot environment or creates new one if needed
-- Configures custom pacman cache directory (default: `/var/tmp/pacman-cache`)
+- Configures custom pacman cache directory (default: `/var/tmp/builder/pacman-cache`)
 - For packages with checkdepends (when `!check` is used in PKGBUILD):
   - Creates temporary chroot copy using `sudo rsync`
   - Installs checkdepends with `sudo arch-nspawn` and `pacman -Syy`
@@ -969,11 +969,11 @@ which makechrootpkg pkgctl git rsync
 
 **Chroot Issues**
 ```bash
-# Remove corrupted chroot:
+# Remove entire build environment:
 sudo rm -rf /var/tmp/builder
 
-# Clear cache:
-sudo rm -rf /var/tmp/pacman-cache/*
+# Or just clear cache:
+sudo rm -rf /var/tmp/builder/pacman-cache/*
 ```
 
 **GPG Key Issues**

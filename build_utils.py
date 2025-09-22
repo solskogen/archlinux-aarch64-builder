@@ -6,6 +6,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+# Default build paths
+BUILD_ROOT = "/var/tmp/builder"
+CACHE_PATH = f"{BUILD_ROOT}/pacman-cache"
+
 class BuildUtils:
     """Shared utilities for package builders"""
     
