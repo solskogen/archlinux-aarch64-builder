@@ -64,6 +64,14 @@ class PackageBuilder:
                 str(self.chroot_path / "root"),
                 "base-devel"
             ])
+        else:
+            # Clean up stale lock files
+            for lock_file in self.chroot_path.glob("*.lock"):
+                try:
+                    lock_file.unlink()
+                    print(f"Removed stale lock file: {lock_file}")
+                except Exception:
+                    pass
         
         # Ensure cache directory exists
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -248,6 +256,7 @@ class PackageBuilder:
                 print(f"Successfully uploaded {uploaded_count} packages to {target_repo}")
             
             print(f"Successfully built {pkg_name}")
+            self._update_last_successful(pkg_name)
             return True
             
         except subprocess.CalledProcessError as e:
@@ -270,27 +279,26 @@ class PackageBuilder:
     
     def _find_last_successful_package(self, packages):
         """Find the index of the last successfully built package"""
-        if not self.logs_dir.exists():
+        state_file = Path("last_successful.txt")
+        if not state_file.exists():
             return None
         
-        # Look for successful builds by checking for built packages in pkgbuilds directories
-        for i in reversed(range(len(packages))):
-            pkg_name = packages[i]['name']
-            pkg_dir = Path("pkgbuilds") / pkg_name
-            
-            # Check if package was built (has .pkg.tar.* files)
-            if pkg_dir.exists():
-                built_packages = list(pkg_dir.glob("*.pkg.tar.*"))
-                if built_packages:
-                    # Check if any built packages are newer than PKGBUILD (indicating recent build)
-                    pkgbuild_path = pkg_dir / "PKGBUILD"
-                    if pkgbuild_path.exists():
-                        pkgbuild_mtime = pkgbuild_path.stat().st_mtime
-                        for pkg_file in built_packages:
-                            if pkg_file.stat().st_mtime > pkgbuild_mtime:
-                                return i
+        try:
+            last_pkg_name = state_file.read_text().strip()
+            for i, pkg in enumerate(packages):
+                if pkg['name'] == last_pkg_name:
+                    return i
+        except Exception:
+            pass
         
         return None
+    
+    def _update_last_successful(self, pkg_name):
+        """Update the last successful package state file"""
+        try:
+            Path("last_successful.txt").write_text(pkg_name)
+        except Exception:
+            pass
     
     def _parse_package_list(self, deps_str):
         """Parse package list handling single quotes, double quotes, and no quotes"""
