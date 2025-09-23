@@ -106,33 +106,111 @@ def parse_pkgbuild_deps(pkgbuild_path):
         
         # Parse dependency arrays more robustly
         for dep_type in ['depends', 'makedepends', 'checkdepends', 'provides']:
-            # Match array declarations including multi-line - use word boundaries to avoid partial matches
-            pattern = rf'\b{dep_type}=\s*\((.*?)\)'
-            matches = re.findall(pattern, content, re.MULTILINE | re.DOTALL)
-            if matches:
-                # Extract items from the array, handling quotes and comments
-                array_content = matches[-1]  # Use last match
-                # Find all non-empty lines, ignoring comments
-                items = []
-                for line in array_content.split('\n'):
-                    line = line.strip()
-                    # Skip empty lines and comments
-                    if not line or line.startswith('#'):
-                        continue
-                    # Remove inline comments
-                    line = re.sub(r'#.*$', '', line).strip()
-                    if line:
-                        # Remove quotes if present
-                        line = line.strip('\'"')
-                        if line:
-                            items.append(line)
-                deps[dep_type] = items
+            # Match array declarations including multi-line
+            pattern = rf'^{dep_type}=\s*\('
+            lines = content.split('\n')
+            in_array = False
+            items = []
+            
+            for line in lines:
+                line_stripped = line.strip()
+                
+                if re.match(pattern, line_stripped):
+                    in_array = True
+                    # Check if it's a single-line array
+                    if ')' in line:
+                        # Single line array
+                        array_content = re.search(rf'{dep_type}=\s*\((.*?)\)', line).group(1)
+                        # Handle inline comments
+                        if '#' in array_content:
+                            array_content = array_content.split('#')[0].strip()
+                        
+                        # Parse multiple quoted items
+                        import shlex
+                        try:
+                            line_items = shlex.split(array_content)
+                            for item in line_items:
+                                if item and item not in items:  # Avoid duplicates
+                                    items.append(item)
+                        except ValueError:
+                            # Fallback if shlex fails
+                            for item in array_content.split():
+                                item = item.strip().strip('\'"')
+                                if item and item not in items:
+                                    items.append(item)
+                        in_array = False
+                    else:
+                        # Multi-line array - check if there's content after the opening parenthesis
+                        remaining = line_stripped.split('(', 1)[1] if '(' in line_stripped else ''
+                        if remaining.strip():
+                            # Handle inline comments
+                            if '#' in remaining:
+                                remaining = remaining.split('#')[0].strip()
+                            
+                            # Parse multiple quoted items
+                            import shlex
+                            try:
+                                line_items = shlex.split(remaining)
+                                for item in line_items:
+                                    if item and item not in items:  # Avoid duplicates
+                                        items.append(item)
+                            except ValueError:
+                                # Fallback if shlex fails
+                                item = remaining.strip('\'"')
+                                if item and item not in items:
+                                    items.append(item)
+                    continue
+                
+                if in_array:
+                    if ')' in line_stripped:
+                        # End of multi-line array
+                        remaining = line_stripped.split(')')[0]
+                        if remaining.strip():
+                            # Handle inline comments
+                            if '#' in remaining:
+                                remaining = remaining.split('#')[0].strip()
+                            
+                            # Parse multiple quoted items
+                            import shlex
+                            try:
+                                line_items = shlex.split(remaining)
+                                for item in line_items:
+                                    if item and item not in items:  # Avoid duplicates
+                                        items.append(item)
+                            except ValueError:
+                                # Fallback if shlex fails
+                                item = remaining.strip().strip('\'"')
+                                if item and item not in items:
+                                    items.append(item)
+                        in_array = False
+                    else:
+                        # Middle of multi-line array
+                        if line_stripped and not line_stripped.startswith('#'):
+                            # Handle inline comments - only remove comment part, keep dependency name
+                            clean_line = line_stripped
+                            if '#' in clean_line:
+                                clean_line = clean_line.split('#')[0].strip()
+                            
+                            # Parse multiple quoted items on same line
+                            import shlex
+                            try:
+                                line_items = shlex.split(clean_line)
+                                for item in line_items:
+                                    if item and item not in items:  # Avoid duplicates
+                                        items.append(item)
+                            except ValueError:
+                                # Fallback if shlex fails
+                                item = clean_line.strip('\'"')
+                                if item and item not in items:
+                                    items.append(item)
+            
+            deps[dep_type] = items
     except Exception as e:
         print(f"Warning: Failed to parse PKGBUILD {pkgbuild_path}: {e}")
     
     return deps
 
-def fetch_pkgbuild_deps(packages_to_build, no_update=False):
+def fetch_pkgbuild_deps(packages_to_build, no_update=False, arm_packages=None):
     """Fetch PKGBUILDs for packages that need building and extract full dependencies"""
     if not packages_to_build:
         return packages_to_build
@@ -232,7 +310,41 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
             pkg.update(deps)
     
     # Return combined list with blacklisted packages (unchanged) and fetched packages (with updated deps)
-    return packages_to_fetch + blacklisted_packages
+    all_packages = packages_to_fetch + blacklisted_packages
+    
+    # Build provides mapping from ARM packages database for deduplication
+    provides_map = {}
+    if arm_packages:
+        for pkg_name, pkg_data in arm_packages.items():
+            basename = pkg_data.get('basename', pkg_name)
+            provides_map[pkg_name] = basename
+            for provide in pkg_data.get('provides', []):
+                provide_name = provide.split('=')[0]
+                provides_map[provide_name] = basename
+    
+    # Clean up dependencies - only keep deps that are in the build list
+    build_list_names = {pkg['name'] for pkg in all_packages}
+    build_list_basenames = {pkg.get('basename', pkg['name']) for pkg in all_packages}
+    
+    for pkg in all_packages:
+        for dep_type in ['depends', 'makedepends', 'checkdepends']:
+            if dep_type in pkg:
+                cleaned_deps = []
+                
+                for dep in pkg[dep_type]:
+                    dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
+                    # Keep dependency if it's in the build list (by name or basename)
+                    if dep_name in build_list_names or dep_name in build_list_basenames:
+                        cleaned_deps.append(dep)
+                    # Also check if .so dependency resolves to a package in build list
+                    elif dep_name in provides_map:
+                        providing_basename = provides_map[dep_name]
+                        if providing_basename in build_list_basenames:
+                            cleaned_deps.append(dep)
+                
+                pkg[dep_type] = cleaned_deps
+    
+    return all_packages
 
 def download_dbs(x86_urls, arm_urls, skip_if_exists=False, skip_x86=False):
     x86_files = []
@@ -575,10 +687,12 @@ def sort_by_build_order(packages):
         if 'checkdepends' in pkg:
             all_deps += pkg['checkdepends']
         
-        for dep in all_deps:
-            dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
-            if dep_name in provides_map and provides_map[dep_name]['name'] in pkg_map:
-                deps[pkg['name']].add(provides_map[dep_name]['name'])
+        for dep_string in all_deps:
+            # Split space-separated dependencies
+            for dep in dep_string.split():
+                dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
+                if dep_name in provides_map and provides_map[dep_name]['name'] in pkg_map:
+                    deps[pkg['name']].add(provides_map[dep_name]['name'])
     
     # Calculate build stages
     stages = {}
@@ -705,55 +819,48 @@ if __name__ == "__main__":
                     'repo': 'extra'
                 }
     
-    # Always download ARM databases for comparison (unless using --packages or --rebuild-repo)
-    if args.packages or args.rebuild_repo:
-        if args.packages:
-            print("Skipping aarch64 database download (using --packages)")
-        else:
-            print("Skipping aarch64 database download (using --rebuild-repo)")
-        arm_packages = {}
-    else:
-        print("Downloading aarch64 databases...")
-        _, arm_files = download_dbs([], args.arm_urls)
-        
-        print("Parsing aarch64 packages...")
-        arm_packages = {}
-        duplicates = []
-        for i, db_file in enumerate(arm_files):
-            repo_name = "core" if "core" in args.arm_urls[i] else "extra"
-            packages = extract_packages(db_file, repo_name)
-            # Check for duplicates across ARM repositories
-            for pkg_name, pkg_data in packages.items():
-                if pkg_name in arm_packages:
-                    # Check where it belongs according to x86_64
-                    x86_repo = "NOT FOUND"
-                    if pkg_name in x86_packages:
-                        x86_repo = x86_packages[pkg_name]['repo']
-                    
-                    duplicates.append({
-                        'name': pkg_name,
-                        'first_repo': arm_packages[pkg_name]['repo'],
-                        'first_version': arm_packages[pkg_name]['version'],
-                        'second_repo': repo_name,
-                        'second_version': pkg_data['version'],
-                        'x86_repo': x86_repo
-                    })
-                else:
-                    arm_packages[pkg_name] = pkg_data
-            print(f"Found {len(packages)} packages in {args.arm_urls[i]}")
-        
-        if duplicates:
-            print(f"\n{'='*80}")
-            print(f"WARNING: Found {len(duplicates)} duplicate packages in ARM repositories!")
-            print(f"{'='*80}")
-            for dup in duplicates:
-                print(f"  Package '{dup['name']}':")
-                print(f"    {dup['first_repo']}: {dup['first_version']}")
-                print(f"    {dup['second_repo']}: {dup['second_version']}")
-                print(f"    x86_64 has it in: {dup['x86_repo']}")
-            print(f"{'='*80}")
-            print("CONTINUING WITH FIRST OCCURRENCE OF EACH DUPLICATE...")
-            print(f"{'='*80}\n")
+    # Always download ARM databases for provides information
+    print("Downloading aarch64 databases for provides information...")
+    _, arm_files = download_dbs([], args.arm_urls)
+    
+    print("Parsing aarch64 packages...")
+    arm_packages = {}
+    duplicates = []
+    for i, db_file in enumerate(arm_files):
+        repo_name = "core" if "core" in args.arm_urls[i] else "extra"
+        packages = extract_packages(db_file, repo_name)
+        # Check for duplicates across ARM repositories
+        for pkg_name, pkg_data in packages.items():
+            if pkg_name in arm_packages:
+                # Check where it belongs according to x86_64
+                x86_repo = "NOT FOUND"
+                if pkg_name in x86_packages:
+                    x86_repo = x86_packages[pkg_name]['repo']
+                
+                duplicates.append({
+                    'name': pkg_name,
+                    'first_repo': arm_packages[pkg_name]['repo'],
+                    'first_version': arm_packages[pkg_name]['version'],
+                    'second_repo': repo_name,
+                    'second_version': pkg_data['version'],
+                    'x86_repo': x86_repo
+                })
+            else:
+                arm_packages[pkg_name] = pkg_data
+        print(f"Found {len(packages)} packages in {args.arm_urls[i]}")
+    
+    if duplicates and not (args.packages or args.rebuild_repo):
+        print(f"\n{'='*80}")
+        print(f"WARNING: Found {len(duplicates)} duplicate packages in ARM repositories!")
+        print(f"{'='*80}")
+        for dup in duplicates:
+            print(f"  Package '{dup['name']}':")
+            print(f"    {dup['first_repo']}: {dup['first_version']}")
+            print(f"    {dup['second_repo']}: {dup['second_version']}")
+            print(f"    x86_64 has it in: {dup['x86_repo']}")
+        print(f"{'='*80}")
+        print("CONTINUING WITH FIRST OCCURRENCE OF EACH DUPLICATE...")
+        print(f"{'='*80}\n")
     
     print("Comparing versions...")
     # Skip blacklist entirely when using --packages
@@ -815,7 +922,7 @@ if __name__ == "__main__":
     # Fetch PKGBUILDs for packages that need building to get complete dependency info (always enabled)
     if newer_packages:
         print("Fetching PKGBUILDs for complete dependency information...")
-        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update)
+        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, arm_packages)
     
     # Check if any skipped packages are dependencies of packages being built
     if skipped_packages and newer_packages:
