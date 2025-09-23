@@ -5,10 +5,12 @@ This automated build system maintains an AArch64 port of Arch Linux by continuou
 ## Features
 
 - Uses Arch Linux state repository for fast, comprehensive package information
-- Compares x86_64 (core + extra) against AArch64 repositories
+- Compares x86_64 (core + extra) against AArch64 repositories from configured mirrors
 - Filters out architecture-independent packages (`ARCH=any`)
 - Extracts comprehensive package metadata including source repository
-- Fetches PKGBUILDs for complete dependency information
+- Fetches PKGBUILDs for complete dependency information with intelligent update detection
+- Shows clear progress messages indicating current vs target versions (e.g., "updating 1.2.3 -> 1.2.4")
+- Only performs git operations when package updates are actually needed
 - Sorts packages by dependency-based build order using topological sort
 - Automated building and uploading to correct testing repositories
 - Configurable pacman cache directory for build optimization
@@ -19,6 +21,7 @@ This automated build system maintains an AArch64 port of Arch Linux by continuou
 - Generate lists of packages missing from AArch64 repository
 - Repository analysis and version comparison tools
 - Support for local, AUR, and official package sources
+- Efficient processing: reads existing PKGBUILDs first to determine current versions before git operations
 
 ## Components
 
@@ -100,6 +103,24 @@ This automated build system maintains an AArch64 port of Arch Linux by continuou
 ```bash
 ./generate_build_list.py --arm-urls https://example.com/core.db https://example.com/extra.db
 ```
+
+#### Skip git updates (use existing PKGBUILDs)
+```bash
+./generate_build_list.py --no-update
+```
+
+## Progress Messages
+
+The system provides clear, informative progress messages during PKGBUILD processing:
+
+- `Processing vim (fetching 9.1.1734-1)...` - Cloning new repository for specific version
+- `Processing vim (already up to date: 9.1.1734-1)...` - Package is current, no git operations needed
+- `Processing vim (updating 9.1.1730-1 -> 9.1.1734-1)...` - Updating from current to target version
+- `Processing vim (updating to latest commit)...` - Updating AUR package or using `--use-latest`
+- `Processing vim (no update, current: 9.1.1730-1)...` - Using `--no-update` flag
+- `Processing vim (fetching from AUR)...` - Cloning new AUR package
+
+This messaging system ensures users know exactly what operations are being performed and whether git updates are actually happening.
 
 ### Package Building
 
@@ -315,6 +336,7 @@ git clone <special-glibc-repo> pkgbuilds/glibc
 | `--missing-packages` | List packages missing from AArch64 repository |
 | `--use-latest` | Use latest git commit instead of version tag |
 | `--rebuild-repo REPO` | Rebuild all packages from specific repository (core/extra) |
+| `--no-update` | Skip git updates, use existing PKGBUILDs |
 
 ### build_packages.py
 

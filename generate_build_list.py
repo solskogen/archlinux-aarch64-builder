@@ -12,9 +12,128 @@ import datetime
 import subprocess
 import re
 import shutil
+import tempfile
 from pathlib import Path
 from packaging import version
 from utils import load_blacklist
+
+def get_provides_mapping():
+    """Get basename to provides mapping from upstream x86_64 databases"""
+    mirror_url = 'https://archlinux.carebears.no'
+    provides_map = {}
+    
+    for repo in ['core', 'extra']:
+        db_url = f"{mirror_url}/{repo}/os/x86_64/{repo}.db"
+        
+        try:
+            with tempfile.NamedTemporaryFile() as tmp_file:
+                urllib.request.urlretrieve(db_url, tmp_file.name)
+                
+                with tarfile.open(tmp_file.name, 'r:gz') as tar:
+                    for member in tar.getmembers():
+                        if member.name.endswith('/desc'):
+                            desc_content = tar.extractfile(member).read().decode('utf-8')
+                            
+                            # Parse desc file
+                            sections = desc_content.strip().split('\n\n')
+                            pkg_name = ''
+                            pkg_base = ''
+                            pkg_provides = []
+                            
+                            for section in sections:
+                                lines = section.strip().split('\n')
+                                if not lines:
+                                    continue
+                                    
+                                section_name = lines[0].strip('%')
+                                section_content = lines[1:]
+                                
+                                if section_name == 'NAME' and section_content:
+                                    pkg_name = section_content[0]
+                                elif section_name == 'BASE' and section_content:
+                                    pkg_base = section_content[0]
+                                elif section_name == 'PROVIDES':
+                                    pkg_provides = section_content
+                            
+                            # Use base if available, otherwise use name
+                            basename = pkg_base or pkg_name
+                            if basename:
+                                provides_map[basename] = basename  # Package provides itself
+                                for provide in pkg_provides:
+                                    provide_name = provide.split('=')[0]
+                                    provides_map[provide_name] = basename
+        except Exception as e:
+            print(f"Warning: failed to download {repo}.db: {e}")
+    
+    return provides_map
+
+def write_results(packages, args):
+    """Write results to packages_to_build.json"""
+    print("Writing results to packages_to_build.json...")
+    output_data = {
+        "_command": " ".join(sys.argv),
+        "_timestamp": datetime.datetime.now().isoformat(),
+        "packages": packages
+    }
+    with open("packages_to_build.json", "w") as f:
+        json.dump(output_data, f, indent=2)
+    
+    print(f"\nBuild Statistics:")
+    print(f"Total packages to build: {len(packages)}")
+    if packages:
+        stages = {}
+        for pkg in packages:
+            stage = pkg.get('build_stage', 0)
+            stages[stage] = stages.get(stage, 0) + 1
+        print(f"Total build stages: {max(stages.keys()) + 1 if stages else 0}")
+        print("Packages per stage:")
+        for stage in sorted(stages.keys()):
+            print(f"  Stage {stage}: {stages[stage]} packages")
+
+def parse_database_file(db_filename):
+    """Parse a pacman database file and return packages"""
+    import tarfile
+    packages = {}
+    
+    try:
+        with tarfile.open(db_filename, 'r:gz') as tar:
+            for member in tar.getmembers():
+                if member.name.endswith('/desc'):
+                    desc_content = tar.extractfile(member).read().decode('utf-8')
+                    
+                    # Parse desc content manually (don't filter ARCH=any for ARM packages)
+                    lines = desc_content.strip().split('\n')
+                    data = {}
+                    current_key = None
+                    
+                    for line in lines:
+                        if line.startswith('%') and line.endswith('%'):
+                            current_key = line[1:-1]
+                            data[current_key] = []
+                        elif current_key and line:
+                            data[current_key].append(line)
+                    
+                    if 'NAME' in data and 'VERSION' in data:
+                        # Skip packages with ARCH=any
+                        if data.get('ARCH', [''])[0] == 'any':
+                            continue
+                            
+                        name = data['NAME'][0]
+                        version = data['VERSION'][0]
+                        
+                        packages[name] = {
+                            'name': name,
+                            'version': version,
+                            'basename': data.get('BASE', [name])[0],
+                            'depends': data.get('DEPENDS', []),
+                            'makedepends': data.get('MAKEDEPENDS', []),
+                            'provides': data.get('PROVIDES', []),
+                            'repo': 'unknown'  # Will be set by caller
+                        }
+    except Exception as e:
+        print(f"Error parsing {db_filename}: {e}")
+    
+    return packages
 
 def load_state_packages():
     """Load x86_64 packages from state repository with consistency checking"""
@@ -210,7 +329,7 @@ def parse_pkgbuild_deps(pkgbuild_path):
     
     return deps
 
-def fetch_pkgbuild_deps(packages_to_build, no_update=False, arm_packages=None):
+def fetch_pkgbuild_deps(packages_to_build, no_update=False):
     """Fetch PKGBUILDs for packages that need building and extract full dependencies"""
     if not packages_to_build:
         return packages_to_build
@@ -240,19 +359,42 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False, arm_packages=None):
         pkgbuild_dir = Path("pkgbuilds") / name
         pkgbuild_path = pkgbuild_dir / "PKGBUILD"
         
+        # Check if PKGBUILD exists and get current version
+        current_version = None
+        if pkgbuild_path.exists():
+            try:
+                with open(pkgbuild_path, 'r') as f:
+                    content = f.read()
+                    # Extract pkgver and pkgrel
+                    pkgver_match = re.search(r'^pkgver=(.+)$', content, re.MULTILINE)
+                    pkgrel_match = re.search(r'^pkgrel=(.+)$', content, re.MULTILINE)
+                    if pkgver_match and pkgrel_match:
+                        pkgver = pkgver_match.group(1).strip('\'"')
+                        pkgrel = pkgrel_match.group(1).strip('\'"')
+                        current_version = f"{pkgver}-{pkgrel}"
+            except Exception:
+                pass  # If we can't read version, treat as if PKGBUILD doesn't exist
+        
+        # Determine what action to take
+        target_version = pkg['version']
+        needs_update = current_version != target_version
+        
         # Fetch or update PKGBUILD (skip if no_update is True)
         if no_update:
-            print(f"[{i}/{total}] Using existing PKGBUILD for {name}")
+            if current_version:
+                print(f"[{i}/{total}] Processing {name} (no update, current: {current_version})...")
+            else:
+                print(f"[{i}/{total}] Processing {name} (no update)...")
         elif not pkgbuild_path.exists():
             # Need to clone the repository
             try:
                 if pkg.get('use_aur', False):
-                    print(f"[{i}/{total}] Fetching AUR PKGBUILD for {name}...")
+                    print(f"[{i}/{total}] Processing {name} (fetching from AUR)...")
                     result = subprocess.run(["git", "clone", f"https://aur.archlinux.org/{name}.git", name], 
                                          cwd="pkgbuilds", check=True, 
                                          capture_output=True, text=True)
                 else:
-                    print(f"[{i}/{total}] Fetching PKGBUILD for {name}...")
+                    print(f"[{i}/{total}] Processing {name} (fetching {target_version})...")
                     # Use --switch to get the correct version tag only if not using latest
                     if pkg.get('force_latest', False):
                         # Get latest commit from main branch
@@ -268,59 +410,62 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False, arm_packages=None):
             except subprocess.CalledProcessError as e:
                 print(f"Warning: Failed to fetch PKGBUILD for {name}: {e.stderr.strip() if e.stderr else 'Unknown error'}")
                 continue
-        elif not no_update:
-            # Repository exists, ensure we're on the correct version (skip if no_update)
+        elif needs_update or pkg.get('force_latest', False):
+            # Repository exists but needs update
             pkg_repo_dir = Path("pkgbuilds") / name
-            if pkg_repo_dir.exists() and not pkg.get('use_aur', False):
-                try:
-                    if pkg.get('force_latest', False):
-                        print(f"[{i}/{total}] Switching {name} to latest commit...")
-                        subprocess.run(["git", "checkout", "main"], cwd=pkg_repo_dir, check=True, capture_output=True)
-                        subprocess.run(["git", "pull"], cwd=pkg_repo_dir, check=True, capture_output=True)
-                    else:
-                        print(f"[{i}/{total}] Switching {name} to version {pkg['version']}...")
-                        version_tag = pkg['version']
-                        subprocess.run(["git", "fetch", "--tags"], cwd=pkg_repo_dir, check=True, capture_output=True)
-                        # Try different tag formats - replace : with - for git tags
-                        git_version_tag = version_tag.replace(':', '-')
-                        tag_formats = [git_version_tag, version_tag, f"v{git_version_tag}", f"{name}-{git_version_tag}"]
-                        checkout_success = False
-                        for tag_format in tag_formats:
-                            try:
-                                subprocess.run(["git", "checkout", tag_format], cwd=pkg_repo_dir, check=True, capture_output=True)
-                                checkout_success = True
-                                break
-                            except subprocess.CalledProcessError:
-                                continue
-                        
-                        if not checkout_success:
-                            print(f"Warning: Could not find tag for {name} version {version_tag}, using latest commit")
-                            subprocess.run(["git", "checkout", "main"], cwd=pkg_repo_dir, check=True, capture_output=True)
-                            subprocess.run(["git", "pull"], cwd=pkg_repo_dir, check=True, capture_output=True)
-                except subprocess.CalledProcessError as e:
-                    print(f"Warning: Failed to switch {name} to correct version: {e}")
-            else:
-                print(f"[{i}/{total}] Using existing PKGBUILD for {name}")
+            try:
+                if pkg.get('force_latest', False):
+                    print(f"[{i}/{total}] Processing {name} (updating to latest commit)...")
+                    subprocess.run(["git", "pull"], cwd=pkg_repo_dir, check=True, capture_output=True)
+                else:
+                    print(f"[{i}/{total}] Processing {name} (updating {current_version} -> {target_version})...")
+                    subprocess.run(["git", "fetch", "--tags"], cwd=pkg_repo_dir, check=True, capture_output=True)
+                    # Try different tag formats - replace : with - for git tags
+                    git_version_tag = target_version.replace(':', '-')
+                    tag_formats = [git_version_tag, target_version, f"v{git_version_tag}", f"{name}-{git_version_tag}"]
+                    checkout_success = False
+                    for tag_format in tag_formats:
+                        try:
+                            result = subprocess.run(["git", "checkout", tag_format], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
+                            checkout_success = True
+                            break
+                        except subprocess.CalledProcessError as checkout_error:
+                            # Debug: show what tag format failed
+                            if tag_format == tag_formats[-1]:  # Last attempt
+                                print(f"Debug: All tag formats failed for {name}. Tried: {tag_formats}")
+                                if checkout_error.stderr:
+                                    print(f"Last error: {checkout_error.stderr.strip()}")
+                            continue
+                    
+                    if not checkout_success:
+                        print(f"Warning: Could not find tag for {name} version {target_version}, using latest commit")
+                        try:
+                            # Reset to clean state before pulling
+                            subprocess.run(["git", "reset", "--hard"], cwd=pkg_repo_dir, check=True, capture_output=True)
+                            subprocess.run(["git", "pull"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
+                        except subprocess.CalledProcessError as pull_error:
+                            print(f"Warning: Failed to pull latest commit for {name}: {pull_error}")
+                            if pull_error.stderr:
+                                print(f"Git error: {pull_error.stderr.strip()}")
+            except subprocess.CalledProcessError as e:
+                print(f"Warning: Failed to update {name}: {e}")
+                if hasattr(e, 'stderr') and e.stderr:
+                    print(f"Git error: {e.stderr.strip()}")
+        else:
+            # Repository exists and is up to date
+            print(f"[{i}/{total}] Processing {name} (already up to date: {current_version})...")
         
         # Parse dependencies from existing PKGBUILD
         if pkgbuild_path.exists():
             deps = parse_pkgbuild_deps(pkgbuild_path)
-            if deps['depends'] or deps['makedepends']:
-                print(f"DEBUG: Found dependencies for {name}: depends={deps['depends'][:3]}{'...' if len(deps['depends']) > 3 else ''}, makedepends={deps['makedepends'][:3]}{'...' if len(deps['makedepends']) > 3 else ''}")
             pkg.update(deps)
     
     # Return combined list with blacklisted packages (unchanged) and fetched packages (with updated deps)
     all_packages = packages_to_fetch + blacklisted_packages
     
-    # Build provides mapping from ARM packages database for deduplication
-    provides_map = {}
-    if arm_packages:
-        for pkg_name, pkg_data in arm_packages.items():
-            basename = pkg_data.get('basename', pkg_name)
-            provides_map[pkg_name] = basename
-            for provide in pkg_data.get('provides', []):
-                provide_name = provide.split('=')[0]
-                provides_map[provide_name] = basename
+    # Get provides mapping from upstream x86_64 databases
+    print("Loading provides mapping from upstream databases...")
+    provides_map = get_provides_mapping()
     
     # Clean up dependencies - only keep deps that are in the build list
     build_list_names = {pkg['name'] for pkg in all_packages}
@@ -439,9 +584,11 @@ def find_missing_dependencies(packages, x86_packages, arm_packages):
     
     return missing_deps
 
-def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=None, missing_packages_mode=False, use_aur=False, use_latest=False):
+def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=None, missing_packages_mode=False, aur_packages=None, use_latest=False):
     if force_packages is None:
         force_packages = set()
+    if aur_packages is None:
+        aur_packages = set()
     else:
         force_packages = set(force_packages)
     
@@ -644,7 +791,7 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
             newer_in_x86.append({
                 'name': basename,
                 'force_latest': should_use_latest,
-                'use_aur': bool(use_aur and force_packages and basename in force_packages),
+                'use_aur': bool(basename in aur_packages),
                 **pkg_data
             })
     
@@ -728,27 +875,78 @@ def sort_by_build_order(packages):
     return sorted(sorted_pkgs, key=lambda x: x['build_stage'])
 
 if __name__ == "__main__":
+    # Clean up state from previous builds
+    try:
+        Path("last_successful.txt").unlink()
+    except FileNotFoundError:
+        pass
+    
     parser = argparse.ArgumentParser(description='Generate build list by comparing Arch Linux package versions between x86_64 and AArch64 repositories')
     parser.add_argument('--arm-urls', nargs='+',
                         default=["https://arch-linux-repo.drzee.net/arch/core/os/aarch64/core.db",
                                  "https://arch-linux-repo.drzee.net/arch/extra/os/aarch64/extra.db"],
                         help='URLs for AArch64 repository databases')
+    parser.add_argument('--aur', nargs='+',
+                        help='Get specified packages from AUR (implies --packages mode)')
     parser.add_argument('--packages', nargs='+',
                         help='Force rebuild specific packages by name')
-    parser.add_argument('--aur', action='store_true',
-                        help='Use AUR as source for packages specified with --packages')
     parser.add_argument('--blacklist', default='blacklist.txt',
                         help='File containing packages to skip (default: blacklist.txt)')
     parser.add_argument('--missing-packages', action='store_true',
                         help='Generate list of all packages present in x86_64 but missing from aarch64')
     parser.add_argument('--rebuild-repo', choices=['core', 'extra'],
                         help='Rebuild all packages from specified repository regardless of version')
-    parser.add_argument('--no-update', action='store_true',
+    
+    # Mutually exclusive group for git update options
+    git_group = parser.add_mutually_exclusive_group()
+    git_group.add_argument('--no-update', action='store_true',
                        help='Skip updating state repository and PKGBUILDs (use existing versions)')
-    parser.add_argument('--use-latest', action='store_true',
+    git_group.add_argument('--use-latest', action='store_true',
                         help='Use latest git commit of package source instead of version tag when building')
     
     args = parser.parse_args()
+    
+    # Handle --aur implying --packages mode
+    if args.aur:
+        if args.packages:
+            # Merge AUR packages with regular packages
+            args.packages.extend(args.aur)
+        else:
+            args.packages = args.aur
+        # Set AUR flag for the specified packages
+        args.use_aur_for_packages = set(args.aur)
+        args.aur = True
+        
+        # For pure AUR mode, skip all comparison logic
+        if not args.packages or set(args.packages) == args.use_aur_for_packages:
+            # Create packages directly from AUR list
+            newer_packages = []
+            for pkg_name in args.use_aur_for_packages:
+                newer_packages.append({
+                    'name': pkg_name,
+                    'basename': pkg_name,
+                    'version': 'AUR',
+                    'repo': 'aur',
+                    'depends': [],
+                    'makedepends': [],
+                    'provides': [],
+                    'force_latest': not args.no_update,  # Update to latest unless --no-update
+                    'use_aur': True,
+                    'use_local': False,
+                    'build_stage': 0
+                })
+            
+            # Fetch PKGBUILDs and write results
+            if newer_packages:
+                print("Processing PKGBUILDs for dependency information...")
+                newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update)
+            
+            newer_packages = sort_by_build_order(newer_packages)
+            write_results(newer_packages, args)
+            sys.exit(0)
+    else:
+        args.use_aur_for_packages = set()
+        args.aur = False
     
     # Always use state repository and fetch PKGBUILDs (now default behavior)
     if not args.no_update:
@@ -819,48 +1017,29 @@ if __name__ == "__main__":
                     'repo': 'extra'
                 }
     
-    # Always download ARM databases for provides information
-    print("Downloading aarch64 databases for provides information...")
-    _, arm_files = download_dbs([], args.arm_urls)
-    
-    print("Parsing aarch64 packages...")
+    # Download and parse ARM databases for version comparison
+    print("Downloading AArch64 databases...")
     arm_packages = {}
-    duplicates = []
-    for i, db_file in enumerate(arm_files):
-        repo_name = "core" if "core" in args.arm_urls[i] else "extra"
-        packages = extract_packages(db_file, repo_name)
-        # Check for duplicates across ARM repositories
-        for pkg_name, pkg_data in packages.items():
-            if pkg_name in arm_packages:
-                # Check where it belongs according to x86_64
-                x86_repo = "NOT FOUND"
-                if pkg_name in x86_packages:
-                    x86_repo = x86_packages[pkg_name]['repo']
+    for url in args.arm_urls:
+        try:
+            db_filename = url.split('/')[-1].replace('.db', '_aarch64.db')
+            print(f"Downloading {db_filename}...")
+            subprocess.run(["wget", "-q", "-O", db_filename, url], check=True)
+            
+            repo_name = db_filename.replace('.db', '')
+            print(f"Parsing {db_filename}...")
+            repo_packages = parse_database_file(db_filename)
+            
+            for name, pkg in repo_packages.items():
+                pkg['repo'] = repo_name
+                arm_packages[name] = pkg
                 
-                duplicates.append({
-                    'name': pkg_name,
-                    'first_repo': arm_packages[pkg_name]['repo'],
-                    'first_version': arm_packages[pkg_name]['version'],
-                    'second_repo': repo_name,
-                    'second_version': pkg_data['version'],
-                    'x86_repo': x86_repo
-                })
-            else:
-                arm_packages[pkg_name] = pkg_data
-        print(f"Found {len(packages)} packages in {args.arm_urls[i]}")
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: Failed to download {url}: {e}")
+        except Exception as e:
+            print(f"Warning: Failed to parse {db_filename}: {e}")
     
-    if duplicates and not (args.packages or args.rebuild_repo):
-        print(f"\n{'='*80}")
-        print(f"WARNING: Found {len(duplicates)} duplicate packages in ARM repositories!")
-        print(f"{'='*80}")
-        for dup in duplicates:
-            print(f"  Package '{dup['name']}':")
-            print(f"    {dup['first_repo']}: {dup['first_version']}")
-            print(f"    {dup['second_repo']}: {dup['second_version']}")
-            print(f"    x86_64 has it in: {dup['x86_repo']}")
-        print(f"{'='*80}")
-        print("CONTINUING WITH FIRST OCCURRENCE OF EACH DUPLICATE...")
-        print(f"{'='*80}\n")
+    print(f"Loaded {len(arm_packages)} AArch64 packages")
     
     print("Comparing versions...")
     # Skip blacklist entirely when using --packages
@@ -872,7 +1051,7 @@ if __name__ == "__main__":
         if blacklist:
             print(f"Loaded blacklist with {len(blacklist)} packages")
     
-    newer_packages, skipped_packages, blacklisted_missing = compare_versions(x86_packages, arm_packages, args.packages, blacklist, args.missing_packages, args.aur, args.use_latest)
+    newer_packages, skipped_packages, blacklisted_missing = compare_versions(x86_packages, arm_packages, args.packages, blacklist, args.missing_packages, args.use_aur_for_packages, args.use_latest)
     
     # Report blacklisted missing packages
     if args.missing_packages and blacklisted_missing:
@@ -921,8 +1100,8 @@ if __name__ == "__main__":
     
     # Fetch PKGBUILDs for packages that need building to get complete dependency info (always enabled)
     if newer_packages:
-        print("Fetching PKGBUILDs for complete dependency information...")
-        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, arm_packages)
+        print("Processing PKGBUILDs for dependency information...")
+        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update)
     
     # Check if any skipped packages are dependencies of packages being built
     if skipped_packages and newer_packages:
@@ -963,14 +1142,7 @@ if __name__ == "__main__":
     print("Sorting by build order...")
     sorted_packages = sort_by_build_order(newer_packages)
     
-    print("Writing results to packages_to_build.json...")
-    output_data = {
-        "_command": " ".join(sys.argv),
-        "_timestamp": datetime.datetime.now().isoformat(),
-        "packages": sorted_packages
-    }
-    with open("packages_to_build.json", "w") as f:
-        json.dump(output_data, f, indent=2)
+    write_results(sorted_packages, args)
     
     # Build statistics
     if sorted_packages:
@@ -983,8 +1155,6 @@ if __name__ == "__main__":
         
         if stage_counts:
             max_stage = max(stage_counts.keys())
-            print(f"\nBuild Statistics:")
-            print(f"Total packages to build: {len(buildable_packages)}")
             if len(sorted_packages) > len(buildable_packages):
                 blacklisted_requested = len(sorted_packages) - len(buildable_packages)
                 print(f"Skipped {blacklisted_requested} blacklisted packages marked for upgrade:")
@@ -993,10 +1163,6 @@ if __name__ == "__main__":
                         print(f"  - {pkg['name']} ({pkg.get('blacklist_reason', 'blacklisted')})")
             if skipped_packages:
                 print(f"Skipped {len(skipped_packages)} total blacklisted packages")
-            print(f"Total build stages: {max_stage + 1}")
-            print(f"Packages per stage:")
-            for stage in sorted(stage_counts.keys()):
-                print(f"  Stage {stage}: {stage_counts[stage]} packages")
     
     print("Keeping downloaded database files...")
     
