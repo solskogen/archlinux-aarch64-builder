@@ -24,15 +24,18 @@ class PackageBuilder:
         self.temp_copies = []
         self.current_process = None
         
-        # Set up signal handler for immediate exit
+        # Set up signal handler for graceful cleanup
         signal.signal(signal.SIGINT, self._signal_handler)
+        signal.signal(signal.SIGTERM, self._signal_handler)
     
     def _signal_handler(self, signum, frame):
-        """Immediate exit on Ctrl+C"""
+        """Graceful cleanup on Ctrl+C"""
+        print(f"\nReceived signal {signum}, cleaning up...")
         if self.current_process:
             self.current_process.terminate()
             self.current_process.kill()
-        os._exit(1)
+        self.cleanup_temp_copies()
+        sys.exit(1)
     
     def _cleanup_temp_copies(self):
         """Clean up any temporary chroot copies"""
@@ -140,12 +143,13 @@ class PackageBuilder:
         if self.no_cache:
             print("Clearing pacman cache...")
             if self.cache_dir.exists():
-                import shutil
-                for item in self.cache_dir.iterdir():
-                    if item.is_file():
-                        item.unlink()
-                    elif item.is_dir():
-                        shutil.rmtree(item)
+                try:
+                    # Use find to delete all files and directories in cache
+                    subprocess.run([
+                        "sudo", "find", str(self.cache_dir), "-mindepth", "1", "-delete"
+                    ], check=True)
+                except subprocess.CalledProcessError as e:
+                    print(f"Warning: Failed to clear cache: {e}")
         
         # Set SOURCE_DATE_EPOCH for reproducible builds
         env = os.environ.copy()
@@ -184,7 +188,7 @@ class PackageBuilder:
                         # Continue multi-line array
                         checkdepends.extend(self._parse_package_list(line))
         
-        # Create unique temporary chroot name
+        # Always create temporary chroot
         import random
         temp_id = random.randint(1000000, 9999999)
         temp_copy_name = f"temp-{pkg_name}-{temp_id}"
@@ -192,13 +196,31 @@ class PackageBuilder:
         self.temp_copies.append(temp_copy_path)
         
         try:
-            # Rsync root chroot to temporary chroot
+            # Always rsync root chroot to temporary chroot
             print(f"Creating temporary chroot: {temp_copy_name}")
             try:
-                subprocess.run([
+                result = subprocess.run([
                     "sudo", "rsync", "-a", "--delete", "-q", "-W", "-x", 
                     f"{root_chroot}/", str(temp_copy_path) + "/"
+                ], check=True, capture_output=True, text=True)
+                print(f"Rsync completed successfully")
+            except subprocess.CalledProcessError as e:
+                print(f"ERROR: Rsync failed: {e}")
+                print(f"Stderr: {e.stderr}")
+                return False
+            except KeyboardInterrupt:
+                sys.exit(1)
+            
+            # Update package database in temporary chroot
+            print("Updating package database in temporary chroot...")
+            try:
+                subprocess.run([
+                    "sudo", "arch-nspawn", 
+                    "-c", str(self.cache_dir),  # Bind mount cache directory
+                    str(temp_copy_path), "pacman", "-Sy", "--noconfirm"
                 ], check=True)
+            except subprocess.CalledProcessError as e:
+                print(f"Warning: Failed to update package database: {e}")
             except KeyboardInterrupt:
                 sys.exit(1)
             
@@ -207,15 +229,18 @@ class PackageBuilder:
                 print(f"Installing checkdepends: {' '.join(checkdepends)}")
                 try:
                     subprocess.run([
-                        "arch-nspawn", str(temp_copy_path),
+                        "sudo", "arch-nspawn", 
+                        "-c", str(self.cache_dir),  # Bind mount cache directory
+                        str(temp_copy_path),
                         "pacman", "-S", "--noconfirm"
                     ] + checkdepends, check=True, env=env)
                 except KeyboardInterrupt:
                     sys.exit(1)
             
-            # Build with temporary chroot
+            # Always build with temporary chroot
             cmd = [
                 "makechrootpkg", "-l", temp_copy_name, "-r", str(self.chroot_path),
+                "-d", str(self.cache_dir),
                 "--", "--ignorearch"
             ]
             
@@ -356,6 +381,11 @@ class PackageBuilder:
                 start_index = last_successful + 1
                 if start_index >= len(packages):
                     print("All packages already built successfully")
+                    # Clear state file for next run
+                    try:
+                        Path("last_successful.txt").unlink()
+                    except FileNotFoundError:
+                        pass
                     return
                 print(f"Continuing from package {start_index + 1}: {packages[start_index]['name']}")
             else:

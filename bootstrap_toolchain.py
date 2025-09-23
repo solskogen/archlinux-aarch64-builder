@@ -163,8 +163,9 @@ class BootstrapBuilder(BuildUtils):
                 print(f"Build log written to {log_file}")
                 sys.exit(1)
             
-            # Upload to core-testing (toolchain always goes to core)
-            self.upload_packages(pkg_dir, "core-testing")
+            # Upload to appropriate testing repository
+            target_repo = "extra-testing" if pkg_name == "valgrind" else "core-testing"
+            self.upload_packages(pkg_dir, target_repo)
             return True
             
         except subprocess.CalledProcessError as e:
