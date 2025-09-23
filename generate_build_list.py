@@ -106,27 +106,33 @@ def parse_pkgbuild_deps(pkgbuild_path):
         
         # Parse dependency arrays more robustly
         for dep_type in ['depends', 'makedepends', 'checkdepends', 'provides']:
-            # Match array declarations including multi-line
-            pattern = rf'{dep_type}=\s*\([^)]*\)'
+            # Match array declarations including multi-line - use word boundaries to avoid partial matches
+            pattern = rf'\b{dep_type}=\s*\((.*?)\)'
             matches = re.findall(pattern, content, re.MULTILINE | re.DOTALL)
             if matches:
                 # Extract items from the array, handling quotes and comments
                 array_content = matches[-1]  # Use last match
-                # Find all quoted strings, ignoring comments
+                # Find all non-empty lines, ignoring comments
                 items = []
                 for line in array_content.split('\n'):
-                    # Remove comments
-                    line = re.sub(r'#.*$', '', line)
-                    # Extract quoted items
-                    quoted_items = re.findall(r"'([^']*)'|\"([^\"]*)\"", line)
-                    items.extend([item[0] or item[1] for item in quoted_items if item[0] or item[1]])
+                    line = line.strip()
+                    # Skip empty lines and comments
+                    if not line or line.startswith('#'):
+                        continue
+                    # Remove inline comments
+                    line = re.sub(r'#.*$', '', line).strip()
+                    if line:
+                        # Remove quotes if present
+                        line = line.strip('\'"')
+                        if line:
+                            items.append(line)
                 deps[dep_type] = items
     except Exception as e:
         print(f"Warning: Failed to parse PKGBUILD {pkgbuild_path}: {e}")
     
     return deps
 
-def fetch_pkgbuild_deps(packages_to_build):
+def fetch_pkgbuild_deps(packages_to_build, no_update=False):
     """Fetch PKGBUILDs for packages that need building and extract full dependencies"""
     if not packages_to_build:
         return packages_to_build
@@ -156,8 +162,10 @@ def fetch_pkgbuild_deps(packages_to_build):
         pkgbuild_dir = Path("pkgbuilds") / name
         pkgbuild_path = pkgbuild_dir / "PKGBUILD"
         
-        # Fetch or update PKGBUILD
-        if not pkgbuild_path.exists():
+        # Fetch or update PKGBUILD (skip if no_update is True)
+        if no_update:
+            print(f"[{i}/{total}] Using existing PKGBUILD for {name}")
+        elif not pkgbuild_path.exists():
             # Need to clone the repository
             try:
                 if pkg.get('use_aur', False):
@@ -182,8 +190,8 @@ def fetch_pkgbuild_deps(packages_to_build):
             except subprocess.CalledProcessError as e:
                 print(f"Warning: Failed to fetch PKGBUILD for {name}: {e.stderr.strip() if e.stderr else 'Unknown error'}")
                 continue
-        else:
-            # Repository exists, ensure we're on the correct version
+        elif not no_update:
+            # Repository exists, ensure we're on the correct version (skip if no_update)
             pkg_repo_dir = Path("pkgbuilds") / name
             if pkg_repo_dir.exists() and not pkg.get('use_aur', False):
                 try:
@@ -219,6 +227,8 @@ def fetch_pkgbuild_deps(packages_to_build):
         # Parse dependencies from existing PKGBUILD
         if pkgbuild_path.exists():
             deps = parse_pkgbuild_deps(pkgbuild_path)
+            if deps['depends'] or deps['makedepends']:
+                print(f"DEBUG: Found dependencies for {name}: depends={deps['depends'][:3]}{'...' if len(deps['depends']) > 3 else ''}, makedepends={deps['makedepends'][:3]}{'...' if len(deps['makedepends']) > 3 else ''}")
             pkg.update(deps)
     
     # Return combined list with blacklisted packages (unchanged) and fetched packages (with updated deps)
@@ -619,13 +629,16 @@ if __name__ == "__main__":
                         help='Generate list of all packages present in x86_64 but missing from aarch64')
     parser.add_argument('--rebuild-repo', choices=['core', 'extra'],
                         help='Rebuild all packages from specified repository regardless of version')
+    parser.add_argument('--no-update', action='store_true',
+                       help='Skip updating state repository and PKGBUILDs (use existing versions)')
     parser.add_argument('--use-latest', action='store_true',
                         help='Use latest git commit of package source instead of version tag when building')
     
     args = parser.parse_args()
     
     # Always use state repository and fetch PKGBUILDs (now default behavior)
-    update_state_repo()
+    if not args.no_update:
+        update_state_repo()
     
     x86_packages = {}
     if args.packages and not args.aur:
@@ -802,7 +815,7 @@ if __name__ == "__main__":
     # Fetch PKGBUILDs for packages that need building to get complete dependency info (always enabled)
     if newer_packages:
         print("Fetching PKGBUILDs for complete dependency information...")
-        newer_packages = fetch_pkgbuild_deps(newer_packages)
+        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update)
     
     # Check if any skipped packages are dependencies of packages being built
     if skipped_packages and newer_packages:
