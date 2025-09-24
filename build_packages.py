@@ -194,6 +194,7 @@ class PackageBuilder:
         temp_copy_name = f"temp-{pkg_name}-{temp_id}"
         temp_copy_path = self.chroot_path / temp_copy_name
         self.temp_copies.append(temp_copy_path)
+        build_success = False
         
         try:
             # Always rsync root chroot to temporary chroot
@@ -283,25 +284,32 @@ class PackageBuilder:
             
             print(f"Successfully built {pkg_name}")
             self._update_last_successful(pkg_name)
+            build_success = True
             return True
             
         except subprocess.CalledProcessError as e:
             print(f"ERROR: Failed to prepare build environment: {e}")
             return False
         finally:
-            # Clean up temporary chroot copy
+            # Clean up temporary chroot copy (unless --stop-on-failure and build failed)
             if temp_copy_path in self.temp_copies:
-                try:
-                    subprocess.run([
-                        "sudo", "rm", "--recursive", "--force", "--one-file-system", str(temp_copy_path)
-                    ], check=True)
-                    self.temp_copies.remove(temp_copy_path)
-                except (subprocess.CalledProcessError, KeyboardInterrupt, Exception):
-                    # Silent cleanup failure - don't let cleanup issues stop the build process
+                should_cleanup = True
+                if self.stop_on_failure and not build_success:
+                    should_cleanup = False
+                    print(f"Preserving temporary chroot for debugging: {temp_copy_path}")
+                
+                if should_cleanup:
                     try:
+                        subprocess.run([
+                            "sudo", "rm", "--recursive", "--force", "--one-file-system", str(temp_copy_path)
+                        ], check=True)
                         self.temp_copies.remove(temp_copy_path)
-                    except ValueError:
-                        pass
+                    except (subprocess.CalledProcessError, KeyboardInterrupt, Exception):
+                        # Silent cleanup failure - don't let cleanup issues stop the build process
+                        try:
+                            self.temp_copies.remove(temp_copy_path)
+                        except ValueError:
+                            pass
             
             # Clean up lock files created during this build
             for lock_file in self.chroot_path.glob("*.lock"):

@@ -15,7 +15,7 @@ import shutil
 import tempfile
 from pathlib import Path
 from packaging import version
-from utils import load_blacklist
+from utils import load_blacklist, load_x86_64_packages, load_aarch64_packages
 
 def get_provides_mapping():
     """Get basename to provides mapping from upstream x86_64 databases"""
@@ -128,6 +128,7 @@ def parse_database_file(db_filename):
                             'depends': data.get('DEPENDS', []),
                             'makedepends': data.get('MAKEDEPENDS', []),
                             'provides': data.get('PROVIDES', []),
+                            'filename': data.get('FILENAME', [''])[0],
                             'repo': 'unknown'  # Will be set by caller
                         }
     except Exception as e:
@@ -395,18 +396,22 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
                                          capture_output=True, text=True)
                 else:
                     print(f"[{i}/{total}] Processing {name} (fetching {target_version})...")
-                    # Use --switch to get the correct version tag only if not using latest
+                    # Use git directly for more reliable tag switching
                     if pkg.get('force_latest', False):
-                        # Get latest commit from main branch
-                        result = subprocess.run(["pkgctl", "repo", "clone", name], 
+                        # Clone and stay on main branch
+                        result = subprocess.run(["git", "clone", f"https://gitlab.archlinux.org/archlinux/packaging/packages/{name}.git", name], 
                                              cwd="pkgbuilds", check=True, 
                                              capture_output=True, text=True)
                     else:
-                        # Use --switch to get the specific version tag
+                        # Clone and checkout specific version tag
                         version_tag = pkg['version']
-                        result = subprocess.run(["pkgctl", "repo", "clone", name, f"--switch={version_tag}"], 
+                        result = subprocess.run(["git", "clone", f"https://gitlab.archlinux.org/archlinux/packaging/packages/{name}.git", name], 
                                              cwd="pkgbuilds", check=True, 
                                              capture_output=True, text=True)
+                        # Checkout the specific tag
+                        subprocess.run(["git", "checkout", version_tag], 
+                                     cwd=f"pkgbuilds/{name}", check=True, 
+                                     capture_output=True, text=True)
             except subprocess.CalledProcessError as e:
                 print(f"Warning: Failed to fetch PKGBUILD for {name}: {e.stderr.strip() if e.stderr else 'Unknown error'}")
                 continue
@@ -948,61 +953,25 @@ if __name__ == "__main__":
         args.use_aur_for_packages = set()
         args.aur = False
     
-    # Always use state repository and fetch PKGBUILDs (now default behavior)
-    if not args.no_update:
-        update_state_repo()
-    
     x86_packages = {}
     if args.packages and not args.aur:
         print(f"Looking up versions for {len(args.packages)} specified packages...")
-        # Only read the specific package files we need
+        # Load x86_64 packages using shared function
+        x86_packages = load_x86_64_packages(download=not args.no_update)
+        
+        # Filter to only requested packages
+        filtered_x86_packages = {}
         for pkg_name in args.packages:
-            found = False
-            for repo in ["core", "extra"]:
-                pkg_file = Path("state") / f"{repo}-x86_64" / pkg_name
-                if pkg_file.exists():
-                    try:
-                        line = pkg_file.read_text().strip()
-                        parts = line.split()
-                        if len(parts) >= 2:
-                            x86_packages[pkg_name] = {
-                                'name': pkg_name,
-                                'basename': pkg_name,
-                                'version': parts[1],
-                                'depends': [],
-                                'makedepends': [],
-                                'provides': [],
-                                'repo': repo
-                            }
-                            found = True
-                            break
-                    except Exception as e:
-                        print(f"Warning: Failed to parse {pkg_file}: {e}")
-            if not found:
+            if pkg_name in x86_packages:
+                filtered_x86_packages[pkg_name] = x86_packages[pkg_name]
+            else:
                 print(f"Warning: Package {pkg_name} not found in x86_64 repositories")
+        x86_packages = filtered_x86_packages
     elif not args.aur:
-        print("Parsing x86_64 packages from state...")
-        # Track packages by basename to detect duplicates across repositories
-        package_basenames = {}
-        
-        # Only parse the requested repository if --rebuild-repo is specified
-        if args.rebuild_repo:
-            repos_to_parse = [args.rebuild_repo]
-        else:
-            repos_to_parse = ["core", "extra"]
-        
-        for repo in repos_to_parse:
-            packages = parse_state_repo(repo)
-            
-            # Check for basenames that exist in multiple repositories
-            for pkg_name, pkg_data in packages.items():
-                basename = pkg_data['basename']
-                if basename in package_basenames:
-                    print(f"ERROR: Package basename '{basename}' found in both {package_basenames[basename]} and {repo} repositories")
-                    sys.exit(1)
-                package_basenames[basename] = repo
-            
-            x86_packages.update(packages)
+        # Load x86_64 packages using shared function
+        repos = [args.rebuild_repo] if args.rebuild_repo else None
+        x86_packages = load_x86_64_packages(download=not args.no_update, repos=repos)
+        print(f"Loaded {len(x86_packages)} x86_64 packages")
     else:
         print("Skipping x86_64 parsing (using AUR)")
         if args.packages:
@@ -1017,28 +986,8 @@ if __name__ == "__main__":
                     'repo': 'extra'
                 }
     
-    # Download and parse ARM databases for version comparison
-    print("Downloading AArch64 databases...")
-    arm_packages = {}
-    for url in args.arm_urls:
-        try:
-            db_filename = url.split('/')[-1].replace('.db', '_aarch64.db')
-            print(f"Downloading {db_filename}...")
-            subprocess.run(["wget", "-q", "-O", db_filename, url], check=True)
-            
-            repo_name = db_filename.replace('.db', '')
-            print(f"Parsing {db_filename}...")
-            repo_packages = parse_database_file(db_filename)
-            
-            for name, pkg in repo_packages.items():
-                pkg['repo'] = repo_name
-                arm_packages[name] = pkg
-                
-        except subprocess.CalledProcessError as e:
-            print(f"Warning: Failed to download {url}: {e}")
-        except Exception as e:
-            print(f"Warning: Failed to parse {db_filename}: {e}")
-    
+    # Load AArch64 packages using shared function
+    arm_packages = load_aarch64_packages(download=not args.no_update, urls=args.arm_urls)
     print(f"Loaded {len(arm_packages)} AArch64 packages")
     
     print("Comparing versions...")

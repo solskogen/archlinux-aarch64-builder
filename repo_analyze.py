@@ -4,8 +4,7 @@ import argparse
 from pathlib import Path
 from packaging import version
 
-from utils import load_blacklist
-from generate_build_list import _load_state_packages_no_update, extract_packages
+from utils import load_blacklist, load_x86_64_packages, load_aarch64_packages
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze repository differences')
@@ -16,28 +15,14 @@ def main():
     blacklist_file = args.blacklist or 'blacklist.txt'
     blacklist = load_blacklist(blacklist_file) if Path(blacklist_file).exists() else []
     
-    # Get x86_64 packages from existing state (no update)
+    # Load packages using shared functions
     print("Loading x86_64 packages...")
-    x86_packages = _load_state_packages_no_update()
+    x86_packages = load_x86_64_packages()
     print(f"Loaded {len(x86_packages)} x86_64 packages")
     
-    # Get AArch64 packages from existing db files
-    print("Parsing existing AArch64 packages...")
-    arm_packages = {}
-    
-    db_files = [
-        ("core_aarch64.db", "core"),
-        ("extra_aarch64.db", "extra")
-    ]
-    
-    for db_file, repo_name in db_files:
-        db_path = Path(db_file)
-        if db_path.exists():
-            repo_packages = extract_packages(db_path, repo_name)
-            print(f"Found {len(repo_packages)} packages in {repo_name}")
-            arm_packages.update(repo_packages)
-        else:
-            print(f"Warning: {db_file} not found")
+    print("Loading AArch64 packages...")
+    arm_packages = load_aarch64_packages()
+    print(f"Loaded {len(arm_packages)} AArch64 packages")
     
     print(f"Total AArch64 packages: {len(arm_packages)}")
     
@@ -94,7 +79,8 @@ def main():
             # Check if ARM newer
             try:
                 if version.parse(arm_data['version']) > version.parse(x86_data['version']):
-                    arm_newer.append(f"{basename}: AArch64={arm_data['version']}, x86_64={x86_data['version']}")
+                    filename = arm_data.get('filename', 'unknown')
+                    arm_newer.append(f"{basename}: AArch64={arm_data['version']}, x86_64={x86_data['version']} (file: {filename})")
             except:
                 pass
         else:
