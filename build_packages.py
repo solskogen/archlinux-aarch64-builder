@@ -217,7 +217,7 @@ class PackageBuilder:
                 subprocess.run([
                     "sudo", "arch-nspawn", 
                     "-c", str(self.cache_dir),  # Bind mount cache directory
-                    str(temp_copy_path), "pacman", "-Sy", "--noconfirm"
+                    str(temp_copy_path), "pacman", "-Suy", "--noconfirm"
                 ], check=True)
             except subprocess.CalledProcessError as e:
                 print(f"Warning: Failed to update package database: {e}")
@@ -449,8 +449,8 @@ def main():
                         help='Show what would be done without executing')
     parser.add_argument('--json', default='packages_to_build.json',
                         help='JSON file with packages to build (default: packages_to_build.json)')
-    parser.add_argument('--blacklist',
-                        help='File containing packages to skip')
+    parser.add_argument('--blacklist', default='blacklist.txt',
+                        help='File containing packages to skip (default: blacklist.txt)')
     parser.add_argument('--no-upload', action='store_true',
                         help='Build packages but don\'t upload to repository')
     parser.add_argument('--cache',
