@@ -59,6 +59,36 @@ class BuildUtils:
         for old_log in log_files[keep_count:]:
             old_log.unlink()
     
+    def setup_chroot(self, chroot_path, cache_path):
+        """Set up or create build chroot environment"""
+        chroot_path = Path(chroot_path)
+        cache_path = Path(cache_path)
+        
+        if self.dry_run:
+            self.format_dry_run(f"Would setup chroot at {chroot_path}", [
+                f"Create cache directory: {cache_path}",
+                f"Create chroot with mkarchroot" if not (chroot_path / "root").exists() else f"Use existing chroot"
+            ])
+            return
+        
+        # Create cache directory
+        cache_path.mkdir(parents=True, exist_ok=True)
+        
+        # Create chroot if it doesn't exist
+        if not (chroot_path / "root").exists():
+            print(f"Creating chroot at {chroot_path}")
+            chroot_path.mkdir(parents=True, exist_ok=True)
+            self.run_command([
+                "mkarchroot", 
+                "-C", "chroot-config/pacman.conf",
+                "-M", "chroot-config/makepkg.conf",
+                "-c", str(cache_path),
+                str(chroot_path / "root"),
+                "base-devel"
+            ])
+        else:
+            print("Using existing chroot...")
+    
     def upload_packages(self, pkg_dir, target_repo):
         """Upload all built packages to repository"""
         built_packages = [str(f) for f in pkg_dir.glob("*.pkg.tar.*") if not f.name.endswith('.sig')]

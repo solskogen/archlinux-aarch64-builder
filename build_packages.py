@@ -57,19 +57,8 @@ class PackageBuilder:
     
     def setup_chroot(self):
         """Set up or update the build chroot"""
-        if not self.chroot_path.exists():
-            print(f"Creating chroot at {self.chroot_path}")
-            self.chroot_path.mkdir(parents=True, exist_ok=True)
-            self.build_utils.run_command([
-                "sudo", "mkarchroot", 
-                "-C", "chroot-config/pacman.conf",
-                "-M", "chroot-config/makepkg.conf",
-                "-c", str(self.cache_dir),
-                str(self.chroot_path / "root"),
-                "base-devel"
-            ])
-        else:
-            # Clean up stale lock files
+        # Clean up stale lock files
+        if self.chroot_path.exists():
             for lock_file in self.chroot_path.glob("*.lock"):
                 try:
                     lock_file.unlink()
@@ -77,8 +66,8 @@ class PackageBuilder:
                 except Exception:
                     pass
         
-        # Ensure cache directory exists
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        # Setup chroot using shared utility
+        self.build_utils.setup_chroot(self.chroot_path, self.cache_dir)
         
         # Copy pacman configuration
         chroot_pacman_conf = self.chroot_path / "root" / "etc" / "pacman.conf"
@@ -87,12 +76,7 @@ class PackageBuilder:
                 "sudo", "cp", "chroot-config/pacman.conf", str(chroot_pacman_conf)
             ])
         
-        # Copy makepkg configuration
-        chroot_makepkg_conf = self.chroot_path / "root" / "etc" / "makepkg.conf"
-        if Path("chroot-config/makepkg.conf").exists():
-            self.build_utils.run_command([
-                "sudo", "cp", "chroot-config/makepkg.conf", str(chroot_makepkg_conf)
-            ])
+
     
     def import_gpg_keys(self):
         """Import GPG keys from keys/pgp/ directory"""
@@ -247,34 +231,67 @@ class PackageBuilder:
             
             # Execute build
             print(f"Running: {' '.join(cmd)}")
-            self.current_process = subprocess.Popen(cmd, cwd=pkg_dir, env=env, preexec_fn=os.setpgrp)
-            
-            # Poll process to allow signal handling
-            while self.current_process.poll() is None:
-                time.sleep(0.1)
-            
-            process = self.current_process
-            self.current_process = None
-            
-            if process.returncode != 0:
-                # Write build log on failure
-                self.logs_dir.mkdir(exist_ok=True)
-                timestamp = subprocess.run(['date', '+%Y%m%d-%H%M%S'], capture_output=True, text=True).stdout.strip()
-                log_file = self.logs_dir / f"{pkg_name}-{timestamp}-build.log"
-                self.build_utils.cleanup_old_logs(pkg_name)
+            try:
+                # Stream output in real-time and capture for logging
+                stdout_lines = []
+                stderr_lines = []
                 
-                with open(log_file, 'w') as f:
-                    f.write(f"Build failed for {pkg_name}\n")
-                    f.write(f"Command: {' '.join(cmd)}\n")
-                    f.write(f"Return code: {process.returncode}\n\n")
-                    f.write("Output was streamed to console during build\n")
+                process = subprocess.Popen(cmd, cwd=pkg_dir, env=env, 
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                                         text=True, bufsize=1, universal_newlines=True)
                 
-                print(f"ERROR: Build failed for {pkg_name}")
-                print(f"Build log saved to: {log_file}")
+                # Read output line by line
+                import select
+                while process.poll() is None:
+                    ready, _, _ = select.select([process.stdout, process.stderr], [], [], 0.1)
+                    for stream in ready:
+                        if stream == process.stdout:
+                            line = stream.readline()
+                            if line:
+                                print(line, end='')
+                                stdout_lines.append(line)
+                        elif stream == process.stderr:
+                            line = stream.readline()
+                            if line:
+                                print(line, end='', file=sys.stderr)
+                                stderr_lines.append(line)
                 
-                # Only exit if this was actually an interrupt (not just any 255 exit code)
-                # We can detect real interrupts by checking if our signal handler was called
-                return False
+                # Read any remaining output
+                remaining_stdout, remaining_stderr = process.communicate()
+                if remaining_stdout:
+                    print(remaining_stdout, end='')
+                    stdout_lines.append(remaining_stdout)
+                if remaining_stderr:
+                    print(remaining_stderr, end='', file=sys.stderr)
+                    stderr_lines.append(remaining_stderr)
+                
+                if process.returncode != 0:
+                    # Write build log on failure
+                    self.logs_dir.mkdir(exist_ok=True)
+                    timestamp = subprocess.run(['date', '+%Y%m%d-%H%M%S'], capture_output=True, text=True).stdout.strip()
+                    log_file = self.logs_dir / f"{pkg_name}-{timestamp}-build.log"
+                    self.build_utils.cleanup_old_logs(pkg_name)
+                    
+                    with open(log_file, 'w') as f:
+                        f.write(f"Build failed for {pkg_name}\n")
+                        f.write(f"Command: {' '.join(cmd)}\n")
+                        f.write(f"Return code: {process.returncode}\n\n")
+                        if stdout_lines:
+                            f.write("STDOUT:\n")
+                            f.write(''.join(stdout_lines))
+                            f.write("\n\n")
+                        if stderr_lines:
+                            f.write("STDERR:\n")
+                            f.write(''.join(stderr_lines))
+                            f.write("\n")
+                    
+                    print(f"ERROR: Build failed for {pkg_name}")
+                    print(f"Build log saved to: {log_file}")
+                    return False
+                    
+            except KeyboardInterrupt:
+                print(f"\nBuild interrupted for {pkg_name}")
+                sys.exit(1)
             
             # Upload packages if not disabled
             if not self.no_upload:
