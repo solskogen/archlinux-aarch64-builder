@@ -357,7 +357,8 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
     total = len(packages_to_fetch)
     for i, pkg in enumerate(packages_to_fetch, 1):
         name = pkg['name']
-        pkgbuild_dir = Path("pkgbuilds") / name
+        basename = pkg.get('basename', name)  # Use basename for git operations
+        pkgbuild_dir = Path("pkgbuilds") / basename
         pkgbuild_path = pkgbuild_dir / "PKGBUILD"
         
         # Check if PKGBUILD exists and get current version
@@ -366,32 +367,31 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
             try:
                 with open(pkgbuild_path, 'r') as f:
                     content = f.read()
-                    # Extract pkgver and pkgrel
+                    # Extract pkgver and pkgrel - only if they don't contain complex variables
                     pkgver_match = re.search(r'^pkgver=(.+)$', content, re.MULTILINE)
                     pkgrel_match = re.search(r'^pkgrel=(.+)$', content, re.MULTILINE)
                     if pkgver_match and pkgrel_match:
                         pkgver = pkgver_match.group(1).strip('\'"')
                         pkgrel = pkgrel_match.group(1).strip('\'"')
-                        current_version = f"{pkgver}-{pkgrel}"
+                        # Only use if no complex variable substitution
+                        if not ('${' in pkgver or '$(' in pkgver):
+                            current_version = f"{pkgver}-{pkgrel}"
             except Exception:
                 pass  # If we can't read version, treat as if PKGBUILD doesn't exist
         
-        # Determine what action to take
+        # Determine what action to take based on target version vs database version
         target_version = pkg['version']
         needs_update = current_version != target_version
         
         # Fetch or update PKGBUILD (skip if no_update is True)
         if no_update:
-            if current_version:
-                print(f"[{i}/{total}] Processing {name} (no update, current: {current_version})...")
-            else:
-                print(f"[{i}/{total}] Processing {name} (no update)...")
+            print(f"[{i}/{total}] Processing {name} (no update)...")
         elif not pkgbuild_path.exists():
             # Need to clone the repository
             try:
                 if pkg.get('use_aur', False):
                     print(f"[{i}/{total}] Processing {name} (fetching from AUR)...")
-                    result = subprocess.run(["git", "clone", f"https://aur.archlinux.org/{name}.git", name], 
+                    result = subprocess.run(["git", "clone", f"https://aur.archlinux.org/{basename}.git", basename], 
                                          cwd="pkgbuilds", check=True, 
                                          capture_output=True, text=True)
                 else:
@@ -399,35 +399,54 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
                     # Use git directly for more reliable tag switching
                     if pkg.get('force_latest', False):
                         # Clone and stay on main branch
-                        result = subprocess.run(["git", "clone", f"https://gitlab.archlinux.org/archlinux/packaging/packages/{name}.git", name], 
+                        result = subprocess.run(["git", "clone", f"https://gitlab.archlinux.org/archlinux/packaging/packages/{basename}.git", basename], 
                                              cwd="pkgbuilds", check=True, 
                                              capture_output=True, text=True)
                     else:
                         # Clone and checkout specific version tag
                         version_tag = pkg['version']
-                        result = subprocess.run(["git", "clone", f"https://gitlab.archlinux.org/archlinux/packaging/packages/{name}.git", name], 
+                        result = subprocess.run(["git", "clone", f"https://gitlab.archlinux.org/archlinux/packaging/packages/{basename}.git", basename], 
                                              cwd="pkgbuilds", check=True, 
                                              capture_output=True, text=True)
-                        # Checkout the specific tag
-                        subprocess.run(["git", "checkout", version_tag], 
-                                     cwd=f"pkgbuilds/{name}", check=True, 
-                                     capture_output=True, text=True)
+                        # Checkout the specific tag - try different tag formats
+                        git_version_tag = version_tag.replace(':', '-')
+                        tag_formats = [git_version_tag, version_tag, f"v{git_version_tag}", f"{basename}-{git_version_tag}"]
+                        checkout_success = False
+                        for tag_format in tag_formats:
+                            try:
+                                subprocess.run(["git", "checkout", tag_format], 
+                                             cwd=f"pkgbuilds/{basename}", check=True, 
+                                             capture_output=True, text=True)
+                                checkout_success = True
+                                break
+                            except subprocess.CalledProcessError:
+                                continue
+                        
+                        if not checkout_success:
+                            print(f"Warning: Could not find tag for {basename} version {version_tag}, using latest commit")
+                            subprocess.run(["git", "pull"], cwd=f"pkgbuilds/{basename}", check=True, capture_output=True)
             except subprocess.CalledProcessError as e:
-                print(f"Warning: Failed to fetch PKGBUILD for {name}: {e.stderr.strip() if e.stderr else 'Unknown error'}")
+                error_msg = e.stderr.strip() if e.stderr else 'Unknown error'
+                print(f"Warning: Failed to fetch PKGBUILD for {name} (basename: {basename}): {error_msg}")
+                if "Username for" in error_msg or "Authentication failed" in error_msg:
+                    print(f"  -> Package {basename} may not exist in official repositories or requires authentication")
                 continue
         elif needs_update or pkg.get('force_latest', False):
             # Repository exists but needs update
-            pkg_repo_dir = Path("pkgbuilds") / name
+            pkg_repo_dir = Path("pkgbuilds") / basename
             try:
                 if pkg.get('force_latest', False):
                     print(f"[{i}/{total}] Processing {name} (updating to latest commit)...")
                     subprocess.run(["git", "pull"], cwd=pkg_repo_dir, check=True, capture_output=True)
                 else:
-                    print(f"[{i}/{total}] Processing {name} (updating {current_version} -> {target_version})...")
+                    if current_version:
+                        print(f"[{i}/{total}] Processing {name} (updating {current_version} -> {target_version})...")
+                    else:
+                        print(f"[{i}/{total}] Processing {name} (updating to {target_version})...")
                     subprocess.run(["git", "fetch", "--tags"], cwd=pkg_repo_dir, check=True, capture_output=True)
                     # Try different tag formats - replace : with - for git tags
                     git_version_tag = target_version.replace(':', '-')
-                    tag_formats = [git_version_tag, target_version, f"v{git_version_tag}", f"{name}-{git_version_tag}"]
+                    tag_formats = [git_version_tag, target_version, f"v{git_version_tag}", f"{basename}-{git_version_tag}"]
                     checkout_success = False
                     for tag_format in tag_formats:
                         try:
@@ -437,28 +456,28 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
                         except subprocess.CalledProcessError as checkout_error:
                             # Debug: show what tag format failed
                             if tag_format == tag_formats[-1]:  # Last attempt
-                                print(f"Debug: All tag formats failed for {name}. Tried: {tag_formats}")
+                                print(f"Debug: All tag formats failed for {basename}. Tried: {tag_formats}")
                                 if checkout_error.stderr:
                                     print(f"Last error: {checkout_error.stderr.strip()}")
                             continue
                     
                     if not checkout_success:
-                        print(f"Warning: Could not find tag for {name} version {target_version}, using latest commit")
+                        print(f"Warning: Could not find tag for {basename} version {target_version}, using latest commit")
                         try:
                             # Reset to clean state before pulling
                             subprocess.run(["git", "reset", "--hard"], cwd=pkg_repo_dir, check=True, capture_output=True)
                             subprocess.run(["git", "pull"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
                         except subprocess.CalledProcessError as pull_error:
-                            print(f"Warning: Failed to pull latest commit for {name}: {pull_error}")
+                            print(f"Warning: Failed to pull latest commit for {basename}: {pull_error}")
                             if pull_error.stderr:
                                 print(f"Git error: {pull_error.stderr.strip()}")
             except subprocess.CalledProcessError as e:
-                print(f"Warning: Failed to update {name}: {e}")
+                print(f"Warning: Failed to update {basename}: {e}")
                 if hasattr(e, 'stderr') and e.stderr:
                     print(f"Git error: {e.stderr.strip()}")
         else:
             # Repository exists and is up to date
-            print(f"[{i}/{total}] Processing {name} (already up to date: {current_version})...")
+            print(f"[{i}/{total}] Processing {name} (already up to date: {current_version or target_version})...")
         
         # Parse dependencies from existing PKGBUILD
         if pkgbuild_path.exists():
@@ -802,10 +821,10 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
     
     # Find and add missing dependencies (always enabled except in missing_packages_mode)
     if not missing_packages_mode:
-        missing_deps = find_missing_dependencies(newer_in_x86, x86_packages, arm_packages)
+        missing_deps = find_missing_dependencies(newer_in_x86, full_x86_packages, arm_packages)
         for dep_name in missing_deps:
-            if dep_name in x86_packages:
-                pkg = x86_packages[dep_name]
+            if dep_name in full_x86_packages:
+                pkg = full_x86_packages[dep_name]
                 basename = pkg['basename']
                 if basename not in [p['name'] for p in newer_in_x86]:
                     newer_in_x86.append({
@@ -956,24 +975,29 @@ if __name__ == "__main__":
     x86_packages = {}
     if args.packages and not args.aur:
         print(f"Looking up versions for {len(args.packages)} specified packages...")
-        # Load x86_64 packages using shared function
-        x86_packages = load_x86_64_packages(download=not args.no_update)
+        # Load full x86_64 packages for dependency resolution
+        all_x86_packages = load_x86_64_packages(download=not args.no_update)
         
-        # Filter to only requested packages
+        # Filter to only requested packages for comparison, but keep full list for dependency resolution
         filtered_x86_packages = {}
         for pkg_name in args.packages:
-            if pkg_name in x86_packages:
-                filtered_x86_packages[pkg_name] = x86_packages[pkg_name]
+            if pkg_name in all_x86_packages:
+                filtered_x86_packages[pkg_name] = all_x86_packages[pkg_name]
             else:
                 print(f"Warning: Package {pkg_name} not found in x86_64 repositories")
         x86_packages = filtered_x86_packages
+        # Store full package list for dependency resolution
+        full_x86_packages = all_x86_packages
     elif not args.aur:
         # Load x86_64 packages using shared function
         repos = [args.rebuild_repo] if args.rebuild_repo else None
         x86_packages = load_x86_64_packages(download=not args.no_update, repos=repos)
         print(f"Loaded {len(x86_packages)} x86_64 packages")
+        # Use same list for dependency resolution
+        full_x86_packages = x86_packages
     else:
         print("Skipping x86_64 parsing (using AUR)")
+        full_x86_packages = {}
         if args.packages:
             for pkg_name in args.packages:
                 x86_packages[pkg_name] = {
