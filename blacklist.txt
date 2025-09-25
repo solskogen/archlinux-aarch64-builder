@@ -10,11 +10,11 @@ libassuan
 haskell-*
 ghc
 389-ds-base
-go-swagger
 deno
-intel-compute-runtime
-telegram-desktop
 forgejo
+go-swagger
+gotosocial
+libgoom2
 
 # Architecture-specific packages
 grub
@@ -22,6 +22,10 @@ linux
 
 # Packages we don't support (yet)
 linux-lts
+linux-hardened
+linux-rt
+linux-rt-lts
+linux-zen
 
 # Packages that don't make sense on aarch64
 syslinux
@@ -31,3 +35,21 @@ crash
 # Note: Bootstrap toolchain packages (gcc, binutils, glibc, etc.) are 
 # automatically excluded from normal builds but can still be detected
 # for bootstrap warnings. Use --bootstrap-toolchain to build them.
+
+#wait
+chromium
+
+deepin-daemon
+roctracer
+hipify-clang
+deepin-tray-loader
+onnxruntime
+telegram-desktop
+
+binutils
+glibc
+gcc
+
+vlc
+deepin-shell
+electron*

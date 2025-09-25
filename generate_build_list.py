@@ -128,7 +128,6 @@ def parse_database_file(db_filename):
                             'depends': data.get('DEPENDS', []),
                             'makedepends': data.get('MAKEDEPENDS', []),
                             'provides': data.get('PROVIDES', []),
-                            'filename': data.get('FILENAME', [''])[0],
                             'repo': 'unknown'  # Will be set by caller
                         }
     except Exception as e:
@@ -710,9 +709,19 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
                     else:
                         # Same epoch, compare versions
                         try:
-                            x86_ver = version.parse(x86_ver_str)
-                            arm_ver = version.parse(arm_ver_str)
-                            has_newer_version = x86_ver > arm_ver
+                            # Handle git revision versions (e.g., "15.2.1+r22+gc4e96a094636-1")
+                            # Git revisions are generally newer than release versions
+                            if '+r' in arm_ver_str and '+r' not in x86_ver_str:
+                                # ARM has git revision, x86 doesn't - ARM is likely newer
+                                has_newer_version = False
+                            elif '+r' in x86_ver_str and '+r' not in arm_ver_str:
+                                # x86 has git revision, ARM doesn't - x86 is likely newer
+                                has_newer_version = True
+                            else:
+                                # Both are same type, use packaging.version
+                                x86_ver = version.parse(x86_ver_str)
+                                arm_ver = version.parse(arm_ver_str)
+                                has_newer_version = x86_ver > arm_ver
                         except Exception:
                             # Fallback: try to extract numeric parts for comparison
                             import re
@@ -752,52 +761,91 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
             # Only include packages missing from aarch64
             should_include = basename not in arm_bases and basename not in arm_provides
         elif basename in arm_bases:
-            arm_version = arm_bases[basename]['version']
-            try:
-                # Handle epoch versions (e.g., "1:1.0-1")
-                x86_ver_str = x86_data['version']
-                arm_ver_str = arm_version
+            # Compare basename versions, not individual split packages
+            # Split packages that don't exist on aarch64 are expected (e.g., cross-compilers, lib32 packages)
+            x86_basename_version = x86_data['version']
+            arm_basename_version = arm_bases[basename]['version']
+            
+            # Handle epoch versions (e.g., "1:1.0-1")
+            x86_ver_str = x86_basename_version
+            arm_ver_str = arm_basename_version
+            
+            # Extract epoch if present
+            if ':' in x86_ver_str:
+                x86_epoch, x86_ver_str = x86_ver_str.split(':', 1)
+            else:
+                x86_epoch = '0'
                 
-                # Extract epoch if present
-                if ':' in x86_ver_str:
-                    x86_epoch, x86_ver_str = x86_ver_str.split(':', 1)
-                else:
-                    x86_epoch = '0'
-                    
-                if ':' in arm_ver_str:
-                    arm_epoch, arm_ver_str = arm_ver_str.split(':', 1)
-                else:
-                    arm_epoch = '0'
-                
-                # Compare epochs first
-                if int(x86_epoch) != int(arm_epoch):
-                    should_include = int(x86_epoch) > int(arm_epoch)
-                else:
-                    # Same epoch, compare versions
-                    try:
+            if ':' in arm_ver_str:
+                arm_epoch, arm_ver_str = arm_ver_str.split(':', 1)
+            else:
+                arm_epoch = '0'
+            
+            # Compare epochs first
+            if int(x86_epoch) != int(arm_epoch):
+                should_include = int(x86_epoch) > int(arm_epoch)
+            else:
+                # Same epoch, compare versions
+                try:
+                    # Handle git revision versions
+                    if '+r' in x86_ver_str or '+r' in arm_ver_str:
+                        # Extract base versions for comparison
+                        import re
+                        x86_base = re.split(r'\+r\d+', x86_ver_str)[0]
+                        arm_base = re.split(r'\+r\d+', arm_ver_str)[0]
+                        
+                        try:
+                            x86_base_ver = version.parse(x86_base)
+                            arm_base_ver = version.parse(arm_base)
+                            
+                            if x86_base_ver != arm_base_ver:
+                                # Different base versions, use base version comparison
+                                should_include = x86_base_ver > arm_base_ver
+                            elif '+r' in x86_ver_str and '+r' in arm_ver_str:
+                                # Same base version, both have git revisions, compare r numbers
+                                x86_r = re.search(r'\+r(\d+)', x86_ver_str)
+                                arm_r = re.search(r'\+r(\d+)', arm_ver_str)
+                                if x86_r and arm_r:
+                                    should_include = int(x86_r.group(1)) > int(arm_r.group(1))
+                                else:
+                                    should_include = False
+                            elif '+r' in x86_ver_str and '+r' not in arm_ver_str:
+                                # Same base version, x86 has git revision, ARM has release
+                                # Git revision is typically newer than release of same base version
+                                should_include = True
+                            elif '+r' not in x86_ver_str and '+r' in arm_ver_str:
+                                # Same base version, ARM has git revision, x86 has release
+                                should_include = False
+                            else:
+                                # Same base version, neither has git revision
+                                should_include = False
+                        except Exception:
+                            # Fallback to string comparison
+                            should_include = x86_ver_str > arm_ver_str
+                    else:
+                        # Neither has git revisions, use packaging.version
                         x86_ver = version.parse(x86_ver_str)
                         arm_ver = version.parse(arm_ver_str)
                         should_include = x86_ver > arm_ver
-                    except Exception:
-                        # Fallback: try to extract numeric parts for comparison
-                        import re
-                        x86_nums = re.findall(r'\d+', x86_ver_str)
-                        arm_nums = re.findall(r'\d+', arm_ver_str)
-                        
-                        # Compare numeric sequences
-                        should_include = False
-                        for i in range(min(len(x86_nums), len(arm_nums))):
-                            x86_num = int(x86_nums[i])
-                            arm_num = int(arm_nums[i])
-                            if x86_num != arm_num:
-                                should_include = x86_num > arm_num
-                                break
-                        else:
-                            # If all compared numbers are equal, compare by string
-                            should_include = x86_ver_str > arm_ver_str
-            except Exception as e:
-                print(f"Warning: Failed to compare versions for {basename}: {e}")
-                should_include = False
+                except Exception:
+                    # Fallback: try to extract numeric parts for comparison
+                    import re
+                    x86_nums = re.findall(r'\d+', x86_ver_str)
+                    arm_nums = re.findall(r'\d+', arm_ver_str)
+                    
+                    # Compare numeric sequences
+                    should_include = False
+                    for i in range(min(len(x86_nums), len(arm_nums))):
+                        x86_num = int(x86_nums[i])
+                        arm_num = int(arm_nums[i])
+                        if x86_num != arm_num:
+                            should_include = x86_num > arm_num
+                            break
+                    else:
+                        # If all compared numbers are equal, compare by string
+                        should_include = x86_ver_str > arm_ver_str
+            
+            arm_version = arm_basename_version  # For display purposes
         else:
             # Package doesn't exist in aarch64 - don't auto-include all missing packages
             # Missing dependencies will be handled separately by find_missing_dependencies
@@ -826,7 +874,15 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
             if dep_name in full_x86_packages:
                 pkg = full_x86_packages[dep_name]
                 basename = pkg['basename']
-                if basename not in [p['name'] for p in newer_in_x86]:
+                
+                # Check if basename is blacklisted
+                is_blacklisted = False
+                for pattern in blacklist:
+                    if fnmatch.fnmatch(basename, pattern):
+                        is_blacklisted = True
+                        break
+                
+                if not is_blacklisted and basename not in [p['name'] for p in newer_in_x86]:
                     newer_in_x86.append({
                         'name': basename,
                         'force_latest': use_latest,
@@ -912,6 +968,8 @@ if __name__ == "__main__":
                         help='URLs for AArch64 repository databases')
     parser.add_argument('--aur', nargs='+',
                         help='Get specified packages from AUR (implies --packages mode)')
+    parser.add_argument('--local', action='store_true',
+                        help='Build packages from local PKGBUILDs only (use with --packages)')
     parser.add_argument('--packages', nargs='+',
                         help='Force rebuild specific packages by name')
     parser.add_argument('--blacklist', default='blacklist.txt',
@@ -924,11 +982,45 @@ if __name__ == "__main__":
     # Mutually exclusive group for git update options
     git_group = parser.add_mutually_exclusive_group()
     git_group.add_argument('--no-update', action='store_true',
-                       help='Skip updating state repository and PKGBUILDs (use existing versions)')
+                       help='Skip git updates, use existing PKGBUILDs')
     git_group.add_argument('--use-latest', action='store_true',
                         help='Use latest git commit of package source instead of version tag when building')
     
     args = parser.parse_args()
+    
+    # Handle --local implying --packages mode
+    if args.local:
+        if not args.packages:
+            print("ERROR: --local requires --packages to specify which packages to build")
+            sys.exit(1)
+        
+        # For local mode, create packages directly from local PKGBUILDs
+        newer_packages = []
+        for pkg_name in args.packages:
+            pkg_dir = Path("pkgbuilds") / pkg_name
+            if not pkg_dir.exists() or not (pkg_dir / "PKGBUILD").exists():
+                print(f"ERROR: Local PKGBUILD not found for {pkg_name} at {pkg_dir}/PKGBUILD")
+                sys.exit(1)
+            
+            newer_packages.append({
+                'name': pkg_name,
+                'basename': pkg_name,
+                'version': 'local',
+                'repo': 'local',
+                'depends': [],
+                'makedepends': [],
+                'provides': [],
+                'force_latest': False,
+                'use_aur': False,
+                'use_local': True,
+                'build_stage': 0
+            })
+        
+        # Parse PKGBUILDs for dependencies
+        newer_packages = fetch_pkgbuild_deps(newer_packages, True)
+        newer_packages = sort_by_build_order(newer_packages)
+        write_results(newer_packages, args)
+        sys.exit(0)
     
     # Handle --aur implying --packages mode
     if args.aur:

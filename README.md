@@ -78,7 +78,12 @@ This automated build system maintains an AArch64 port of Arch Linux by continuou
 ./generate_build_list.py --packages yay paru --aur
 ```
 
-#### Build local packages (from pkgbuilds/ directory)
+#### Build packages from existing PKGBUILDs (skip git updates)
+```bash
+./generate_build_list.py --packages my-custom-package --no-update
+```
+
+#### Build local packages (from pkgbuilds/ directory only)
 ```bash
 ./generate_build_list.py --packages my-custom-package --local
 ```
@@ -330,7 +335,7 @@ git clone <special-glibc-repo> pkgbuilds/glibc
 |--------|-------------|
 | `--arm-urls URL [URL ...]` | URLs for AArch64 repository databases |
 | `--packages PKG [PKG ...]` | Force rebuild specific packages by name |
-| `--local` | Build packages from local PKGBUILDs (use with --packages) |
+| `--local` | Build packages from local PKGBUILDs only (use with --packages) |
 | `--aur` | Use AUR as source for packages specified with --packages |
 | `--blacklist FILE` | File containing packages to skip (default: blacklist.txt) |
 | `--missing-packages` | List packages missing from AArch64 repository |
@@ -349,6 +354,7 @@ git clone <special-glibc-repo> pkgbuilds/glibc
 | `--cache DIR` | Custom pacman cache directory |
 | `--no-cache` | Clear cache before each package build |
 | `--continue` | Continue from last successful package |
+| `--stop-on-failure` | Stop building on first package failure |
 | `--chroot DIR` | Custom chroot directory path |
 
 ### repo_analyze.py
@@ -470,8 +476,7 @@ The program outputs JSON with packages where x86_64 has newer versions, sorted b
       ],
       "force_latest": false,
       "use_aur": false,
-      "use_local": false,
-      "build_stage": 0
+      "use_local": false,      "build_stage": 0
     }
   ]
 }
@@ -490,8 +495,7 @@ The program outputs JSON with packages where x86_64 has newer versions, sorted b
 - `provides`: Virtual packages/libraries provided
 - `force_latest`: Use latest git commit instead of version tag
 - `use_aur`: Clone from AUR instead of Arch Linux GitLab
-- `use_local`: Use local PKGBUILD from pkgbuilds/ directory
-- `build_stage`: Build order stage number
+- `use_local`: Use local PKGBUILD from pkgbuilds/ directory- `build_stage`: Build order stage number
 - `skip`: If set to 1, package is blacklisted and should be skipped during build
 
 ## JSON Format
@@ -515,7 +519,6 @@ The output JSON contains metadata and an array of packages to build:
       "provides": ["libboost_atomic.so=1.86.0-64"],
       "force_latest": false,
       "use_aur": false,
-      "use_local": false,
       "build_stage": 0,
       "skip": 0
     }
@@ -910,7 +913,7 @@ The program outputs JSON with packages where x86_64 has newer versions, sorted b
       "use_aur": false,
       "build_stage": 0
     }
-  ]
+      "use_local": false,  ]
 }
 ```
 
@@ -929,7 +932,7 @@ The program outputs JSON with packages where x86_64 has newer versions, sorted b
 - `use_aur`: Clone from AUR instead of Arch Linux GitLab
 - `build_stage`: Build order stage number
 - `skip`: If set to 1, package is blacklisted and should be skipped during build
-
+- `use_local`: Use local PKGBUILD from pkgbuilds/ directory
 ## JSON Format
 
 The output JSON contains metadata and an array of packages to build:
