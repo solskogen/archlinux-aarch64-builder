@@ -24,8 +24,11 @@ def load_database_packages(urls, arch_suffix, download=True):
         try:
             db_filename = url.split('/')[-1].replace('.db', f'{arch_suffix}.db')
             
-            if download:
-                print(f"Downloading {db_filename}...")
+            if download or not Path(db_filename).exists():
+                if not download:
+                    print(f"Database {db_filename} not found, downloading...")
+                else:
+                    print(f"Downloading {db_filename}...")
                 subprocess.run(["wget", "-q", "-O", db_filename, url], check=True)
             
             repo_name = url.split('/')[-4]  # Extract 'core' or 'extra' from URL

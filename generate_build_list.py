@@ -1076,7 +1076,16 @@ if __name__ == "__main__":
             if pkg_name in all_x86_packages:
                 filtered_x86_packages[pkg_name] = all_x86_packages[pkg_name]
             else:
-                print(f"Warning: Package {pkg_name} not found in x86_64 repositories")
+                # Check if it's a basename (pkgbase) instead of package name
+                found_by_basename = False
+                for name, pkg_data in all_x86_packages.items():
+                    if pkg_data['basename'] == pkg_name:
+                        filtered_x86_packages[name] = pkg_data
+                        found_by_basename = True
+                        break
+                
+                if not found_by_basename:
+                    print(f"Warning: Package {pkg_name} not found in x86_64 repositories")
         x86_packages = filtered_x86_packages
         # Store full package list for dependency resolution
         full_x86_packages = all_x86_packages
