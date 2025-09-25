@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 from packaging import version
 import tarfile
+import fnmatch
 
 def parse_database_file_with_any(db_filename):
     """Parse a pacman database file including ARCH=any packages"""
@@ -79,6 +80,12 @@ from utils import load_blacklist
 def main():
     parser = argparse.ArgumentParser(description='Analyze repository differences')
     parser.add_argument('--blacklist', help='Blacklist file (default: blacklist.txt)')
+    parser.add_argument('--missing-pkgbase', action='store_true', help='Print missing pkgbase names (space delimited)')
+    parser.add_argument('--outdated-any', action='store_true', help='Show outdated any packages')
+    parser.add_argument('--missing-any', action='store_true', help='Show missing any packages')
+    parser.add_argument('--repo-mismatches', action='store_true', help='Show repository mismatches')
+    parser.add_argument('--arm-newer', action='store_true', help='Show packages where AArch64 is newer')
+    parser.add_argument('--arm-only', action='store_true', help='Show AArch64 only packages')
     args = parser.parse_args()
     
     # Load blacklist
@@ -92,7 +99,7 @@ def main():
         "https://geo.mirror.pkgbuild.com/extra/os/x86_64/extra.db"
     ]
     x86_packages = load_packages_with_any(x86_urls, '_x86_64')
-    print(f"Loaded {len(x86_packages)} x86_64 packages")
+    print(f"Loaded {len(x86_packages)} x86_64 package names")
     
     print("Loading AArch64 packages...")
     arm_urls = [
@@ -100,9 +107,7 @@ def main():
         "https://arch-linux-repo.drzee.net/arch/extra/os/aarch64/extra.db"
     ]
     arm_packages = load_packages_with_any(arm_urls, '_aarch64')
-    print(f"Loaded {len(arm_packages)} AArch64 packages")
-    
-    print(f"Total AArch64 packages: {len(arm_packages)}")
+    print(f"Loaded {len(arm_packages)} AArch64 package names")
     
     # Group by basename
     x86_bases = {}
@@ -115,8 +120,8 @@ def main():
         basename = pkg_data['basename']
         arm_bases[basename] = pkg_data
     
-    print(f"x86_64 basenames: {len(x86_bases)}")
-    print(f"AArch64 basenames: {len(arm_bases)}")
+    print(f"x86_64 packages: {len(x86_bases)} pkgbase")
+    print(f"AArch64 packages: {len(arm_bases)} pkgbase")
     
     # Build provides lookup for x86_64
     x86_provides = {}
@@ -130,6 +135,20 @@ def main():
     arm_newer = []
     arm_only = []
     any_outdated = []
+    any_missing = []
+    missing_pkgbase = []
+    
+    # Find missing pkgbase in AArch64
+    for basename in x86_bases:
+        if basename not in arm_bases:
+            # Check if basename matches any blacklist pattern
+            is_blacklisted = False
+            for pattern in blacklist:
+                if fnmatch.fnmatch(basename, pattern):
+                    is_blacklisted = True
+                    break
+            if not is_blacklisted:
+                missing_pkgbase.append(basename)
     
     # Check AArch64 packages
     for basename, arm_data in arm_bases.items():
@@ -204,30 +223,57 @@ def main():
                     filename = arm_data.get('filename', 'unknown')
                     arm_only.append(f"{basename} [{pkg_names_str}]: {arm_data['version']} ({arm_data['repo']}) (file: {filename})")
     
-    # Output
-    if any_outdated:
-        print(f"\nOutdated 'any' Packages in AArch64 ({len(any_outdated)}):")
-        for pkg in sorted(any_outdated):
-            print(f"  {pkg}")
+    # Check for missing 'any' packages in AArch64
+    for basename, x86_data in x86_bases.items():
+        if basename not in arm_bases:
+            # Check if any individual packages for this basename are 'any' architecture
+            for pkg_name, pkg_data in x86_packages.items():
+                if pkg_data['basename'] == basename:
+                    if pkg_data.get('arch') == 'any' or pkg_data.get('filename', '').endswith('any.pkg.tar.zst'):
+                        any_missing.append(f"{pkg_name}: x86_64={pkg_data['version']} ({pkg_data['repo']})")
+                        break
     
-    if repo_mismatches:
-        print(f"\nRepository Mismatches ({len(repo_mismatches)}):")
-        for mismatch in sorted(repo_mismatches):
-            print(f"  {mismatch}")
+    # Output based on command line options
+    if args.missing_pkgbase:
+        print(' '.join(sorted(missing_pkgbase)))
+        return
     
-    if arm_newer:
-        print(f"\nAArch64 Newer Versions ({len(arm_newer)}):")
-        for pkg in sorted(arm_newer):
-            print(f"  {pkg}")
+    # If no specific options, show all except missing-pkgbase (default behavior)
+    show_all = not any([args.outdated_any, args.missing_any, args.repo_mismatches, args.arm_newer, args.arm_only])
     
-    if arm_only:
-        print(f"\nAArch64 Only Packages ({len(arm_only)}):")
-        for pkg in sorted(arm_only)[:10]:  # Show first 10
-            print(f"  {pkg}")
-        if len(arm_only) > 10:
-            print(f"  ... and {len(arm_only) - 10} more")
+    if show_all or args.outdated_any:
+        if any_outdated:
+            print(f"\nOutdated 'any' Packages in AArch64 ({len(any_outdated)}):")
+            for pkg in sorted(any_outdated):
+                print(f"  {pkg}")
     
-    if not repo_mismatches and not arm_newer and not arm_only:
+    if show_all or args.missing_any:
+        if any_missing:
+            print(f"\nMissing 'any' Packages in AArch64 ({len(any_missing)}):")
+            for pkg in sorted(any_missing):
+                print(f"  {pkg}")
+    
+    if show_all or args.repo_mismatches:
+        if repo_mismatches:
+            print(f"\nRepository Mismatches ({len(repo_mismatches)}):")
+            for mismatch in sorted(repo_mismatches):
+                print(f"  {mismatch}")
+    
+    if show_all or args.arm_newer:
+        if arm_newer:
+            print(f"\nAArch64 Newer Versions ({len(arm_newer)}):")
+            for pkg in sorted(arm_newer):
+                print(f"  {pkg}")
+    
+    if show_all or args.arm_only:
+        if arm_only:
+            print(f"\nAArch64 Only Packages ({len(arm_only)}):")
+            for pkg in sorted(arm_only)[:10]:  # Show first 10
+                print(f"  {pkg}")
+            if len(arm_only) > 10:
+                print(f"  ... and {len(arm_only) - 10} more")
+    
+    if show_all and not repo_mismatches and not arm_newer and not arm_only and not any_outdated and not any_missing:
         print("No issues found")
 
 if __name__ == "__main__":
