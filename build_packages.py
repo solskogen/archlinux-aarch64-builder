@@ -411,6 +411,11 @@ class PackageBuilder:
         for pkg in deps_str.split():
             pkg = pkg.strip().strip('\'"')
             if pkg:
+                # Remove version constraints (>=, >, =)
+                for op in ['>=', '>', '=']:
+                    if op in pkg:
+                        pkg = pkg.split(op)[0]
+                        break
                 packages.append(pkg)
         return packages
     

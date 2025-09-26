@@ -16,11 +16,13 @@ from pathlib import Path
 from build_utils import BuildUtils, BUILD_ROOT, CACHE_PATH
 from utils import validate_package_name, safe_path_join
 
-# Toolchain configuration
-TOOLCHAIN_PACKAGES = [
-    "linux-api-headers", "glibc", "binutils", "gcc", "binutils", "gmp", "mpfr", 
-    "libmpc", "libisl", "glibc", "gcc", "binutils", "gcc", "gmp", "mpfr", 
-    "libmpc", "libisl", "libtool", "valgrind"
+# Toolchain configuration - staged build
+STAGE1_PACKAGES = [
+    "linux-api-headers", "glibc", "binutils", "gcc", "gmp", "mpfr", "libmpc", "libisl"
+]
+
+STAGE2_PACKAGES = [
+    "glibc", "binutils", "gcc", "libtool", "valgrind"
 ]
 
 REQUIRED_TOOLS = ['makechrootpkg', 'pkgctl', 'repo-upload', 'arch-nspawn']
@@ -28,7 +30,7 @@ REQUIRED_TOOLS = ['makechrootpkg', 'pkgctl', 'repo-upload', 'arch-nspawn']
 class BootstrapBuilder(BuildUtils):
     """Bootstrap toolchain package builder"""
     
-    def __init__(self, chroot_path=BUILD_ROOT, cache_path=CACHE_PATH, dry_run=False, continue_build=False, no_update=False):
+    def __init__(self, chroot_path=BUILD_ROOT, cache_path=CACHE_PATH, dry_run=False, continue_build=False, no_update=False, start_from=None):
         super().__init__(dry_run)
         self.chroot_path = Path(chroot_path)
         self.cache_path = Path(cache_path)
@@ -36,9 +38,17 @@ class BootstrapBuilder(BuildUtils):
         self.continue_build = continue_build
         self.progress_file = Path("bootstrap_progress.txt")
         self.no_update = no_update
+        self.start_from = start_from
     
-    def get_start_index(self):
-        """Get starting index for continue mode"""
+    def get_start_index(self, packages):
+        """Get starting index for continue mode or start_from option"""
+        if self.start_from:
+            try:
+                return packages.index(self.start_from)
+            except ValueError:
+                print(f"ERROR: Package '{self.start_from}' not found in package list")
+                sys.exit(1)
+        
         if not self.continue_build or not self.progress_file.exists():
             return 0
         
@@ -114,7 +124,7 @@ class BootstrapBuilder(BuildUtils):
             sys.exit(1)
         
         # Force install all toolchain dependencies in chroot
-        all_toolchain = TOOLCHAIN_PACKAGES + ["gcc-libs"]
+        all_toolchain = STAGE1_PACKAGES + ["gcc-libs"]
         try:
             self.run_command([
                 "arch-nspawn", str(self.chroot_path / "root"),
@@ -179,10 +189,34 @@ class BootstrapBuilder(BuildUtils):
             print(f"ERROR: Failed to bootstrap build {pkg_name}: {e}")
             sys.exit(1)
     
+    def build_stage(self, stage_name, packages, stage_num, total_stages):
+        """Build a stage of packages"""
+        print(f"\n=== {stage_name} ({stage_num}/{total_stages}) ===")
+        
+        start_index = self.get_start_index(packages) if stage_num == 1 else 0
+        
+        if start_index > 0:
+            print(f"Starting from package {start_index + 1}/{len(packages)} in {stage_name}")
+        
+        built_count = 0
+        for i, pkg_name in enumerate(packages):
+            if i < start_index:
+                print(f"Skipping {pkg_name} ({i + 1}/{len(packages)}) - start_from specified")
+                continue
+                
+            print(f"\n--- Building {pkg_name} ({i + 1}/{len(packages)}) ---")
+            self.bootstrap_build_package(pkg_name)
+            built_count += 1
+            print(f"✓ {pkg_name} built successfully")
+        
+        print(f"✓ {stage_name} completed: {built_count}/{len(packages) - start_index} packages built")
+        return built_count
+
     def run_bootstrap(self):
-        """Run complete bootstrap toolchain build"""
-        print("=== Bootstrap Toolchain Build ===")
-        print(f"Building {len(TOOLCHAIN_PACKAGES)} toolchain packages in order")
+        """Run staged bootstrap toolchain build"""
+        print("=== Staged Bootstrap Toolchain Build ===")
+        print(f"Stage 1: {len(STAGE1_PACKAGES)} packages")
+        print(f"Stage 2: {len(STAGE2_PACKAGES)} packages")
         
         # Atomic lock file creation with PID
         lock_file = Path(BUILD_ROOT) / "bootstrap.lock"
@@ -245,8 +279,8 @@ class BootstrapBuilder(BuildUtils):
             
             # Ensure all toolchain PKGBUILDs are checked out before starting
             print("Checking out all toolchain PKGBUILDs...")
-            unique_packages = list(dict.fromkeys(TOOLCHAIN_PACKAGES))  # Remove duplicates while preserving order
-            for pkg_name in unique_packages:
+            all_packages = list(dict.fromkeys(STAGE1_PACKAGES + STAGE2_PACKAGES))  # Remove duplicates
+            for pkg_name in all_packages:
                 pkg_dir = self.build_dir / pkg_name
                 
                 if pkg_name in ["gcc", "glibc"]:
@@ -256,33 +290,6 @@ class BootstrapBuilder(BuildUtils):
                     else:
                         print(f"✓ Skipping update for {pkg_name} (special repo - managed manually)")
                     continue
-                    # Special repos - just git pull
-                    if self.dry_run:
-                        self.format_dry_run(f"Would update {pkg_name} (special repo)", ["git stash", "git pull", "git stash pop"])
-                    else:
-                        try:
-                            # Check if we're on a branch or detached HEAD
-                            branch_result = self.run_command(["git", "branch", "--show-current"], cwd=pkg_dir, capture_output=True)
-                            current_branch = branch_result.stdout.strip()
-                            
-                            if current_branch:
-                                # We're on a branch, can pull normally
-                                # Stash changes, pull, then restore
-                                stash_result = self.run_command(["git", "stash"], cwd=pkg_dir, capture_output=True)
-                                has_changes = "No local changes to save" not in stash_result.stdout
-                                
-                                self.run_command(["git", "pull"], cwd=pkg_dir)
-                                
-                                if has_changes:
-                                    self.run_command(["git", "stash", "pop"], cwd=pkg_dir)
-                            else:
-                                # Detached HEAD - just fetch latest
-                                print(f"Note: {pkg_name} is in detached HEAD state, skipping pull")
-                            
-                            print(f"✓ Updated {pkg_name}")
-                        except subprocess.CalledProcessError as e:
-                            print(f"Warning: git operations failed in {pkg_dir}: {e}")
-                            print(f"✓ Continuing with existing {pkg_name} (ignoring git errors)")
                 else:
                     # Regular Arch packages - clone or update
                     if pkg_dir.exists():
@@ -352,26 +359,18 @@ class BootstrapBuilder(BuildUtils):
                     print(f"ERROR: Failed to clear cache before bootstrap: {e}")
                     sys.exit(1)
             
-            built_count = 0
-            start_index = self.get_start_index()
+            # Build stages
+            total_built = 0
             
-            if start_index > 0:
-                print(f"Continuing from package {start_index + 1}/{len(self.TOOLCHAIN_PACKAGES)}")
+            # Stage 1: Initial build
+            total_built += self.build_stage("Stage 1 - Initial Build", STAGE1_PACKAGES, 1, 2)
             
-            for i, pkg_name in enumerate(TOOLCHAIN_PACKAGES, 1):
-                if i - 1 < start_index:
-                    print(f"Skipping {pkg_name} ({i}/{len(TOOLCHAIN_PACKAGES)}) - already completed")
-                    continue
-                    
-                print(f"\n=== Building {pkg_name} ({i}/{len(TOOLCHAIN_PACKAGES)}) ===")
-                self.bootstrap_build_package(pkg_name)
-                built_count += 1
-                self.save_progress(i - 1)
-                print(f"✓ {pkg_name} built successfully")
+            # Stage 2: Final rebuild
+            total_built += self.build_stage("Stage 2 - Final Rebuild", STAGE2_PACKAGES, 2, 2)
             
             print(f"\n=== Bootstrap Summary ===")
-            print(f"Successfully built: {built_count}/{len(TOOLCHAIN_PACKAGES) - start_index}")
-            print("Toolchain bootstrap completed successfully!")
+            print(f"Successfully built: {total_built} packages total")
+            print("Staged toolchain bootstrap completed successfully!")
             
             # Clean up progress file on successful completion
             if not self.dry_run and self.progress_file.exists():
@@ -392,6 +391,8 @@ def main():
                        help='Show what would be done without actually building')
     parser.add_argument('--continue', action='store_true', dest='continue_build',
                        help='Continue from last successful package')
+    parser.add_argument('--start-from', metavar='PACKAGE',
+                       help='Start from specific package in stage 1 (linux-api-headers, glibc, binutils, gcc, gmp, mpfr, libmpc, libisl)')
     parser.add_argument('--no-update', action='store_true',
                        help='Skip git updates for gcc/glibc special repos')
     
@@ -399,7 +400,7 @@ def main():
     
     builder = BootstrapBuilder(chroot_path=args.chroot, cache_path=args.cache, 
                               dry_run=args.dry_run, continue_build=args.continue_build,
-                              no_update=args.no_update)
+                              no_update=args.no_update, start_from=args.start_from)
     builder.run_bootstrap()
 
 if __name__ == "__main__":

@@ -404,15 +404,17 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
                 else:
                     print(f"[{i}/{total}] Processing {name} (fetching {target_version})...")
                     # Use git directly for more reliable tag switching
+                    # Convert ++ to plusplus for GitLab URLs
+                    gitlab_basename = basename.replace('++', 'plusplus')
                     if pkg.get('force_latest', False):
                         # Clone and stay on main branch
-                        result = subprocess.run(["git", "clone", f"https://gitlab.archlinux.org/archlinux/packaging/packages/{basename}.git", basename], 
+                        result = subprocess.run(["git", "clone", f"https://gitlab.archlinux.org/archlinux/packaging/packages/{gitlab_basename}.git", basename], 
                                              cwd="pkgbuilds", check=True, 
                                              capture_output=True, text=True)
                     else:
                         # Clone and checkout specific version tag
                         version_tag = pkg['version']
-                        result = subprocess.run(["git", "clone", f"https://gitlab.archlinux.org/archlinux/packaging/packages/{basename}.git", basename], 
+                        result = subprocess.run(["git", "clone", f"https://gitlab.archlinux.org/archlinux/packaging/packages/{gitlab_basename}.git", basename], 
                                              cwd="pkgbuilds", check=True, 
                                              capture_output=True, text=True)
                         # Checkout the specific tag - try different tag formats
@@ -995,7 +997,7 @@ if __name__ == "__main__":
                 'name': pkg_name,
                 'basename': pkg_name,
                 'version': 'local',
-                'repo': 'local',
+                'repo': 'extra',
                 'depends': [],
                 'makedepends': [],
                 'provides': [],
@@ -1074,7 +1076,43 @@ if __name__ == "__main__":
                         break
                 
                 if not found_by_basename:
-                    print(f"Warning: Package {pkg_name} not found in x86_64 repositories")
+                    # Check if package exists but is ARCH=any (filtered out)
+                    arch_any_found = False
+                    for repo in ['core', 'extra']:
+                        try:
+                            db_filename = f"{repo}_x86_64.db"
+                            if os.path.exists(db_filename):
+                                with tarfile.open(db_filename, 'r:gz') as tar:
+                                    for member in tar.getmembers():
+                                        if member.name.endswith('/desc'):
+                                            desc_content = tar.extractfile(member).read().decode('utf-8')
+                                            lines = desc_content.strip().split('\n')
+                                            data = {}
+                                            current_key = None
+                                            
+                                            for line in lines:
+                                                if line.startswith('%') and line.endswith('%'):
+                                                    current_key = line[1:-1]
+                                                    data[current_key] = []
+                                                elif current_key and line:
+                                                    data[current_key].append(line)
+                                            
+                                            if ('NAME' in data and data['NAME'][0] == pkg_name) or \
+                                               ('BASE' in data and data['BASE'][0] == pkg_name):
+                                                if data.get('ARCH', [''])[0] == 'any':
+                                                    print(f"ERROR: Package {pkg_name} is ARCH=any and doesn't need rebuilding for AArch64")
+                                                    print(f"       ARCH=any packages work on all architectures without modification")
+                                                    sys.exit(1)
+                                                arch_any_found = True
+                                                break
+                                    if arch_any_found:
+                                        break
+                        except Exception:
+                            continue
+                    
+                    if not arch_any_found:
+                        print(f"ERROR: Package {pkg_name} not found in x86_64 repositories")
+                        sys.exit(1)
         x86_packages = filtered_x86_packages
         # Store full package list for dependency resolution
         full_x86_packages = all_x86_packages

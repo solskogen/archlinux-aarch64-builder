@@ -192,6 +192,15 @@ git clone <special-glibc-repo-url> pkgbuilds/glibc
 ./bootstrap_toolchain.py --dry-run --chroot /custom/chroot --cache /custom/cache
 ```
 
+#### Bootstrap starting from specific package
+```bash
+# Skip linux-api-headers if no update
+./bootstrap_toolchain.py --start-from glibc
+
+# Skip toolchain, only rebuild math libs + stage 2
+./bootstrap_toolchain.py --start-from gmp
+```
+
 ## Use Cases
 
 ### 1. Regular Package Updates
@@ -421,15 +430,17 @@ When using `--no-cache`, the pacman cache is cleared before building each packag
 
 ## Toolchain Bootstrap
 
-The `bootstrap_toolchain.py` script builds core toolchain packages in a specific order required for a complete toolchain rebuild:
+The `bootstrap_toolchain.py` script builds core toolchain packages in a staged approach to ensure all components are compiled with each other:
 
-**Build Order**: linux-api-headers → glibc → binutils → gcc → gmp → mpfr → libmpc → libisl → glibc → binutils → gcc → gmp → mpfr → libmpc → libisl → libtool → valgrind
+**Stage 1 - Initial Build**: linux-api-headers → glibc → binutils → gcc → gmp → mpfr → libmpc → libisl
+
+**Stage 2 - Final Rebuild**: glibc → binutils → gcc → libtool → valgrind
 
 **Special Requirements**:
 - `gcc` and `glibc` must be manually checked out from their special repositories
 - Other packages are automatically cloned from Arch Linux GitLab if missing
 - Uses lock file (bootstrap.lock) to prevent multiple simultaneous runs
-- Shows progress indication (e.g., "Building gcc (4/17)")
+- Shows progress indication per stage and package
 - Graceful cleanup on interruption (SIGINT/SIGTERM)
 - Updates chroot package database before each build
 - Force installs latest toolchain dependencies
@@ -847,15 +858,17 @@ When using `--no-cache`, the pacman cache is cleared before building each packag
 
 ## Toolchain Bootstrap
 
-The `bootstrap_toolchain.py` script builds core toolchain packages in a specific order required for a complete toolchain rebuild:
+The `bootstrap_toolchain.py` script builds core toolchain packages in a staged approach to ensure all components are compiled with each other:
 
-**Build Order**: linux-api-headers → glibc → binutils → gcc → gmp → mpfr → libmpc → libisl → glibc → binutils → gcc → gmp → mpfr → libmpc → libisl → libtool → valgrind
+**Stage 1 - Initial Build**: linux-api-headers → glibc → binutils → gcc → gmp → mpfr → libmpc → libisl
+
+**Stage 2 - Final Rebuild**: glibc → binutils → gcc → libtool → valgrind
 
 **Special Requirements**:
 - `gcc` and `glibc` must be manually checked out from their special repositories
 - Other packages are automatically cloned from Arch Linux GitLab if missing
 - Uses lock file (bootstrap.lock) to prevent multiple simultaneous runs
-- Shows progress indication (e.g., "Building gcc (4/17)")
+- Shows progress indication per stage and package
 - Graceful cleanup on interruption (SIGINT/SIGTERM)
 - Updates chroot package database before each build
 - Force installs latest toolchain dependencies
