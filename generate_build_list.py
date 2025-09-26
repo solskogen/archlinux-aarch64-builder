@@ -1,6 +1,27 @@
 #!/bin/bash
 '''exec' python3 -B "$0" "$@"
 ' '''
+"""
+Arch Linux AArch64 Build List Generator
+
+This script compares package versions between x86_64 and AArch64 repositories
+to identify packages that need building. It generates a dependency-ordered
+build list with complete package metadata.
+
+Key features:
+- Version comparison using Arch Linux state repository
+- Dependency resolution and topological sorting
+- PKGBUILD fetching with git tag management
+- Variable expansion in PKGBUILDs
+- Blacklist filtering and missing package detection
+- Support for AUR and local packages
+
+Usage:
+    ./generate_build_list.py                    # Find outdated packages
+    ./generate_build_list.py --packages vim    # Force rebuild specific packages
+    ./generate_build_list.py --missing-packages # List missing packages
+"""
+
 import urllib.request
 import tarfile
 import json
@@ -22,11 +43,24 @@ from utils import (
 )
 
 def needs_package_update(upstream_version: str, target_version: str) -> bool:
-    """Check if package needs update based on version comparison"""
+    """
+    Check if package needs update based on version comparison.
+    
+    Uses Arch Linux version comparison logic including epoch handling.
+    """
     return is_version_newer(target_version, upstream_version)
 
 def get_provides_mapping():
-    """Get basename to provides mapping from upstream x86_64 databases"""
+    """
+    Get basename to provides mapping from upstream x86_64 databases.
+    
+    Downloads and parses official Arch Linux databases to build a mapping
+    of package names to what they provide. This is used for dependency
+    resolution when packages depend on virtual packages.
+    
+    Returns:
+        dict: Mapping of provided names to providing package basenames
+    """
     mirror_url = 'https://archlinux.carebears.no'
     provides_map = {}
     
@@ -224,7 +258,22 @@ def parse_state_repo(repo_name):
     return packages
 
 def parse_pkgbuild_deps(pkgbuild_path):
-    """Extract dependencies from PKGBUILD file"""
+    """
+    Extract dependencies from PKGBUILD file with robust parsing.
+    
+    Handles various PKGBUILD formats including:
+    - Single and multi-line dependency arrays
+    - Comments within arrays (# comment)
+    - Variable expansion ($_variable)
+    - Inline comments after dependencies
+    - Multiple quoted items on same line
+    
+    Args:
+        pkgbuild_path: Path to PKGBUILD file
+        
+    Returns:
+        dict: Dictionary with depends, makedepends, checkdepends, provides lists
+    """
     deps = {'depends': [], 'makedepends': [], 'checkdepends': [], 'provides': []}
     
     try:
@@ -338,7 +387,23 @@ def parse_pkgbuild_deps(pkgbuild_path):
     return deps
 
 def fetch_pkgbuild_deps(packages_to_build, no_update=False):
-    """Fetch PKGBUILDs for packages that need building and extract full dependencies"""
+    """
+    Fetch PKGBUILDs for packages and extract complete dependency information.
+    
+    This function:
+    1. Clones or updates git repositories for each package
+    2. Handles version tag checkout for specific versions
+    3. Parses PKGBUILDs to extract all dependencies
+    4. Filters dependencies to only include packages in the build list
+    5. Provides clear progress messages about git operations
+    
+    Args:
+        packages_to_build: List of package dictionaries to process
+        no_update: Skip git operations, use existing PKGBUILDs
+        
+    Returns:
+        list: Updated package list with complete dependency information
+    """
     if not packages_to_build:
         return packages_to_build
         
@@ -618,6 +683,25 @@ def find_missing_dependencies(packages, x86_packages, arm_packages):
     return missing_deps
 
 def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=None, missing_packages_mode=False, aur_packages=None, use_latest=False):
+    """
+    Compare package versions between x86_64 and AArch64 repositories.
+    
+    Identifies packages that need building by comparing versions and handling
+    various scenarios like missing packages, blacklisted packages, and
+    bootstrap-only packages.
+    
+    Args:
+        x86_packages: Dictionary of x86_64 packages
+        arm_packages: Dictionary of AArch64 packages  
+        force_packages: Set of packages to force rebuild
+        blacklist: List of blacklist patterns
+        missing_packages_mode: Only return missing packages
+        aur_packages: Set of packages to get from AUR
+        use_latest: Use latest git commits instead of version tags
+        
+    Returns:
+        tuple: (packages_to_build, skipped_packages, blacklisted_missing)
+    """
     if force_packages is None:
         force_packages = set()
     if aur_packages is None:
@@ -877,6 +961,18 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
     return newer_in_x86, skipped_packages, blacklisted_missing
 
 def sort_by_build_order(packages):
+    """
+    Sort packages by dependency order using topological sort.
+    
+    Ensures that dependencies are built before packages that depend on them.
+    Handles circular dependencies gracefully and assigns build stages.
+    
+    Args:
+        packages: List of package dictionaries with dependency information
+        
+    Returns:
+        list: Packages sorted by build order with build_stage assigned
+    """
     # Create maps for quick lookup
     pkg_map = {pkg['name']: pkg for pkg in packages}
     provides_map = {}

@@ -277,6 +277,21 @@ class BootstrapBuilder(BuildUtils):
                     print(f"ERROR: {pkg_dir} not found - please checkout {pkg_name} from special repo manually")
                     sys.exit(1)
             
+            # Clear build directory for fresh start (unless continuing)
+            if not self.continue_build and not self.start_from:
+                if self.dry_run:
+                    self.format_dry_run(f"Would clear build directory for fresh start", [f"rm -rf {BUILD_ROOT}"])
+                else:
+                    print(f"Clearing build directory for fresh bootstrap: {BUILD_ROOT}")
+                    try:
+                        if Path(BUILD_ROOT).exists():
+                            subprocess.run(["sudo", "rm", "-rf", BUILD_ROOT], check=True)
+                        Path(BUILD_ROOT).mkdir(parents=True, exist_ok=True)
+                        print(f"Build directory cleared and recreated")
+                    except subprocess.CalledProcessError as e:
+                        print(f"ERROR: Failed to clear build directory: {e}")
+                        sys.exit(1)
+            
             # Ensure all toolchain PKGBUILDs are checked out before starting
             print("Checking out all toolchain PKGBUILDs...")
             all_packages = list(dict.fromkeys(STAGE1_PACKAGES + STAGE2_PACKAGES))  # Remove duplicates
