@@ -154,6 +154,15 @@ class PackageBuilder:
         with open(pkgbuild_path, 'r') as f:
             pkgbuild_content = f.read()
             
+            # Extract variables for substitution
+            variables = {}
+            for line in pkgbuild_content.split('\n'):
+                line = line.strip()
+                if '=' in line and not line.startswith('#') and not line.startswith('depends=') and not line.startswith('makedepends=') and not line.startswith('checkdepends='):
+                    if line.startswith('_') or line.startswith('pkgver=') or line.startswith('pkgrel='):
+                        var_name, var_value = line.split('=', 1)
+                        variables[var_name] = var_value.strip('\'"')
+            
             # Extract dependencies - handle single line and multi-line arrays
             lines = pkgbuild_content.split('\n')
             in_depends = False
@@ -167,52 +176,58 @@ class PackageBuilder:
                 if line.startswith('depends=('):
                     if line.endswith(')'):
                         deps_str = line[len('depends=('):-1]
-                        depends.extend(self._parse_package_list(deps_str))
+                        depends.extend(self._parse_package_list(deps_str, variables))
                     else:
                         in_depends = True
                         deps_str = line[len('depends=('):]
-                        depends.extend(self._parse_package_list(deps_str))
+                        depends.extend(self._parse_package_list(deps_str, variables))
                 elif in_depends:
                     if line.endswith(')'):
                         deps_str = line[:-1]
-                        depends.extend(self._parse_package_list(deps_str))
+                        depends.extend(self._parse_package_list(deps_str, variables))
                         in_depends = False
                     else:
-                        depends.extend(self._parse_package_list(line))
+                        # Skip comment lines entirely
+                        if not line.startswith('#'):
+                            depends.extend(self._parse_package_list(line, variables))
                 
                 # Handle makedepends
                 elif line.startswith('makedepends=('):
                     if line.endswith(')'):
                         deps_str = line[len('makedepends=('):-1]
-                        makedepends.extend(self._parse_package_list(deps_str))
+                        makedepends.extend(self._parse_package_list(deps_str, variables))
                     else:
                         in_makedepends = True
                         deps_str = line[len('makedepends=('):]
-                        makedepends.extend(self._parse_package_list(deps_str))
+                        makedepends.extend(self._parse_package_list(deps_str, variables))
                 elif in_makedepends:
                     if line.endswith(')'):
                         deps_str = line[:-1]
-                        makedepends.extend(self._parse_package_list(deps_str))
+                        makedepends.extend(self._parse_package_list(deps_str, variables))
                         in_makedepends = False
                     else:
-                        makedepends.extend(self._parse_package_list(line))
+                        # Skip comment lines entirely
+                        if not line.startswith('#'):
+                            makedepends.extend(self._parse_package_list(line, variables))
                 
                 # Handle checkdepends
                 elif line.startswith('checkdepends=('):
                     if line.endswith(')'):
                         deps_str = line[len('checkdepends=('):-1]
-                        checkdepends.extend(self._parse_package_list(deps_str))
+                        checkdepends.extend(self._parse_package_list(deps_str, variables))
                     else:
                         in_checkdepends = True
                         deps_str = line[len('checkdepends=('):]
-                        checkdepends.extend(self._parse_package_list(deps_str))
+                        checkdepends.extend(self._parse_package_list(deps_str, variables))
                 elif in_checkdepends:
                     if line.endswith(')'):
                         deps_str = line[:-1]
-                        checkdepends.extend(self._parse_package_list(deps_str))
+                        checkdepends.extend(self._parse_package_list(deps_str, variables))
                         in_checkdepends = False
                     else:
-                        checkdepends.extend(self._parse_package_list(line))
+                        # Skip comment lines entirely
+                        if not line.startswith('#'):
+                            checkdepends.extend(self._parse_package_list(line, variables))
         
         # Always create temporary chroot
         import random
@@ -401,16 +416,23 @@ class PackageBuilder:
         except Exception:
             pass
     
-    def _parse_package_list(self, deps_str):
+    def _parse_package_list(self, deps_str, variables=None):
         """Parse package list handling single quotes, double quotes, and no quotes"""
         if not deps_str.strip():
             return []
+        
+        if variables is None:
+            variables = {}
         
         packages = []
         # Split by whitespace and clean up quotes
         for pkg in deps_str.split():
             pkg = pkg.strip().strip('\'"')
-            if pkg:
+            # Skip comments and empty strings
+            if pkg and not pkg.startswith('#'):
+                # Expand variables
+                for var_name, var_value in variables.items():
+                    pkg = pkg.replace(f'${var_name}', var_value)
                 # Remove version constraints (>=, >, =)
                 for op in ['>=', '>', '=']:
                     if op in pkg:
