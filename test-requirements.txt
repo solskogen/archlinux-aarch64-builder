@@ -1,0 +1,10 @@
+# Testing dependencies
+pytest>=7.0.0
+pytest-mock>=3.10.0
+pytest-cov>=4.0.0
+
+# For mocking HTTP requests in tests
+responses>=0.23.0
+
+# For temporary file handling in tests
+pytest-tmp-path>=0.1.0

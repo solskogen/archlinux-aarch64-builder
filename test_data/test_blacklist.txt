@@ -1,0 +1,17 @@
+# Test blacklist file
+# Comments should be ignored
+
+# Specific packages
+blacklisted-package
+another-blacklisted
+
+# Wildcard patterns  
+lib32-*
+*-git
+test-*
+
+# Empty lines should be ignored
+
+# More patterns
+broken-pkg
+unstable-*

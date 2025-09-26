@@ -9,7 +9,10 @@ import argparse
 import time
 from pathlib import Path
 from build_utils import BuildUtils, BUILD_ROOT, CACHE_PATH
-from utils import load_blacklist, filter_blacklisted_packages
+from utils import (
+    load_blacklist, filter_blacklisted_packages, 
+    validate_package_name, safe_path_join, PACKAGE_SKIP_FLAG
+)
 
 class PackageBuilder:
     def __init__(self, dry_run=False, chroot_path=None, cache_dir=None, no_cache=False, no_upload=False, stop_on_failure=False):
@@ -91,6 +94,11 @@ class PackageBuilder:
     
     def build_package(self, pkg_name, pkg_data):
         """Build a single package"""
+        # Validate package name
+        if not validate_package_name(pkg_name):
+            print(f"ERROR: Invalid package name: {pkg_name}")
+            return False
+            
         print(f"\n{'='*60}")
         print(f"Building {pkg_name}")
         print(f"{'='*60}")
@@ -102,7 +110,7 @@ class PackageBuilder:
             print("Run setup_chroot() first or create with mkarchroot")
             return False
         
-        pkg_dir = Path("pkgbuilds") / pkg_name
+        pkg_dir = safe_path_join(Path("pkgbuilds"), pkg_name)
         if not pkg_dir.exists():
             print(f"ERROR: Package directory {pkg_dir} not found")
             return False
@@ -139,37 +147,71 @@ class PackageBuilder:
         env = os.environ.copy()
         env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
         
-        # Parse PKGBUILD for checkdepends
+        # Parse PKGBUILD for depends, makedepends, and checkdepends
+        depends = []
+        makedepends = []
         checkdepends = []
         with open(pkgbuild_path, 'r') as f:
             pkgbuild_content = f.read()
             
-            # Extract checkdepends - handle single line and multi-line arrays
+            # Extract dependencies - handle single line and multi-line arrays
             lines = pkgbuild_content.split('\n')
+            in_depends = False
+            in_makedepends = False
             in_checkdepends = False
             
             for line in lines:
                 line = line.strip()
                 
-                if line.startswith('checkdepends=('):
-                    # Single line: checkdepends=('pkg1' 'pkg2' "pkg3")
+                # Handle depends
+                if line.startswith('depends=('):
                     if line.endswith(')'):
-                        # Complete on one line
+                        deps_str = line[len('depends=('):-1]
+                        depends.extend(self._parse_package_list(deps_str))
+                    else:
+                        in_depends = True
+                        deps_str = line[len('depends=('):]
+                        depends.extend(self._parse_package_list(deps_str))
+                elif in_depends:
+                    if line.endswith(')'):
+                        deps_str = line[:-1]
+                        depends.extend(self._parse_package_list(deps_str))
+                        in_depends = False
+                    else:
+                        depends.extend(self._parse_package_list(line))
+                
+                # Handle makedepends
+                elif line.startswith('makedepends=('):
+                    if line.endswith(')'):
+                        deps_str = line[len('makedepends=('):-1]
+                        makedepends.extend(self._parse_package_list(deps_str))
+                    else:
+                        in_makedepends = True
+                        deps_str = line[len('makedepends=('):]
+                        makedepends.extend(self._parse_package_list(deps_str))
+                elif in_makedepends:
+                    if line.endswith(')'):
+                        deps_str = line[:-1]
+                        makedepends.extend(self._parse_package_list(deps_str))
+                        in_makedepends = False
+                    else:
+                        makedepends.extend(self._parse_package_list(line))
+                
+                # Handle checkdepends
+                elif line.startswith('checkdepends=('):
+                    if line.endswith(')'):
                         deps_str = line[len('checkdepends=('):-1]
                         checkdepends.extend(self._parse_package_list(deps_str))
                     else:
-                        # Multi-line array starts
                         in_checkdepends = True
                         deps_str = line[len('checkdepends=('):]
                         checkdepends.extend(self._parse_package_list(deps_str))
                 elif in_checkdepends:
                     if line.endswith(')'):
-                        # Multi-line array ends
                         deps_str = line[:-1]
                         checkdepends.extend(self._parse_package_list(deps_str))
                         in_checkdepends = False
                     else:
-                        # Continue multi-line array
                         checkdepends.extend(self._parse_package_list(line))
         
         # Always create temporary chroot
@@ -209,16 +251,17 @@ class PackageBuilder:
             except KeyboardInterrupt:
                 sys.exit(1)
             
-            # Install checkdepends if any
-            if checkdepends:
-                print(f"Installing checkdepends: {' '.join(checkdepends)}")
+            # Install all dependencies if any
+            all_deps = depends + makedepends + checkdepends
+            if all_deps:
+                print(f"Installing dependencies: {' '.join(all_deps)}")
                 try:
                     subprocess.run([
                         "sudo", "arch-nspawn", 
                         "-c", str(self.cache_dir),  # Bind mount cache directory
                         str(temp_copy_path),
                         "pacman", "-S", "--noconfirm"
-                    ] + checkdepends, check=True, env=env)
+                    ] + all_deps, check=True, env=env)
                 except KeyboardInterrupt:
                     sys.exit(1)
             
@@ -391,7 +434,7 @@ class PackageBuilder:
                     print(f"Filtered out {filtered_count} blacklisted packages")
         
         # Filter out packages with skip=1
-        packages = [pkg for pkg in packages if not pkg.get('skip', 0)]
+        packages = [pkg for pkg in packages if not pkg.get('skip', 0) == PACKAGE_SKIP_FLAG]
         
         if not packages:
             print("No packages to build after filtering")

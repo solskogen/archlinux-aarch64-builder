@@ -15,7 +15,15 @@ import shutil
 import tempfile
 from pathlib import Path
 from packaging import version
-from utils import load_blacklist, load_x86_64_packages, load_aarch64_packages
+from utils import (
+    load_blacklist, load_x86_64_packages, load_aarch64_packages,
+    validate_package_name, safe_path_join, is_version_newer,
+    PACKAGE_SKIP_FLAG, PACKAGE_BUILD_FLAG
+)
+
+def needs_package_update(upstream_version: str, target_version: str) -> bool:
+    """Check if package needs update based on version comparison"""
+    return is_version_newer(target_version, upstream_version)
 
 def get_provides_mapping():
     """Get basename to provides mapping from upstream x86_64 databases"""
@@ -709,35 +717,9 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
                     else:
                         # Same epoch, compare versions
                         try:
-                            # Handle git revision versions (e.g., "15.2.1+r22+gc4e96a094636-1")
-                            # Git revisions are generally newer than release versions
-                            if '+r' in arm_ver_str and '+r' not in x86_ver_str:
-                                # ARM has git revision, x86 doesn't - ARM is likely newer
-                                has_newer_version = False
-                            elif '+r' in x86_ver_str and '+r' not in arm_ver_str:
-                                # x86 has git revision, ARM doesn't - x86 is likely newer
-                                has_newer_version = True
-                            else:
-                                # Both are same type, use packaging.version
-                                x86_ver = version.parse(x86_ver_str)
-                                arm_ver = version.parse(arm_ver_str)
-                                has_newer_version = x86_ver > arm_ver
+                            has_newer_version = is_version_newer(arm_ver_str, x86_ver_str)
                         except Exception:
-                            # Fallback: try to extract numeric parts for comparison
-                            import re
-                            x86_nums = re.findall(r'\d+', x86_ver_str)
-                            arm_nums = re.findall(r'\d+', arm_ver_str)
-                            
-                            # Compare numeric sequences
-                            for i in range(min(len(x86_nums), len(arm_nums))):
-                                x86_num = int(x86_nums[i])
-                                arm_num = int(arm_nums[i])
-                                if x86_num != arm_num:
-                                    has_newer_version = x86_num > arm_num
-                                    break
-                            else:
-                                # If all compared numbers are equal, compare by string length/content
-                                has_newer_version = x86_ver_str > arm_ver_str
+                            has_newer_version = x86_ver_str > arm_ver_str
                 except Exception:
                     pass
             else:
@@ -987,6 +969,13 @@ if __name__ == "__main__":
                         help='Use latest git commit of package source instead of version tag when building')
     
     args = parser.parse_args()
+    
+    # Validate package names if specified
+    if args.packages:
+        for pkg_name in args.packages:
+            if not validate_package_name(pkg_name):
+                print(f"ERROR: Invalid package name: {pkg_name}")
+                sys.exit(1)
     
     # Handle --local implying --packages mode
     if args.local:
