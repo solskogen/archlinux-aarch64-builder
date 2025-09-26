@@ -6,15 +6,14 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Default build paths
+# Configuration constants
 BUILD_ROOT = "/var/tmp/builder"
 CACHE_PATH = f"{BUILD_ROOT}/pacman-cache"
+UPLOAD_BUCKET = "arch-linux-repos.drzee.net"
+LOG_RETENTION_COUNT = 3
 
 class BuildUtils:
     """Shared utilities for package builders"""
-    
-    UPLOAD_BUCKET = "arch-linux-repos.drzee.net"
-    LOG_RETENTION_COUNT = 3
     
     def __init__(self, dry_run=False):
         self.dry_run = dry_run
@@ -43,7 +42,7 @@ class BuildUtils:
     def cleanup_old_logs(self, package_name, keep_count=None):
         """Keep only the most recent N log files for a package"""
         if keep_count is None:
-            keep_count = self.LOG_RETENTION_COUNT
+            keep_count = LOG_RETENTION_COUNT
             
         if not self.logs_dir.exists():
             return
@@ -103,7 +102,7 @@ class BuildUtils:
                     "repo-upload", pkg,
                     "--arch", "aarch64",
                     "--repo", target_repo,
-                    "--bucket", self.UPLOAD_BUCKET
+                    "--bucket", UPLOAD_BUCKET
                 ])
                 print(f"Uploaded {Path(pkg).name} to {target_repo}")
             except subprocess.CalledProcessError as e:

@@ -14,18 +14,19 @@ import argparse
 import signal
 from pathlib import Path
 from build_utils import BuildUtils, BUILD_ROOT, CACHE_PATH
+from utils import validate_package_name, safe_path_join
+
+# Toolchain configuration
+TOOLCHAIN_PACKAGES = [
+    "linux-api-headers", "glibc", "binutils", "gcc", "binutils", "gmp", "mpfr", 
+    "libmpc", "libisl", "glibc", "gcc", "binutils", "gcc", "gmp", "mpfr", 
+    "libmpc", "libisl", "libtool", "valgrind"
+]
+
+REQUIRED_TOOLS = ['makechrootpkg', 'pkgctl', 'repo-upload', 'arch-nspawn']
 
 class BootstrapBuilder(BuildUtils):
     """Bootstrap toolchain package builder"""
-    
-    # Toolchain packages in build order (some repeated for multi-pass builds)
-    TOOLCHAIN_PACKAGES = [
-        "linux-api-headers", "glibc", "binutils", "gcc", "binutils", "gmp", "mpfr", 
-        "libmpc", "libisl", "glibc", "gcc", "binutils", "gcc", "gmp", "mpfr", 
-        "libmpc", "libisl", "libtool", "valgrind"
-    ]
-    
-    REQUIRED_TOOLS = ['makechrootpkg', 'pkgctl', 'repo-upload', 'arch-nspawn']
     
     def __init__(self, chroot_path=BUILD_ROOT, cache_path=CACHE_PATH, dry_run=False, continue_build=False, no_update=False):
         super().__init__(dry_run)
@@ -113,7 +114,7 @@ class BootstrapBuilder(BuildUtils):
             sys.exit(1)
         
         # Force install all toolchain dependencies in chroot
-        all_toolchain = self.TOOLCHAIN_PACKAGES + ["gcc-libs"]
+        all_toolchain = TOOLCHAIN_PACKAGES + ["gcc-libs"]
         try:
             self.run_command([
                 "arch-nspawn", str(self.chroot_path / "root"),
@@ -181,7 +182,7 @@ class BootstrapBuilder(BuildUtils):
     def run_bootstrap(self):
         """Run complete bootstrap toolchain build"""
         print("=== Bootstrap Toolchain Build ===")
-        print(f"Building {len(self.TOOLCHAIN_PACKAGES)} toolchain packages in order")
+        print(f"Building {len(TOOLCHAIN_PACKAGES)} toolchain packages in order")
         
         # Atomic lock file creation with PID
         lock_file = Path(BUILD_ROOT) / "bootstrap.lock"
@@ -230,7 +231,7 @@ class BootstrapBuilder(BuildUtils):
         
         try:
             # Validate required tools exist
-            for tool in self.REQUIRED_TOOLS:
+            for tool in REQUIRED_TOOLS:
                 if not self.dry_run and not shutil.which(tool):
                     print(f"ERROR: Required tool '{tool}' not found in PATH")
                     sys.exit(1)
@@ -244,7 +245,7 @@ class BootstrapBuilder(BuildUtils):
             
             # Ensure all toolchain PKGBUILDs are checked out before starting
             print("Checking out all toolchain PKGBUILDs...")
-            unique_packages = list(dict.fromkeys(self.TOOLCHAIN_PACKAGES))  # Remove duplicates while preserving order
+            unique_packages = list(dict.fromkeys(TOOLCHAIN_PACKAGES))  # Remove duplicates while preserving order
             for pkg_name in unique_packages:
                 pkg_dir = self.build_dir / pkg_name
                 
@@ -357,19 +358,19 @@ class BootstrapBuilder(BuildUtils):
             if start_index > 0:
                 print(f"Continuing from package {start_index + 1}/{len(self.TOOLCHAIN_PACKAGES)}")
             
-            for i, pkg_name in enumerate(self.TOOLCHAIN_PACKAGES, 1):
+            for i, pkg_name in enumerate(TOOLCHAIN_PACKAGES, 1):
                 if i - 1 < start_index:
-                    print(f"Skipping {pkg_name} ({i}/{len(self.TOOLCHAIN_PACKAGES)}) - already completed")
+                    print(f"Skipping {pkg_name} ({i}/{len(TOOLCHAIN_PACKAGES)}) - already completed")
                     continue
                     
-                print(f"\n=== Building {pkg_name} ({i}/{len(self.TOOLCHAIN_PACKAGES)}) ===")
+                print(f"\n=== Building {pkg_name} ({i}/{len(TOOLCHAIN_PACKAGES)}) ===")
                 self.bootstrap_build_package(pkg_name)
                 built_count += 1
                 self.save_progress(i - 1)
                 print(f"✓ {pkg_name} built successfully")
             
             print(f"\n=== Bootstrap Summary ===")
-            print(f"Successfully built: {built_count}/{len(self.TOOLCHAIN_PACKAGES) - start_index}")
+            print(f"Successfully built: {built_count}/{len(TOOLCHAIN_PACKAGES) - start_index}")
             print("Toolchain bootstrap completed successfully!")
             
             # Clean up progress file on successful completion
