@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
 Shared utilities for package building scripts.
+
+This module provides common build-related functionality:
+- Command execution with dry-run support
+- Chroot environment management  
+- Package upload to repositories
+- Build log management and cleanup
+- Consistent error handling
+
+Used by both build_packages.py and bootstrap_toolchain.py to ensure
+consistent behavior across different build scenarios.
 """
+
 import subprocess
 import sys
 from pathlib import Path
@@ -13,14 +24,33 @@ UPLOAD_BUCKET = "arch-linux-repos.drzee.net"
 LOG_RETENTION_COUNT = 3
 
 class BuildUtils:
-    """Shared utilities for package builders"""
+    """
+    Shared utilities for package builders.
+    
+    Provides common functionality needed by both regular package building
+    and bootstrap toolchain building, including command execution,
+    chroot management, and package uploads.
+    """
     
     def __init__(self, dry_run=False):
         self.dry_run = dry_run
         self.logs_dir = Path("logs")
     
     def run_command(self, cmd, cwd=None, capture_output=False):
-        """Unified command runner with consistent error handling and dry-run support"""
+        """
+        Unified command runner with consistent error handling and dry-run support.
+        
+        Executes commands with proper error handling. In dry-run mode, shows
+        what would be executed without actually running commands.
+        
+        Args:
+            cmd: Command list to execute
+            cwd: Working directory for command
+            capture_output: Whether to capture stdout/stderr
+            
+        Returns:
+            CompletedProcess: Result of command execution
+        """
         if self.dry_run:
             print(f"[DRY RUN] Would run: {' '.join(cmd)}")
             if cwd:
@@ -40,7 +70,16 @@ class BuildUtils:
                     print(f"[DRY RUN]   {detail}")
     
     def cleanup_old_logs(self, package_name, keep_count=None):
-        """Keep only the most recent N log files for a package"""
+        """
+        Keep only the most recent N log files for a package.
+        
+        Prevents log directory from growing indefinitely by removing
+        old build logs while keeping recent ones for debugging.
+        
+        Args:
+            package_name: Name of package to clean logs for
+            keep_count: Number of recent logs to keep (default: LOG_RETENTION_COUNT)
+        """
         if keep_count is None:
             keep_count = LOG_RETENTION_COUNT
             
@@ -59,7 +98,16 @@ class BuildUtils:
             old_log.unlink()
     
     def setup_chroot(self, chroot_path, cache_path):
-        """Set up or create build chroot environment"""
+        """
+        Set up or create build chroot environment.
+        
+        Creates a clean chroot environment for building packages if it doesn't
+        exist. Uses mkarchroot with custom configuration files.
+        
+        Args:
+            chroot_path: Path where chroot should be created
+            cache_path: Path for pacman cache directory
+        """
         chroot_path = Path(chroot_path)
         cache_path = Path(cache_path)
         
@@ -89,7 +137,19 @@ class BuildUtils:
             print("Using existing chroot...")
     
     def upload_packages(self, pkg_dir, target_repo):
-        """Upload all built packages to repository"""
+        """
+        Upload all built packages to repository.
+        
+        Finds all built package files in the directory and uploads them
+        to the specified repository using the repo-upload tool.
+        
+        Args:
+            pkg_dir: Directory containing built packages
+            target_repo: Target repository name (e.g., 'core-testing')
+            
+        Returns:
+            int: Number of packages uploaded
+        """
         built_packages = [str(f) for f in pkg_dir.glob("*.pkg.tar.*") if not f.name.endswith('.sig')]
         
         if not built_packages:

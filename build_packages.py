@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+"""
+Package builder for Arch Linux AArch64 packages.
+
+This script builds packages in clean chroot environments using makechrootpkg.
+It handles dependency installation, temporary chroot management, and package uploads.
+
+Key features:
+- Clean chroot builds with dependency isolation
+- Automatic dependency parsing from PKGBUILDs
+- Variable expansion in dependency lists
+- Comment filtering in PKGBUILD arrays
+- Temporary chroot cleanup on interruption
+- Package upload to testing repositories
+"""
 
 import json
 import sys
@@ -15,7 +29,24 @@ from utils import (
 )
 
 class PackageBuilder:
+    """
+    Main package builder class that handles the complete build process.
+    
+    Manages chroot environments, dependency installation, package building,
+    and cleanup operations. Supports dry-run mode and graceful interruption.
+    """
     def __init__(self, dry_run=False, chroot_path=None, cache_dir=None, no_cache=False, no_upload=False, stop_on_failure=False):
+        """
+        Initialize the package builder.
+        
+        Args:
+            dry_run: Show what would be done without executing
+            chroot_path: Custom chroot directory path
+            cache_dir: Custom pacman cache directory
+            no_cache: Clear cache before each build
+            no_upload: Build but don't upload packages
+            stop_on_failure: Stop on first build failure
+        """
         self.build_utils = BuildUtils(dry_run)
         self.dry_run = dry_run
         self.no_upload = no_upload
@@ -32,7 +63,12 @@ class PackageBuilder:
         signal.signal(signal.SIGTERM, self._signal_handler)
     
     def _signal_handler(self, signum, frame):
-        """Graceful cleanup on Ctrl+C"""
+        """
+        Graceful cleanup on Ctrl+C or termination signals.
+        
+        Terminates any running build process and cleans up temporary chroot copies
+        to prevent leaving the system in an inconsistent state.
+        """
         print(f"\nReceived signal {signum}, cleaning up...")
         if self.current_process:
             self.current_process.terminate()
@@ -41,7 +77,12 @@ class PackageBuilder:
         sys.exit(1)
     
     def _cleanup_temp_copies(self):
-        """Clean up any temporary chroot copies"""
+        """
+        Clean up any temporary chroot copies created during builds.
+        
+        Uses sudo to remove temporary chroot directories that were created
+        for dependency isolation. Handles permission errors gracefully.
+        """
         for temp_copy_path in self.temp_copies:
             if temp_copy_path.exists():
                 try:
@@ -59,7 +100,12 @@ class PackageBuilder:
                     print(f"Warning: Failed to clean up {temp_copy_path}: {e}")
     
     def setup_chroot(self):
-        """Set up or update the build chroot"""
+        """
+        Set up or update the build chroot environment.
+        
+        Creates a clean chroot environment for building packages if it doesn't exist,
+        or uses an existing one. Cleans up stale lock files and copies configuration.
+        """
         # Clean up stale lock files
         if self.chroot_path.exists():
             for lock_file in self.chroot_path.glob("*.lock"):
@@ -82,7 +128,12 @@ class PackageBuilder:
 
     
     def import_gpg_keys(self):
-        """Import GPG keys from keys/pgp/ directory"""
+        """
+        Import GPG keys from keys/pgp/ directory.
+        
+        Automatically imports any .asc GPG key files found in the keys/pgp/
+        directory to enable signature verification during builds.
+        """
         keys_dir = Path("keys/pgp")
         if keys_dir.exists():
             print("Importing GPG keys...")
@@ -93,7 +144,25 @@ class PackageBuilder:
                     print(f"ERROR: Failed to import GPG key {key_file}: {e}")
     
     def build_package(self, pkg_name, pkg_data):
-        """Build a single package"""
+        """
+        Build a single package in a clean chroot environment.
+        
+        This is the core build method that:
+        1. Validates the package name and paths
+        2. Creates a temporary chroot copy for isolation
+        3. Parses PKGBUILD dependencies with variable expansion
+        4. Installs all dependencies in the temporary chroot
+        5. Builds the package using makechrootpkg
+        6. Uploads the built packages to the appropriate repository
+        7. Cleans up temporary files
+        
+        Args:
+            pkg_name: Name of the package to build
+            pkg_data: Package metadata dictionary
+            
+        Returns:
+            bool: True if build succeeded, False otherwise
+        """
         # Validate package name
         if not validate_package_name(pkg_name):
             print(f"ERROR: Invalid package name: {pkg_name}")
@@ -148,13 +217,16 @@ class PackageBuilder:
         env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
         
         # Parse PKGBUILD for depends, makedepends, and checkdepends
+        # This section extracts dependency information from the PKGBUILD file
+        # and handles various edge cases like comments, variables, and multi-line arrays
         depends = []
         makedepends = []
         checkdepends = []
         with open(pkgbuild_path, 'r') as f:
             pkgbuild_content = f.read()
             
-            # Extract variables for substitution
+            # Extract variables for substitution (e.g., _electron=electron37)
+            # This handles cases where dependencies use variables like $_electron
             variables = {}
             for line in pkgbuild_content.split('\n'):
                 line = line.strip()
@@ -164,6 +236,7 @@ class PackageBuilder:
                         variables[var_name] = var_value.strip('\'"')
             
             # Extract dependencies - handle single line and multi-line arrays
+            # Supports various PKGBUILD formats including comments within arrays
             lines = pkgbuild_content.split('\n')
             in_depends = False
             in_makedepends = False
@@ -229,7 +302,8 @@ class PackageBuilder:
                         if not line.startswith('#'):
                             checkdepends.extend(self._parse_package_list(line, variables))
         
-        # Always create temporary chroot
+        # Always create temporary chroot for build isolation
+        # Each package gets its own temporary chroot copy to prevent dependency conflicts
         import random
         temp_id = random.randint(1000000, 9999999)
         temp_copy_name = f"temp-{pkg_name}-{temp_id}"
@@ -417,7 +491,22 @@ class PackageBuilder:
             pass
     
     def _parse_package_list(self, deps_str, variables=None):
-        """Parse package list handling single quotes, double quotes, and no quotes"""
+        """
+        Parse package list from PKGBUILD dependency arrays.
+        
+        Handles various formats including:
+        - Single and double quoted package names
+        - Comments within arrays (# comment)
+        - Variable expansion ($_variable)
+        - Version constraints (>=, >, =)
+        
+        Args:
+            deps_str: Raw dependency string from PKGBUILD
+            variables: Dictionary of variable substitutions
+            
+        Returns:
+            list: Clean list of package names
+        """
         if not deps_str.strip():
             return []
         
@@ -491,6 +580,20 @@ class PackageBuilder:
         # Set up build environment
         self.setup_chroot()
         self.import_gpg_keys()
+        
+        # Clean up old temporary chroots
+        print("Cleaning up old temporary chroots...")
+        if self.dry_run:
+            self.build_utils.format_dry_run("Would clean up old temporary chroots", [f"sudo rm -rf {self.chroot_path}/temp-*"])
+        else:
+            try:
+                temp_dirs = list(self.chroot_path.glob("temp-*"))
+                for temp_dir in temp_dirs:
+                    subprocess.run(["sudo", "rm", "-rf", str(temp_dir)], check=True)
+                if temp_dirs:
+                    print(f"Removed {len(temp_dirs)} old temporary chroots")
+            except subprocess.CalledProcessError as e:
+                print(f"Warning: Failed to clean up some temporary chroots: {e}")
         
         # Build packages
         failed_packages = []

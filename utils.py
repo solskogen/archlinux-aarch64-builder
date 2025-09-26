@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+"""
+Shared utility functions for the Arch Linux AArch64 build system.
+
+This module provides common functionality used across multiple scripts:
+- Package name validation and security
+- Version comparison with Arch Linux semantics  
+- Database loading and parsing
+- Blacklist management
+- Path safety utilities
+
+The utilities handle various edge cases in Arch Linux package management
+including epoch versions, git revisions, and architecture filtering.
+"""
+
 import os
 import fnmatch
 import subprocess
@@ -35,12 +49,39 @@ class BuildConfig:
     cache_path: Path = Path("/var/tmp/builder/pacman-cache")
 
 def validate_package_name(pkg_name: str) -> bool:
-    """Validate package name against Arch Linux naming rules"""
+    """
+    Validate package name against Arch Linux naming rules.
+    
+    Ensures package names only contain safe characters to prevent
+    injection attacks and filesystem issues.
+    
+    Args:
+        pkg_name: Package name to validate
+        
+    Returns:
+        bool: True if name is valid, False otherwise
+    """
     VALID_PKG_NAME = re.compile(r'^[a-zA-Z0-9][a-zA-Z0-9+._-]*$')
     return bool(VALID_PKG_NAME.match(pkg_name))
 
 def safe_path_join(base: Path, user_input: str) -> Path:
-    """Safely join paths preventing traversal attacks"""
+    """
+    Safely join paths preventing traversal attacks.
+    
+    Validates the user input and ensures the resulting path
+    stays within the base directory to prevent directory
+    traversal security vulnerabilities.
+    
+    Args:
+        base: Base directory path
+        user_input: User-provided path component
+        
+    Returns:
+        Path: Safe joined path
+        
+    Raises:
+        ValueError: If path traversal is detected or name is invalid
+    """
     if not validate_package_name(user_input):
         raise ValueError(f"Invalid package name: {user_input}")
     
@@ -54,7 +95,21 @@ def is_version_newer(current_version: str, target_version: str) -> bool:
     return compare_arch_versions(current_version, target_version) < 0
 
 def compare_arch_versions(version1: str, version2: str) -> int:
-    """Compare two Arch Linux version strings (-1: v1<v2, 0: equal, 1: v1>v2)"""
+    """
+    Compare two Arch Linux version strings using proper semantics.
+    
+    Handles Arch Linux specific version formats including:
+    - Epoch versions (1:2.0-1)
+    - Git revision versions (1.0+r123.abc123-1)  
+    - Standard semantic versions (1.2.3-1)
+    
+    Args:
+        version1: First version string
+        version2: Second version string
+        
+    Returns:
+        int: -1 if version1 < version2, 0 if equal, 1 if version1 > version2
+    """
     epoch1, ver1 = split_epoch_version(version1)
     epoch2, ver2 = split_epoch_version(version2)
     
@@ -122,7 +177,10 @@ def compare_git_versions(ver1: str, ver2: str) -> int:
 
 def load_database_packages(urls, arch_suffix, download=True):
     """
-    Download and parse database files for given URLs
+    Download and parse database files for given URLs.
+    
+    Downloads pacman database files and extracts package information.
+    Filters out ARCH=any packages since they don't need rebuilding.
     
     Args:
         urls: List of database URLs to download
@@ -244,7 +302,18 @@ def load_aarch64_packages(download=True, urls=None):
     return load_database_packages(urls, '_aarch64', download)
 
 def load_blacklist(blacklist_file):
-    """Load blacklisted packages with wildcard support"""
+    """
+    Load blacklisted packages with wildcard support.
+    
+    Reads a blacklist file containing package patterns to skip.
+    Supports shell-style wildcards and ignores comments/empty lines.
+    
+    Args:
+        blacklist_file: Path to blacklist file
+        
+    Returns:
+        list: List of blacklist patterns
+    """
     if not blacklist_file or not Path(blacklist_file).exists():
         return []
     blacklist = []
