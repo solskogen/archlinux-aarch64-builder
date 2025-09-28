@@ -209,103 +209,60 @@ class PackageBuilder:
         env = os.environ.copy()
         env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
         
-        # Parse PKGBUILD for depends, makedepends, and checkdepends
-        # This section extracts dependency information from the PKGBUILD file
-        # and handles various edge cases like comments, variables, and multi-line arrays
+        # Parse PKGBUILD for depends, makedepends, and checkdepends using bash
         depends = []
         makedepends = []
         checkdepends = []
-        with open(pkgbuild_path, 'r') as f:
-            pkgbuild_content = f.read()
-            
-            # Extract variables for substitution (e.g., _electron=electron37)
-            # This handles cases where dependencies use variables like $_electron
-            variables = {}
-            for line in pkgbuild_content.split('\n'):
-                line = line.strip()
-                if '=' in line and not line.startswith('#') and not line.startswith('depends=') and not line.startswith('makedepends=') and not line.startswith('checkdepends='):
-                    if line.startswith('_') or line.startswith('pkgver=') or line.startswith('pkgrel='):
-                        var_name, var_value = line.split('=', 1)
-                        variables[var_name] = var_value.strip('\'"')
-            
-            # Extract dependencies - handle single line and multi-line arrays
-            # Supports various PKGBUILD formats including comments within arrays
-            lines = pkgbuild_content.split('\n')
-            in_depends = False
-            in_makedepends = False
-            in_checkdepends = False
-            
-            for line in lines:
-                line = line.strip()
+        
+        # Create a temporary script to source PKGBUILD and extract dependencies
+        temp_script = f"""#!/bin/bash
+cd "{pkg_dir}"
+source PKGBUILD 2>/dev/null || exit 1
+echo "DEPENDS_START"
+printf '%s\\n' "${{depends[@]}}"
+echo "DEPENDS_END"
+echo "MAKEDEPENDS_START"
+printf '%s\\n' "${{makedepends[@]}}"
+echo "MAKEDEPENDS_END"
+echo "CHECKDEPENDS_START"
+printf '%s\\n' "${{checkdepends[@]}}"
+echo "CHECKDEPENDS_END"
+"""
+        
+        try:
+            result = subprocess.run(['bash', '-c', temp_script], 
+                                  capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                output = result.stdout
+                current_section = None
                 
-                # Handle depends
-                if line.startswith('depends=('):
-                    if line.endswith(')'):
-                        deps_str = line[len('depends=('):-1]
-                        depends.extend(self._parse_package_list(deps_str, variables))
-                    else:
-                        in_depends = True
-                        deps_str = line[len('depends=('):]
-                        depends.extend(self._parse_package_list(deps_str, variables))
-                elif in_depends:
-                    if line.endswith(')'):
-                        deps_str = line[:-1]
-                        depends.extend(self._parse_package_list(deps_str, variables))
-                        in_depends = False
-                    else:
-                        # Skip comment lines entirely
-                        if not line.startswith('#'):
-                            # Handle inline comments - split on # and take only the part before
-                            if '#' in line:
-                                line = line.split('#')[0].strip()
-                            if line:  # Only process if something remains after removing comment
-                                depends.extend(self._parse_package_list(line, variables))
-                
-                # Handle makedepends
-                elif line.startswith('makedepends=('):
-                    if line.endswith(')'):
-                        deps_str = line[len('makedepends=('):-1]
-                        makedepends.extend(self._parse_package_list(deps_str, variables))
-                    else:
-                        in_makedepends = True
-                        deps_str = line[len('makedepends=('):]
-                        makedepends.extend(self._parse_package_list(deps_str, variables))
-                elif in_makedepends:
-                    if line.endswith(')'):
-                        deps_str = line[:-1]
-                        makedepends.extend(self._parse_package_list(deps_str, variables))
-                        in_makedepends = False
-                    else:
-                        # Skip comment lines entirely
-                        if not line.startswith('#'):
-                            # Handle inline comments - split on # and take only the part before
-                            if '#' in line:
-                                line = line.split('#')[0].strip()
-                            if line:  # Only process if something remains after removing comment
-                                makedepends.extend(self._parse_package_list(line, variables))
-                
-                # Handle checkdepends
-                elif line.startswith('checkdepends=('):
-                    if line.endswith(')'):
-                        deps_str = line[len('checkdepends=('):-1]
-                        checkdepends.extend(self._parse_package_list(deps_str, variables))
-                    else:
-                        in_checkdepends = True
-                        deps_str = line[len('checkdepends=('):]
-                        checkdepends.extend(self._parse_package_list(deps_str, variables))
-                elif in_checkdepends:
-                    if line.endswith(')'):
-                        deps_str = line[:-1]
-                        checkdepends.extend(self._parse_package_list(deps_str, variables))
-                        in_checkdepends = False
-                    else:
-                        # Skip comment lines entirely
-                        if not line.startswith('#'):
-                            # Handle inline comments - split on # and take only the part before
-                            if '#' in line:
-                                line = line.split('#')[0].strip()
-                            if line:  # Only process if something remains after removing comment
-                                checkdepends.extend(self._parse_package_list(line, variables))
+                for line in output.split('\n'):
+                    line = line.strip()
+                    if line == "DEPENDS_START":
+                        current_section = "depends"
+                    elif line == "DEPENDS_END":
+                        current_section = None
+                    elif line == "MAKEDEPENDS_START":
+                        current_section = "makedepends"
+                    elif line == "MAKEDEPENDS_END":
+                        current_section = None
+                    elif line == "CHECKDEPENDS_START":
+                        current_section = "checkdepends"
+                    elif line == "CHECKDEPENDS_END":
+                        current_section = None
+                    elif line and current_section:
+                        if current_section == "depends":
+                            depends.append(line)
+                        elif current_section == "makedepends":
+                            makedepends.append(line)
+                        elif current_section == "checkdepends":
+                            checkdepends.append(line)
+            else:
+                print(f"Warning: Failed to parse PKGBUILD with bash: {result.stderr}")
+        except subprocess.TimeoutExpired:
+            print("Warning: PKGBUILD parsing timed out")
+        except Exception as e:
+            print(f"Warning: Error parsing PKGBUILD: {e}")
         
         # Always create temporary chroot for build isolation
         # Each package gets its own temporary chroot copy to prevent dependency conflicts
@@ -494,64 +451,6 @@ class PackageBuilder:
             Path("last_successful.txt").write_text(pkg_name)
         except Exception:
             pass
-    
-    def _parse_package_list(self, deps_str, variables=None):
-        """
-        Parse package list from PKGBUILD dependency arrays.
-        
-        Handles various formats including:
-        - Single and double quoted package names
-        - Comments within arrays (# comment)
-        - Variable expansion ($_variable)
-        - Version constraints (>=, >, =)
-        - Brace expansion ({core,pthreads})
-        
-        Args:
-            deps_str: Raw dependency string from PKGBUILD
-            variables: Dictionary of variable substitutions
-            
-        Returns:
-            list: Clean list of package names
-        """
-        if not deps_str.strip():
-            return []
-        
-        if variables is None:
-            variables = {}
-        
-        packages = []
-        # Split by whitespace and clean up quotes
-        for pkg in deps_str.split():
-            pkg = pkg.strip().strip('\'"')
-            # Skip comments and empty strings
-            if pkg and not pkg.startswith('#'):
-                # Expand variables
-                for var_name, var_value in variables.items():
-                    pkg = pkg.replace(f'${var_name}', var_value)
-                
-                # Handle brace expansion like libevent_{core,pthreads}-2.1.so
-                if '{' in pkg and '}' in pkg:
-                    import re
-                    match = re.search(r'(.*){\s*([^}]+)\s*}(.*)', pkg)
-                    if match:
-                        prefix, options, suffix = match.groups()
-                        for option in options.split(','):
-                            expanded_pkg = prefix + option.strip() + suffix
-                            # Remove version constraints
-                            for op in ['>=', '>', '=']:
-                                if op in expanded_pkg:
-                                    expanded_pkg = expanded_pkg.split(op)[0]
-                                    break
-                            packages.append(expanded_pkg)
-                        continue
-                
-                # Remove version constraints (>=, >, =)
-                for op in ['>=', '>', '=']:
-                    if op in pkg:
-                        pkg = pkg.split(op)[0]
-                        break
-                packages.append(pkg)
-        return packages
     
     def build_packages(self, packages_file, blacklist_file=None, continue_build=False):
         """Build all packages from JSON file"""
