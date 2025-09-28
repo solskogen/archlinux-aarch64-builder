@@ -118,13 +118,6 @@ class PackageBuilder:
         # Setup chroot using shared utility
         self.build_utils.setup_chroot(self.chroot_path, self.cache_dir)
         
-        # Copy pacman configuration
-        chroot_pacman_conf = self.chroot_path / "root" / "etc" / "pacman.conf"
-        if Path("chroot-config/pacman.conf").exists():
-            self.build_utils.run_command([
-                "sudo", "cp", "chroot-config/pacman.conf", str(chroot_pacman_conf)
-            ])
-        
 
     
     def import_gpg_keys(self):
@@ -262,7 +255,11 @@ class PackageBuilder:
                     else:
                         # Skip comment lines entirely
                         if not line.startswith('#'):
-                            depends.extend(self._parse_package_list(line, variables))
+                            # Handle inline comments - split on # and take only the part before
+                            if '#' in line:
+                                line = line.split('#')[0].strip()
+                            if line:  # Only process if something remains after removing comment
+                                depends.extend(self._parse_package_list(line, variables))
                 
                 # Handle makedepends
                 elif line.startswith('makedepends=('):
@@ -281,7 +278,11 @@ class PackageBuilder:
                     else:
                         # Skip comment lines entirely
                         if not line.startswith('#'):
-                            makedepends.extend(self._parse_package_list(line, variables))
+                            # Handle inline comments - split on # and take only the part before
+                            if '#' in line:
+                                line = line.split('#')[0].strip()
+                            if line:  # Only process if something remains after removing comment
+                                makedepends.extend(self._parse_package_list(line, variables))
                 
                 # Handle checkdepends
                 elif line.startswith('checkdepends=('):
@@ -300,7 +301,11 @@ class PackageBuilder:
                     else:
                         # Skip comment lines entirely
                         if not line.startswith('#'):
-                            checkdepends.extend(self._parse_package_list(line, variables))
+                            # Handle inline comments - split on # and take only the part before
+                            if '#' in line:
+                                line = line.split('#')[0].strip()
+                            if line:  # Only process if something remains after removing comment
+                                checkdepends.extend(self._parse_package_list(line, variables))
         
         # Always create temporary chroot for build isolation
         # Each package gets its own temporary chroot copy to prevent dependency conflicts
