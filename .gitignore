@@ -5,3 +5,6 @@ logs/
 pkgbuilds/
 __pycache__/
 state/
+blacklist.txt
+TEST_SUMMARY.md
+last_successful.txt

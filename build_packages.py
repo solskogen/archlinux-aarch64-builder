@@ -499,6 +499,7 @@ class PackageBuilder:
         - Comments within arrays (# comment)
         - Variable expansion ($_variable)
         - Version constraints (>=, >, =)
+        - Brace expansion ({core,pthreads})
         
         Args:
             deps_str: Raw dependency string from PKGBUILD
@@ -522,6 +523,23 @@ class PackageBuilder:
                 # Expand variables
                 for var_name, var_value in variables.items():
                     pkg = pkg.replace(f'${var_name}', var_value)
+                
+                # Handle brace expansion like libevent_{core,pthreads}-2.1.so
+                if '{' in pkg and '}' in pkg:
+                    import re
+                    match = re.search(r'(.*){\s*([^}]+)\s*}(.*)', pkg)
+                    if match:
+                        prefix, options, suffix = match.groups()
+                        for option in options.split(','):
+                            expanded_pkg = prefix + option.strip() + suffix
+                            # Remove version constraints
+                            for op in ['>=', '>', '=']:
+                                if op in expanded_pkg:
+                                    expanded_pkg = expanded_pkg.split(op)[0]
+                                    break
+                            packages.append(expanded_pkg)
+                        continue
+                
                 # Remove version constraints (>=, >, =)
                 for op in ['>=', '>', '=']:
                     if op in pkg:

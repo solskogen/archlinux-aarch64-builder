@@ -86,6 +86,7 @@ def main():
     parser.add_argument('--repo-mismatches', action='store_true', help='Show repository mismatches')
     parser.add_argument('--arm-newer', action='store_true', help='Show packages where AArch64 is newer')
     parser.add_argument('--arm-only', action='store_true', help='Show AArch64 only packages')
+    parser.add_argument('--arm-duplicates', action='store_true', help='Show AArch64 packages in both core and extra')
     args = parser.parse_args()
     
     # Load blacklist
@@ -116,9 +117,19 @@ def main():
         x86_bases[basename] = pkg_data
     
     arm_bases = {}
+    arm_repo_count = {}
     for pkg_name, pkg_data in arm_packages.items():
         basename = pkg_data['basename']
         arm_bases[basename] = pkg_data
+        # Track which repos each basename appears in
+        if basename not in arm_repo_count:
+            arm_repo_count[basename] = set()
+        arm_repo_count[basename].add(pkg_data['repo'])
+    
+    # Find packages in both core and extra (AArch64)
+    for basename, repos in arm_repo_count.items():
+        if len(repos) > 1:
+            arm_duplicates.append(f"{basename}: present in {', '.join(sorted(repos))}")
     
     print(f"x86_64 packages: {len(x86_bases)} pkgbase")
     print(f"AArch64 packages: {len(arm_bases)} pkgbase")
@@ -137,6 +148,7 @@ def main():
     any_outdated = []
     any_missing = []
     missing_pkgbase = []
+    arm_duplicates = []
     
     # Find missing pkgbase in AArch64
     for basename in x86_bases:
@@ -239,7 +251,7 @@ def main():
         return
     
     # If no specific options, show all except missing-pkgbase (default behavior)
-    show_all = not any([args.outdated_any, args.missing_any, args.repo_mismatches, args.arm_newer, args.arm_only])
+    show_all = not any([args.outdated_any, args.missing_any, args.repo_mismatches, args.arm_newer, args.arm_only, args.arm_duplicates])
     
     if show_all or args.outdated_any:
         if any_outdated:
@@ -265,6 +277,12 @@ def main():
             for pkg in sorted(arm_newer):
                 print(f"  {pkg}")
     
+    if show_all or args.arm_duplicates:
+        if arm_duplicates:
+            print(f"\nAArch64 Packages in Multiple Repositories ({len(arm_duplicates)}):")
+            for pkg in sorted(arm_duplicates):
+                print(f"  {pkg}")
+    
     if show_all or args.arm_only:
         if arm_only:
             print(f"\nAArch64 Only Packages ({len(arm_only)}):")
@@ -273,7 +291,7 @@ def main():
             if len(arm_only) > 10:
                 print(f"  ... and {len(arm_only) - 10} more")
     
-    if show_all and not repo_mismatches and not arm_newer and not arm_only and not any_outdated and not any_missing:
+    if show_all and not repo_mismatches and not arm_newer and not arm_only and not any_outdated and not any_missing and not arm_duplicates:
         print("No issues found")
 
 if __name__ == "__main__":
