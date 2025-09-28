@@ -191,6 +191,7 @@ def load_database_packages(urls, arch_suffix, download=True):
         dict: Package name -> package data mapping
     """
     import tarfile
+    import threading
     
     def parse_database_file(db_filename):
         """Parse a pacman database file and return packages"""
@@ -235,9 +236,8 @@ def load_database_packages(urls, arch_suffix, download=True):
         
         return packages
     
-    packages = {}
-    
-    for url in urls:
+    def download_and_parse(url, packages_dict, lock):
+        """Download and immediately parse a database file"""
         try:
             db_filename = url.split('/')[-1].replace('.db', f'{arch_suffix}.db')
             
@@ -247,19 +247,36 @@ def load_database_packages(urls, arch_suffix, download=True):
                 else:
                     print(f"Downloading {db_filename}...")
                 subprocess.run(["wget", "-q", "-O", db_filename, url], check=True)
+            else:
+                print(f"Using existing {db_filename}")
             
             repo_name = url.split('/')[-4]  # Extract 'core' or 'extra' from URL
             print(f"Parsing {db_filename}...")
             repo_packages = parse_database_file(db_filename)
             
-            for name, pkg in repo_packages.items():
-                pkg['repo'] = repo_name
-                packages[name] = pkg
-                
+            with lock:
+                for name, pkg in repo_packages.items():
+                    pkg['repo'] = repo_name
+                    packages_dict[name] = pkg
+                    
         except subprocess.CalledProcessError as e:
             print(f"Warning: Failed to download {url}: {e}")
         except Exception as e:
-            print(f"Warning: Failed to parse {db_filename}: {e}")
+            print(f"Warning: Failed to parse database: {e}")
+    
+    packages = {}
+    lock = threading.Lock()
+    threads = []
+    
+    # Start download+parse threads
+    for url in urls:
+        thread = threading.Thread(target=download_and_parse, args=(url, packages, lock))
+        thread.start()
+        threads.append(thread)
+    
+    # Wait for all to complete
+    for thread in threads:
+        thread.join()
     
     return packages
 

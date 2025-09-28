@@ -68,6 +68,11 @@ This automated build system maintains an AArch64 port of Arch Linux by continuou
 ./generate_build_list.py --packages vim firefox gcc --use-latest
 ```
 
+#### Rebuild packages in exact command line order (skip dependency sorting)
+```bash
+./generate_build_list.py --packages gcc glibc binutils --preserve-order
+```
+
 #### Use latest git version for all packages
 ```bash
 ./generate_build_list.py --use-latest
@@ -344,6 +349,7 @@ git clone <special-glibc-repo> pkgbuilds/glibc
 |--------|-------------|
 | `--arm-urls URL [URL ...]` | URLs for AArch64 repository databases |
 | `--packages PKG [PKG ...]` | Force rebuild specific packages by name |
+| `--preserve-order` | Preserve exact order specified in --packages (skip dependency sorting) |
 | `--local` | Build packages from local PKGBUILDs only (use with --packages) |
 | `--aur` | Use AUR as source for packages specified with --packages |
 | `--blacklist FILE` | File containing packages to skip (default: blacklist.txt) |
@@ -635,6 +641,11 @@ This project is licensed under the BSD Zero Clause License - see the [LICENSE](L
 ### Rebuild specific packages using latest git version
 ```bash
 ./generate_build_list.py --packages vim firefox gcc --use-latest
+```
+
+### Rebuild packages in exact command line order (skip dependency sorting)
+```bash
+./generate_build_list.py --packages gcc glibc binutils --preserve-order
 ```
 
 ### Use latest git version for all packages

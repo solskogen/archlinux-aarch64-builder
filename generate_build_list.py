@@ -589,6 +589,21 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
     
     return all_packages
 
+def download_and_parse_db(url, arch_suffix, repo_name, packages_dict):
+    """Download and immediately parse a database file"""
+    filename = url.split('/')[-1].replace('.db', f'_{arch_suffix}.db')
+    
+    if os.path.exists(filename):
+        print(f"Using existing {filename}")
+    else:
+        print(f"Downloading {filename}...")
+        urllib.request.urlretrieve(url, filename)
+    
+    print(f"Parsing {filename}...")
+    repo_packages = extract_packages(filename, repo_name)
+    packages_dict.update(repo_packages)
+    return filename
+
 def download_dbs(x86_urls, arm_urls, skip_if_exists=False, skip_x86=False):
     x86_files = []
     arm_files = []
@@ -960,6 +975,37 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
     
     return newer_in_x86, skipped_packages, blacklisted_missing
 
+def preserve_package_order(packages, ordered_names):
+    """
+    Preserve exact order specified in command line for packages.
+    
+    Args:
+        packages: List of package dictionaries
+        ordered_names: List of package names in desired order
+        
+    Returns:
+        list: Packages sorted in specified order with build_stage assigned sequentially
+    """
+    # Create lookup map
+    pkg_map = {pkg['name']: pkg for pkg in packages}
+    
+    # Sort packages in specified order
+    ordered_packages = []
+    for i, name in enumerate(ordered_names):
+        if name in pkg_map:
+            pkg = pkg_map[name].copy()
+            pkg['build_stage'] = i
+            ordered_packages.append(pkg)
+    
+    # Add any remaining packages not in the ordered list
+    remaining_names = set(pkg_map.keys()) - set(ordered_names)
+    for i, name in enumerate(sorted(remaining_names)):
+        pkg = pkg_map[name].copy()
+        pkg['build_stage'] = len(ordered_names) + i
+        ordered_packages.append(pkg)
+    
+    return ordered_packages
+
 def sort_by_build_order(packages):
     """
     Sort packages by dependency order using topological sort.
@@ -1052,6 +1098,8 @@ if __name__ == "__main__":
                         help='Build packages from local PKGBUILDs only (use with --packages)')
     parser.add_argument('--packages', nargs='+',
                         help='Force rebuild specific packages by name')
+    parser.add_argument('--preserve-order', action='store_true',
+                        help='Preserve exact order specified in --packages (skip dependency sorting)')
     parser.add_argument('--blacklist', default='blacklist.txt',
                         help='File containing packages to skip (default: blacklist.txt)')
     parser.add_argument('--missing-packages', action='store_true',
@@ -1067,6 +1115,11 @@ if __name__ == "__main__":
                         help='Use latest git commit of package source instead of version tag when building')
     
     args = parser.parse_args()
+    
+    # Validate --preserve-order requires --packages
+    if args.preserve_order and not args.packages:
+        print("ERROR: --preserve-order requires --packages to specify package order")
+        sys.exit(1)
     
     # Validate package names if specified
     if args.packages:
@@ -1105,7 +1158,10 @@ if __name__ == "__main__":
         
         # Parse PKGBUILDs for dependencies
         newer_packages = fetch_pkgbuild_deps(newer_packages, True)
-        newer_packages = sort_by_build_order(newer_packages)
+        if args.preserve_order:
+            newer_packages = preserve_package_order(newer_packages, args.packages)
+        else:
+            newer_packages = sort_by_build_order(newer_packages)
         write_results(newer_packages, args)
         sys.exit(0)
     
@@ -1144,7 +1200,10 @@ if __name__ == "__main__":
                 print("Processing PKGBUILDs for dependency information...")
                 newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update)
             
-            newer_packages = sort_by_build_order(newer_packages)
+            if args.preserve_order:
+                newer_packages = preserve_package_order(newer_packages, list(args.use_aur_for_packages))
+            else:
+                newer_packages = sort_by_build_order(newer_packages)
             write_results(newer_packages, args)
             sys.exit(0)
     else:
@@ -1174,6 +1233,7 @@ if __name__ == "__main__":
                 if not found_by_basename:
                     # Check if package exists but is ARCH=any (filtered out)
                     arch_any_found = False
+                    is_arch_any = False
                     for repo in ['core', 'extra']:
                         try:
                             db_filename = f"{repo}_x86_64.db"
@@ -1196,9 +1256,9 @@ if __name__ == "__main__":
                                             if ('NAME' in data and data['NAME'][0] == pkg_name) or \
                                                ('BASE' in data and data['BASE'][0] == pkg_name):
                                                 if data.get('ARCH', [''])[0] == 'any':
-                                                    print(f"ERROR: Package {pkg_name} is ARCH=any and doesn't need rebuilding for AArch64")
-                                                    print(f"       ARCH=any packages work on all architectures without modification")
-                                                    sys.exit(1)
+                                                    print(f"WARNING: Package {pkg_name} is ARCH=any and doesn't need rebuilding for AArch64")
+                                                    print(f"         ARCH=any packages work on all architectures without modification")
+                                                    is_arch_any = True
                                                 arch_any_found = True
                                                 break
                                     if arch_any_found:
@@ -1209,6 +1269,8 @@ if __name__ == "__main__":
                     if not arch_any_found:
                         print(f"ERROR: Package {pkg_name} not found in x86_64 repositories")
                         sys.exit(1)
+                    elif is_arch_any:
+                        continue  # Skip ARCH=any packages
         x86_packages = filtered_x86_packages
         # Store full package list for dependency resolution
         full_x86_packages = all_x86_packages
@@ -1332,12 +1394,31 @@ if __name__ == "__main__":
         print(f"Skipped {len(skipped_packages)} blacklisted packages")
     
     if args.packages:
-        print(f"Found {len(newer_packages)} packages (including forced: {', '.join(args.packages)})")
+        # Separate packages that need updates vs rebuilds
+        rebuild_packages = []
+        update_packages = []
+        for pkg_name in args.packages:
+            if pkg_name in newer_packages:
+                pkg = newer_packages[pkg_name]
+                if pkg.get('x86_version') == pkg.get('arm_version'):
+                    rebuild_packages.append(pkg_name)
+                else:
+                    update_packages.append(pkg_name)
+        
+        rebuild_list = ', '.join(f"\033[1m{pkg}\033[0m" for pkg in rebuild_packages) if rebuild_packages else ""
+        if rebuild_list:
+            print(f"Found {len(newer_packages)} packages (including rebuilds: {rebuild_list})")
+        else:
+            print(f"Found {len(newer_packages)} packages")
     else:
         print(f"Found {len(newer_packages)} packages where x86_64 is newer")
     
-    print("Sorting by build order...")
-    sorted_packages = sort_by_build_order(newer_packages)
+    if args.preserve_order and args.packages:
+        print("Preserving command line order...")
+        sorted_packages = preserve_package_order(newer_packages, args.packages)
+    else:
+        print("Sorting by build order...")
+        sorted_packages = sort_by_build_order(newer_packages)
     
     write_results(sorted_packages, args)
     
