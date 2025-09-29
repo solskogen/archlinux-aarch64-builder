@@ -57,6 +57,7 @@ class PackageBuilder:
         self.logs_dir = Path("logs")
         self.temp_copies = []
         self.current_process = None
+        self.preserved_chroot = None
         
         # Set up signal handler for graceful cleanup
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -136,7 +137,7 @@ class PackageBuilder:
                 except subprocess.CalledProcessError as e:
                     print(f"ERROR: Failed to import GPG key {key_file}: {e}")
     
-    def build_package(self, pkg_name, pkg_data):
+    def build_package(self, pkg_name, pkg_data, repackage=False):
         """
         Build a single package in a clean chroot environment.
         
@@ -266,45 +267,68 @@ echo "CHECKDEPENDS_END"
         
         # Always create temporary chroot for build isolation
         # Each package gets its own temporary chroot copy to prevent dependency conflicts
-        import random
-        temp_id = random.randint(1000000, 9999999)
-        temp_copy_name = f"temp-{pkg_name}-{temp_id}"
-        temp_copy_path = self.chroot_path / temp_copy_name
-        self.temp_copies.append(temp_copy_path)
+        
+        # For repackage mode, reuse existing chroot if available
+        if repackage and self.preserved_chroot and self.preserved_chroot.exists():
+            temp_copy_path = self.preserved_chroot
+            temp_copy_name = self.preserved_chroot.name
+            print(f"Reusing preserved chroot: {temp_copy_name}")
+        else:
+            # Check if there's a preserved chroot from a previous failed build
+            if repackage:
+                # Look for any temp chroot that might be preserved
+                temp_dirs = list(self.chroot_path.glob(f"temp-{pkg_name}-*"))
+                if temp_dirs:
+                    temp_copy_path = temp_dirs[0]  # Use the first one found
+                    temp_copy_name = temp_copy_path.name
+                    print(f"Found preserved chroot: {temp_copy_name}")
+                else:
+                    print(f"ERROR: No preserved chroot found for {pkg_name}")
+                    print(f"Repackage mode requires an existing chroot from a previous failed build")
+                    return False
+            else:
+                import random
+                temp_id = random.randint(1000000, 9999999)
+                temp_copy_name = f"temp-{pkg_name}-{temp_id}"
+                temp_copy_path = self.chroot_path / temp_copy_name
+                self.temp_copies.append(temp_copy_path)
+        
         build_success = False
         
         try:
-            # Always rsync root chroot to temporary chroot
-            print(f"Creating temporary chroot: {temp_copy_name}")
-            try:
-                result = subprocess.run([
-                    "sudo", "rsync", "-a", "--delete", "-q", "-W", "-x", 
-                    f"{root_chroot}/", str(temp_copy_path) + "/"
-                ], check=True, capture_output=True, text=True)
-                print(f"Rsync completed successfully")
-            except subprocess.CalledProcessError as e:
-                print(f"ERROR: Rsync failed: {e}")
-                print(f"Stderr: {e.stderr}")
-                return False
-            except KeyboardInterrupt:
-                sys.exit(1)
+            # Always rsync root chroot to temporary chroot unless repackaging
+            if not repackage:
+                print(f"Creating temporary chroot: {temp_copy_name}")
+                try:
+                    result = subprocess.run([
+                        "sudo", "rsync", "-a", "--delete", "-q", "-W", "-x", 
+                        f"{root_chroot}/", str(temp_copy_path) + "/"
+                    ], check=True, capture_output=True, text=True)
+                    print(f"Rsync completed successfully")
+                except subprocess.CalledProcessError as e:
+                    print(f"ERROR: Rsync failed: {e}")
+                    print(f"Stderr: {e.stderr}")
+                    return False
+                except KeyboardInterrupt:
+                    sys.exit(1)
             
-            # Update package database in temporary chroot
-            print("Updating package database in temporary chroot...")
-            try:
-                subprocess.run([
-                    "sudo", "arch-nspawn", 
-                    "-c", str(self.cache_dir),  # Bind mount cache directory
-                    str(temp_copy_path), "pacman", "-Suy", "--noconfirm"
-                ], check=True)
-            except subprocess.CalledProcessError as e:
-                print(f"Warning: Failed to update package database: {e}")
-            except KeyboardInterrupt:
-                sys.exit(1)
+            # Update package database in temporary chroot (skip in repackage mode)
+            if not repackage:
+                print("Updating package database in temporary chroot...")
+                try:
+                    subprocess.run([
+                        "sudo", "arch-nspawn", 
+                        "-c", str(self.cache_dir),  # Bind mount cache directory
+                        str(temp_copy_path), "pacman", "-Suy", "--noconfirm"
+                    ], check=True)
+                except subprocess.CalledProcessError as e:
+                    print(f"Warning: Failed to update package database: {e}")
+                except KeyboardInterrupt:
+                    sys.exit(1)
             
-            # Install all dependencies if any
+            # Install all dependencies if any (skip in repackage mode)
             all_deps = depends + makedepends + checkdepends
-            if all_deps:
+            if all_deps and not repackage:
                 print(f"Installing dependencies: {' '.join(all_deps)}")
                 try:
                     subprocess.run([
@@ -315,6 +339,8 @@ echo "CHECKDEPENDS_END"
                     ] + all_deps, check=True, env=env)
                 except KeyboardInterrupt:
                     sys.exit(1)
+            elif repackage:
+                print("Skipping dependency installation (repackage mode)")
             
             # Always build with temporary chroot
             cmd = [
@@ -322,6 +348,11 @@ echo "CHECKDEPENDS_END"
                 "-d", str(self.cache_dir),
                 "--", "--ignorearch"
             ]
+            
+            # Add repackage option if requested
+            if repackage:
+                cmd.append("-R")
+                print("Using repackage mode (-R)")
             
             # Execute build
             print(f"Running: {' '.join(cmd)}")
@@ -408,6 +439,8 @@ echo "CHECKDEPENDS_END"
                 if self.stop_on_failure and not build_success:
                     should_cleanup = False
                     print(f"Preserving temporary chroot for debugging: {temp_copy_path}")
+                    # Also preserve for potential repackaging
+                    self.preserved_chroot = temp_copy_path
                 
                 if should_cleanup:
                     try:
@@ -421,6 +454,10 @@ echo "CHECKDEPENDS_END"
                             self.temp_copies.remove(temp_copy_path)
                         except ValueError:
                             pass
+            elif not build_success and not repackage:
+                # Preserve chroot for potential repackaging on build failure
+                self.preserved_chroot = temp_copy_path
+                print(f"Preserving chroot for potential repackage: {temp_copy_path}")
             
             # Clean up lock files created during this build
             for lock_file in self.chroot_path.glob("*.lock"):
@@ -452,7 +489,7 @@ echo "CHECKDEPENDS_END"
         except Exception:
             pass
     
-    def build_packages(self, packages_file, blacklist_file=None, continue_build=False):
+    def build_packages(self, packages_file, blacklist_file=None, continue_build=False, repackage=False):
         """Build all packages from JSON file"""
         # Load packages
         with open(packages_file, 'r') as f:
@@ -480,11 +517,13 @@ echo "CHECKDEPENDS_END"
         
         # Handle continue mode
         start_index = 0
+        repackage_next = False
         if continue_build:
             # Look for last successful package in build logs
             last_successful = self._find_last_successful_package(packages)
             if last_successful is not None:
                 start_index = last_successful + 1
+                repackage_next = repackage  # Only repackage the NEXT package
                 if start_index >= len(packages):
                     print("All packages already built successfully")
                     # Clear state file for next run
@@ -493,7 +532,11 @@ echo "CHECKDEPENDS_END"
                     except FileNotFoundError:
                         pass
                     return
-                print(f"Continuing from package {start_index + 1}: {packages[start_index]['name']}")
+                next_pkg_name = packages[start_index]['name']
+                if repackage:
+                    print(f"Continuing from package {start_index + 1}: {next_pkg_name} (will repackage)")
+                else:
+                    print(f"Continuing from package {start_index + 1}: {next_pkg_name}")
             else:
                 print("No previous successful builds found, starting from beginning")
         
@@ -503,19 +546,22 @@ echo "CHECKDEPENDS_END"
         self.setup_chroot()
         self.import_gpg_keys()
         
-        # Clean up old temporary chroots
-        print("Cleaning up old temporary chroots...")
-        if self.dry_run:
-            self.build_utils.format_dry_run("Would clean up old temporary chroots", [f"sudo rm -rf {self.chroot_path}/temp-*"])
+        # Clean up old temporary chroots (skip in repackage mode)
+        if not repackage:
+            print("Cleaning up old temporary chroots...")
+            if self.dry_run:
+                self.build_utils.format_dry_run("Would clean up old temporary chroots", [f"sudo rm -rf {self.chroot_path}/temp-*"])
+            else:
+                try:
+                    temp_dirs = list(self.chroot_path.glob("temp-*"))
+                    for temp_dir in temp_dirs:
+                        subprocess.run(["sudo", "rm", "-rf", str(temp_dir)], check=True)
+                    if temp_dirs:
+                        print(f"Removed {len(temp_dirs)} old temporary chroots")
+                except subprocess.CalledProcessError as e:
+                    print(f"Warning: Failed to clean up some temporary chroots: {e}")
         else:
-            try:
-                temp_dirs = list(self.chroot_path.glob("temp-*"))
-                for temp_dir in temp_dirs:
-                    subprocess.run(["sudo", "rm", "-rf", str(temp_dir)], check=True)
-                if temp_dirs:
-                    print(f"Removed {len(temp_dirs)} old temporary chroots")
-            except subprocess.CalledProcessError as e:
-                print(f"Warning: Failed to clean up some temporary chroots: {e}")
+            print("Skipping cleanup of old temporary chroots (repackage mode)")
         
         # Build packages
         failed_packages = []
@@ -525,8 +571,12 @@ echo "CHECKDEPENDS_END"
             pkg_name = pkg['name']
             print(f"\n[{i}/{len(packages)}] Building {pkg_name}")
             
+            # Use repackage only for the first package, then disable it
+            use_repackage = repackage_next
+            repackage_next = False  # Disable for subsequent packages
+            
             try:
-                if self.build_package(pkg_name, pkg):
+                if self.build_package(pkg_name, pkg, repackage=use_repackage):
                     successful_packages.append(pkg_name)
                 else:
                     failed_packages.append(pkg)
@@ -579,12 +629,19 @@ def main():
                         help='Clear cache before each package build')
     parser.add_argument('--continue', action='store_true', dest='continue_build',
                         help='Continue from last successful package')
+    parser.add_argument('--repackage', action='store_true',
+                        help='Repackage the next package to build (requires --continue)')
     parser.add_argument('--stop-on-failure', action='store_true',
                         help='Stop building on first package failure')
     parser.add_argument('--chroot',
                         help='Custom chroot directory path')
     
     args = parser.parse_args()
+    
+    # Validate repackage option
+    if args.repackage and not args.continue_build:
+        print("ERROR: --repackage requires --continue")
+        sys.exit(1)
     
     if not Path(args.json).exists():
         print(f"ERROR: Package file {args.json} not found")
@@ -603,7 +660,8 @@ def main():
     builder.build_packages(
         args.json,
         args.blacklist,
-        args.continue_build
+        args.continue_build,
+        args.repackage
     )
 
 if __name__ == "__main__":
