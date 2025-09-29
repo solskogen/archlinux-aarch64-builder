@@ -745,6 +745,8 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
             arm_bases[basename] = {'version': pkg['version']}
     
     newer_in_x86 = []
+    bin_package_warnings = []
+    
     for basename, x86_data in x86_bases.items():
         # Check blacklist against basename (pkgbase) and individual package names
         blacklist_reason = None
@@ -795,6 +797,22 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
             should_include = basename in force_packages
             if basename in arm_bases:
                 arm_version = arm_bases[basename]['version']
+            elif basename in arm_provides and arm_provides[basename]['name'].endswith('-bin'):
+                # Check if a -bin package provides this package
+                bin_pkg = arm_provides[basename]
+                provided_version = None
+                for provide in bin_pkg['provides']:
+                    if provide.startswith(f"{basename}="):
+                        provided_version = provide.split('=')[1]
+                        break
+                
+                if provided_version:
+                    if is_version_newer(provided_version, x86_data['version']):
+                        bin_package_warnings.append(f"WARNING: {bin_pkg['name']} (provides {basename}={provided_version}) is outdated compared to x86_64 {basename} ({x86_data['version']})")
+                    elif is_version_newer(x86_data['version'], provided_version):
+                        bin_package_warnings.append(f"INFO: {bin_pkg['name']} (provides {basename}={provided_version}) is newer than x86_64 {basename} ({x86_data['version']})")
+                should_include = False  # Don't build -bin packages
+                arm_version = f"provided by {bin_pkg['name']}"
         elif missing_packages_mode:
             # Only include packages missing from aarch64
             should_include = basename not in arm_bases and basename not in arm_provides
@@ -803,9 +821,27 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
             should_include = is_version_newer(arm_bases[basename]['version'], x86_data['version'])
             arm_version = arm_bases[basename]['version']
         else:
-            # Package doesn't exist in aarch64 - don't auto-include all missing packages
-            # Missing dependencies will be handled separately by find_missing_dependencies
-            should_include = False
+            # Check if a -bin package provides this package
+            if basename in arm_provides and arm_provides[basename]['name'].endswith('-bin'):
+                bin_pkg = arm_provides[basename]
+                # Extract version from provides (e.g., "electron37=37.3.1" -> "37.3.1")
+                provided_version = None
+                for provide in bin_pkg['provides']:
+                    if provide.startswith(f"{basename}="):
+                        provided_version = provide.split('=')[1]
+                        break
+                
+                if provided_version:
+                    if is_version_newer(provided_version, x86_data['version']):
+                        bin_package_warnings.append(f"WARNING: {bin_pkg['name']} (provides {basename}={provided_version}) is outdated compared to x86_64 {basename} ({x86_data['version']})")
+                    elif is_version_newer(x86_data['version'], provided_version):
+                        bin_package_warnings.append(f"INFO: {bin_pkg['name']} (provides {basename}={provided_version}) is newer than x86_64 {basename} ({x86_data['version']})")
+                should_include = False
+                arm_version = f"provided by {bin_pkg['name']}"
+            else:
+                # Package doesn't exist in aarch64 - don't auto-include all missing packages
+                # Missing dependencies will be handled separately by find_missing_dependencies
+                should_include = False
         
         if should_include:
             pkg_data = x86_data['pkg_data'].copy()
@@ -856,7 +892,7 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
                             **pkg
                         })
     
-    return newer_in_x86, skipped_packages, blacklisted_missing
+    return newer_in_x86, skipped_packages, blacklisted_missing, bin_package_warnings
 
 def preserve_package_order(packages, ordered_names):
     """
@@ -1068,7 +1104,7 @@ if __name__ == "__main__":
                     'name': pkg_name,
                     'basename': pkg_name,
                     'version': 'AUR',
-                    'repo': 'aur',
+                    'repo': 'extra',
                     'depends': [],
                     'makedepends': [],
                     'provides': [],
@@ -1193,13 +1229,20 @@ if __name__ == "__main__":
         if blacklist:
             print(f"Loaded blacklist with {len(blacklist)} packages")
     
-    newer_packages, skipped_packages, blacklisted_missing = compare_versions(x86_packages, arm_packages, args.packages, blacklist, args.missing_packages, args.use_aur_for_packages, args.use_latest)
+    newer_packages, skipped_packages, blacklisted_missing, bin_package_warnings = compare_versions(x86_packages, arm_packages, args.packages, blacklist, args.missing_packages, args.use_aur_for_packages, args.use_latest)
     
     # Report blacklisted missing packages
     if args.missing_packages and blacklisted_missing:
         print(f"Found {len(newer_packages)} missing packages, {len(blacklisted_missing)} blacklisted: {' '.join(blacklisted_missing)}")
     elif args.missing_packages:
         print(f"Found {len(newer_packages)} missing packages")
+    
+    # Report -bin package warnings
+    if bin_package_warnings:
+        print("\n" + "="*60)
+        for warning in bin_package_warnings:
+            print(warning)
+        print("="*60)
     
     # Handle --rebuild-repo option
     if args.rebuild_repo:

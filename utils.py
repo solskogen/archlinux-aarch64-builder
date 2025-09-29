@@ -45,8 +45,8 @@ class BuildConfig:
     upstream_extra_url: str = "https://geo.mirror.pkgbuild.com/extra/os/x86_64/extra.db"
     target_core_url: str = "https://arch-linux-repo.drzee.net/arch/core/os/aarch64/core.db"
     target_extra_url: str = "https://arch-linux-repo.drzee.net/arch/extra/os/aarch64/extra.db"
-    build_root: Path = Path("/var/tmp/builder")
-    cache_path: Path = Path("/var/tmp/builder/pacman-cache")
+    build_root: Path = Path("/scratch/builder")
+    cache_path: Path = Path("/scratch/builder/pacman-cache")
 
 def validate_package_name(pkg_name: str) -> bool:
     """

@@ -1,0 +1,3 @@
+[build]
+build_root = /scratch/builder
+upload_bucket = arch-linux-repos.drzee.net

@@ -15,12 +15,17 @@ consistent behavior across different build scenarios.
 
 import subprocess
 import sys
+import configparser
 from pathlib import Path
 
+# Load configuration
+config = configparser.ConfigParser()
+config.read('config.ini')
+
 # Configuration constants
-BUILD_ROOT = "/var/tmp/builder"
+BUILD_ROOT = config.get('build', 'build_root', fallback='/scratch/builder')
 CACHE_PATH = f"{BUILD_ROOT}/pacman-cache"
-UPLOAD_BUCKET = "arch-linux-repos.drzee.net"
+UPLOAD_BUCKET = config.get('build', 'upload_bucket', fallback='arch-linux-repos.drzee.net')
 LOG_RETENTION_COUNT = 3
 
 class BuildUtils:

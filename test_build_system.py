@@ -42,6 +42,7 @@ from utils import (
     validate_package_name, safe_path_join, is_version_newer, 
     compare_arch_versions, PACKAGE_SKIP_FLAG, BuildConfig
 )
+from build_utils import BUILD_ROOT, CACHE_PATH
 
 
 class TestPackageValidation:
@@ -129,8 +130,8 @@ class TestBuildConfig:
     def test_default_config(self):
         """Test default configuration values"""
         config = BuildConfig()
-        assert config.build_root == Path("/var/tmp/builder")
-        assert config.cache_path == Path("/var/tmp/builder/pacman-cache")
+        assert config.build_root == Path(BUILD_ROOT)
+        assert config.cache_path == Path(CACHE_PATH)
         assert "core.db" in config.upstream_core_url
         assert "extra.db" in config.upstream_extra_url
     
