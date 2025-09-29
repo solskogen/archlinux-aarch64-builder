@@ -164,6 +164,17 @@ This messaging system ensures users know exactly what operations are being perfo
 ./build_packages.py --continue
 ```
 
+#### Repackage a failed build without rebuilding
+```bash
+# After a build fails during packaging
+./build_packages.py --continue --repackage
+```
+
+#### Preserve chroot for debugging successful builds
+```bash
+./build_packages.py --preserve-chroot
+```
+
 #### Build with custom chroot path
 ```bash
 ./build_packages.py --chroot /custom/chroot/path
@@ -332,7 +343,19 @@ git clone <special-glibc-repo> pkgbuilds/glibc
 ./build_packages.py --continue
 ```
 
-### 12. Development Testing
+### 12. Repackaging Failed Builds
+**Scenario**: A package built successfully but failed during the packaging step.
+
+```bash
+# Build fails during package() function, chroot is preserved
+./build_packages.py
+# ERROR: Build failed, chroot preserved automatically
+
+# Repackage without rebuilding (much faster)
+./build_packages.py --continue --repackage
+```
+
+### 13. Development Testing
 **Scenario**: Test build process without actually building packages.
 
 ```bash
@@ -369,6 +392,8 @@ git clone <special-glibc-repo> pkgbuilds/glibc
 | `--cache DIR` | Custom pacman cache directory |
 | `--no-cache` | Clear cache before each package build |
 | `--continue` | Continue from last successful package |
+| `--repackage` | Repackage the next package to build (requires --continue) |
+| `--preserve-chroot` | Preserve chroot even on successful builds |
 | `--stop-on-failure` | Stop building on first package failure |
 | `--chroot DIR` | Custom chroot directory path |
 
@@ -818,7 +843,7 @@ git clone <special-glibc-repo> pkgbuilds/glibc
 ./build_packages.py --continue
 ```
 
-### 10. Development Testing
+### 13. Development Testing
 **Scenario**: Test build process without actually building packages.
 
 ```bash

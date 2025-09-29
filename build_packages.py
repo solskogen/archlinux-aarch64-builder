@@ -35,7 +35,7 @@ class PackageBuilder:
     Manages chroot environments, dependency installation, package building,
     and cleanup operations. Supports dry-run mode and graceful interruption.
     """
-    def __init__(self, dry_run=False, chroot_path=None, cache_dir=None, no_cache=False, no_upload=False, stop_on_failure=False):
+    def __init__(self, dry_run=False, chroot_path=None, cache_dir=None, no_cache=False, no_upload=False, stop_on_failure=False, preserve_chroot=False):
         """
         Initialize the package builder.
         
@@ -46,12 +46,14 @@ class PackageBuilder:
             no_cache: Clear cache before each build
             no_upload: Build but don't upload packages
             stop_on_failure: Stop on first build failure
+            preserve_chroot: Preserve chroot even on successful builds
         """
         self.build_utils = BuildUtils(dry_run)
         self.dry_run = dry_run
         self.no_upload = no_upload
         self.no_cache = no_cache
         self.stop_on_failure = stop_on_failure
+        self.preserve_chroot = preserve_chroot
         self.chroot_path = Path(chroot_path) if chroot_path else Path(BUILD_ROOT)
         self.cache_dir = Path(cache_dir) if cache_dir else Path(CACHE_PATH)
         self.logs_dir = Path("logs")
@@ -278,10 +280,16 @@ echo "CHECKDEPENDS_END"
             if repackage:
                 # Look for any temp chroot that might be preserved
                 temp_dirs = list(self.chroot_path.glob(f"temp-{pkg_name}-*"))
-                if temp_dirs:
-                    temp_copy_path = temp_dirs[0]  # Use the first one found
+                if len(temp_dirs) == 1:
+                    temp_copy_path = temp_dirs[0]
                     temp_copy_name = temp_copy_path.name
                     print(f"Found preserved chroot: {temp_copy_name}")
+                elif len(temp_dirs) > 1:
+                    print(f"ERROR: Multiple preserved chroots found for {pkg_name}:")
+                    for temp_dir in temp_dirs:
+                        print(f"  {temp_dir.name}")
+                    print("Please remove the unwanted chroots and try again")
+                    return False
                 else:
                     print(f"ERROR: No preserved chroot found for {pkg_name}")
                     print(f"Repackage mode requires an existing chroot from a previous failed build")
@@ -353,6 +361,14 @@ echo "CHECKDEPENDS_END"
             if repackage:
                 cmd.append("-R")
                 print("Using repackage mode (-R)")
+                # Clear old packages from pkgdest in preserved chroot
+                pkgdest_path = temp_copy_path / "pkgdest"
+                if pkgdest_path.exists():
+                    try:
+                        subprocess.run(["sudo", "rm", "-rf", str(pkgdest_path)], check=True)
+                        print("Cleared old packages from preserved chroot")
+                    except subprocess.CalledProcessError as e:
+                        print(f"Warning: Failed to clear pkgdest: {e}")
             
             # Execute build
             print(f"Running: {' '.join(cmd)}")
@@ -413,6 +429,27 @@ echo "CHECKDEPENDS_END"
                     print(f"ERROR: Build failed for {pkg_name}")
                     print(f"Build log saved to: {log_file}")
                     return False
+                elif self.preserve_chroot:
+                    # Save build log on success when preserving chroot
+                    self.logs_dir.mkdir(exist_ok=True)
+                    timestamp = subprocess.run(['date', '+%Y%m%d-%H%M%S'], capture_output=True, text=True).stdout.strip()
+                    log_file = self.logs_dir / f"{pkg_name}-{timestamp}-build.log"
+                    self.build_utils.cleanup_old_logs(pkg_name)
+                    
+                    with open(log_file, 'w') as f:
+                        f.write(f"Build succeeded for {pkg_name}\n")
+                        f.write(f"Command: {' '.join(cmd)}\n")
+                        f.write(f"Return code: {process.returncode}\n\n")
+                        if stdout_lines:
+                            f.write("STDOUT:\n")
+                            f.write(''.join(stdout_lines))
+                            f.write("\n\n")
+                        if stderr_lines:
+                            f.write("STDERR:\n")
+                            f.write(''.join(stderr_lines))
+                            f.write("\n")
+                    
+                    print(f"Build log saved to: {log_file}")
                     
             except KeyboardInterrupt:
                 print(f"\nBuild interrupted for {pkg_name}")
@@ -433,7 +470,7 @@ echo "CHECKDEPENDS_END"
             print(f"ERROR: Failed to prepare build environment: {e}")
             return False
         finally:
-            # Clean up temporary chroot copy (unless --stop-on-failure and build failed)
+            # Clean up temporary chroot copy (unless preserving or build failed with stop-on-failure)
             if temp_copy_path in self.temp_copies:
                 should_cleanup = True
                 if self.stop_on_failure and not build_success:
@@ -441,6 +478,9 @@ echo "CHECKDEPENDS_END"
                     print(f"Preserving temporary chroot for debugging: {temp_copy_path}")
                     # Also preserve for potential repackaging
                     self.preserved_chroot = temp_copy_path
+                elif self.preserve_chroot:
+                    should_cleanup = False
+                    print(f"Preserving temporary chroot (--preserve-chroot): {temp_copy_path}")
                 
                 if should_cleanup:
                     try:
@@ -546,8 +586,8 @@ echo "CHECKDEPENDS_END"
         self.setup_chroot()
         self.import_gpg_keys()
         
-        # Clean up old temporary chroots (skip in repackage mode)
-        if not repackage:
+        # Clean up old temporary chroots (skip in repackage mode or when preserving chroots)
+        if not repackage and not self.preserve_chroot:
             print("Cleaning up old temporary chroots...")
             if self.dry_run:
                 self.build_utils.format_dry_run("Would clean up old temporary chroots", [f"sudo rm -rf {self.chroot_path}/temp-*"])
@@ -560,8 +600,10 @@ echo "CHECKDEPENDS_END"
                         print(f"Removed {len(temp_dirs)} old temporary chroots")
                 except subprocess.CalledProcessError as e:
                     print(f"Warning: Failed to clean up some temporary chroots: {e}")
-        else:
+        elif repackage:
             print("Skipping cleanup of old temporary chroots (repackage mode)")
+        elif self.preserve_chroot:
+            print("Skipping cleanup of old temporary chroots (--preserve-chroot)")
         
         # Build packages
         failed_packages = []
@@ -631,6 +673,8 @@ def main():
                         help='Continue from last successful package')
     parser.add_argument('--repackage', action='store_true',
                         help='Repackage the next package to build (requires --continue)')
+    parser.add_argument('--preserve-chroot', action='store_true',
+                        help='Preserve chroot even on successful builds')
     parser.add_argument('--stop-on-failure', action='store_true',
                         help='Stop building on first package failure')
     parser.add_argument('--chroot',
@@ -654,7 +698,8 @@ def main():
         cache_dir=args.cache,
         no_cache=args.no_cache,
         no_upload=args.no_upload,
-        stop_on_failure=args.stop_on_failure
+        stop_on_failure=args.stop_on_failure,
+        preserve_chroot=args.preserve_chroot
     )
     
     builder.build_packages(
