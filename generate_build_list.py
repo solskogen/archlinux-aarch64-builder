@@ -42,13 +42,7 @@ from utils import (
     PACKAGE_SKIP_FLAG, PACKAGE_BUILD_FLAG
 )
 
-def needs_package_update(upstream_version: str, target_version: str) -> bool:
-    """
-    Check if package needs update based on version comparison.
-    
-    Uses Arch Linux version comparison logic including epoch handling.
-    """
-    return is_version_newer(target_version, upstream_version)
+
 
 def get_provides_mapping():
     """
@@ -717,33 +711,27 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
     Returns:
         tuple: (packages_to_build, skipped_packages, blacklisted_missing)
     """
-    if force_packages is None:
-        force_packages = set()
-    if aur_packages is None:
-        aur_packages = set()
-    else:
-        force_packages = set(force_packages)
-    
-    if blacklist is None:
-        blacklist = set()
+    force_packages = set(force_packages or [])
+    aur_packages = set(aur_packages or [])
+    blacklist = blacklist or []
     
     # Bootstrap-only packages (excluded from normal builds but not from bootstrap detection)
-    bootstrap_only = set(['linux-api-headers', 'glibc', 'binutils', 'gcc'])
+    bootstrap_only = {'linux-api-headers', 'glibc', 'binutils', 'gcc'}
     
     skipped_packages = []
-    blacklisted_missing = []  # Track blacklisted missing packages
+    blacklisted_missing = []
     
     # Group packages by basename
     x86_bases = {}
     arm_bases = {}
     
-    # Build provides mapping for ARM packages
-    arm_provides = {}
-    for name, pkg in arm_packages.items():
-        arm_provides[name] = pkg
-        for provide in pkg['provides']:
-            provide_name = provide.split('=')[0]
-            arm_provides[provide_name] = pkg
+    # Build provides mapping for ARM packages (only if needed for missing deps)
+    arm_provides = {name: pkg for name, pkg in arm_packages.items()}
+    if not missing_packages_mode:
+        for pkg in arm_packages.values():
+            for provide in pkg['provides']:
+                provide_name = provide.split('=')[0]
+                arm_provides[provide_name] = pkg
     
     for name, pkg in x86_packages.items():
         basename = pkg['basename']
@@ -791,45 +779,12 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
             continue
         
         # Skip bootstrap-only packages unless explicitly forced
-        # But first check if they have newer versions to warn about bootstrap
         if basename in bootstrap_only and not force_packages:
-            has_newer_version = False
-            if basename in arm_bases:
-                arm_version = arm_bases[basename]['version']
-                try:
-                    # Check if x86_64 has newer version
-                    x86_ver_str = x86_data['version']
-                    arm_ver_str = arm_version
-                    
-                    # Extract epoch if present
-                    if ':' in x86_ver_str:
-                        x86_epoch, x86_ver_str = x86_ver_str.split(':', 1)
-                    else:
-                        x86_epoch = '0'
-                        
-                    if ':' in arm_ver_str:
-                        arm_epoch, arm_ver_str = arm_ver_str.split(':', 1)
-                    else:
-                        arm_epoch = '0'
-                    
-                    # Compare epochs first
-                    if int(x86_epoch) != int(arm_epoch):
-                        has_newer_version = int(x86_epoch) > int(arm_epoch)
-                    else:
-                        # Same epoch, compare versions
-                        try:
-                            has_newer_version = is_version_newer(arm_ver_str, x86_ver_str)
-                        except Exception:
-                            has_newer_version = x86_ver_str > arm_ver_str
-                except Exception:
-                    pass
-            else:
-                # Package missing from aarch64
-                has_newer_version = True
+            has_newer_version = (basename not in arm_bases or 
+                               is_version_newer(arm_bases[basename]['version'], x86_data['version']))
             
             if has_newer_version:
                 skipped_packages.append(f"{basename} (bootstrap-only package - newer version available, run bootstrap script)")
-            # Don't add to skipped list if no newer version
             continue
             
         should_include = False
@@ -844,91 +799,9 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
             # Only include packages missing from aarch64
             should_include = basename not in arm_bases and basename not in arm_provides
         elif basename in arm_bases:
-            # Compare basename versions, not individual split packages
-            # Split packages that don't exist on aarch64 are expected (e.g., cross-compilers, lib32 packages)
-            x86_basename_version = x86_data['version']
-            arm_basename_version = arm_bases[basename]['version']
-            
-            # Handle epoch versions (e.g., "1:1.0-1")
-            x86_ver_str = x86_basename_version
-            arm_ver_str = arm_basename_version
-            
-            # Extract epoch if present
-            if ':' in x86_ver_str:
-                x86_epoch, x86_ver_str = x86_ver_str.split(':', 1)
-            else:
-                x86_epoch = '0'
-                
-            if ':' in arm_ver_str:
-                arm_epoch, arm_ver_str = arm_ver_str.split(':', 1)
-            else:
-                arm_epoch = '0'
-            
-            # Compare epochs first
-            if int(x86_epoch) != int(arm_epoch):
-                should_include = int(x86_epoch) > int(arm_epoch)
-            else:
-                # Same epoch, compare versions
-                try:
-                    # Handle git revision versions
-                    if '+r' in x86_ver_str or '+r' in arm_ver_str:
-                        # Extract base versions for comparison
-                        import re
-                        x86_base = re.split(r'\+r\d+', x86_ver_str)[0]
-                        arm_base = re.split(r'\+r\d+', arm_ver_str)[0]
-                        
-                        try:
-                            x86_base_ver = version.parse(x86_base)
-                            arm_base_ver = version.parse(arm_base)
-                            
-                            if x86_base_ver != arm_base_ver:
-                                # Different base versions, use base version comparison
-                                should_include = x86_base_ver > arm_base_ver
-                            elif '+r' in x86_ver_str and '+r' in arm_ver_str:
-                                # Same base version, both have git revisions, compare r numbers
-                                x86_r = re.search(r'\+r(\d+)', x86_ver_str)
-                                arm_r = re.search(r'\+r(\d+)', arm_ver_str)
-                                if x86_r and arm_r:
-                                    should_include = int(x86_r.group(1)) > int(arm_r.group(1))
-                                else:
-                                    should_include = False
-                            elif '+r' in x86_ver_str and '+r' not in arm_ver_str:
-                                # Same base version, x86 has git revision, ARM has release
-                                # Git revision is typically newer than release of same base version
-                                should_include = True
-                            elif '+r' not in x86_ver_str and '+r' in arm_ver_str:
-                                # Same base version, ARM has git revision, x86 has release
-                                should_include = False
-                            else:
-                                # Same base version, neither has git revision
-                                should_include = False
-                        except Exception:
-                            # Fallback to string comparison
-                            should_include = x86_ver_str > arm_ver_str
-                    else:
-                        # Neither has git revisions, use packaging.version
-                        x86_ver = version.parse(x86_ver_str)
-                        arm_ver = version.parse(arm_ver_str)
-                        should_include = x86_ver > arm_ver
-                except Exception:
-                    # Fallback: try to extract numeric parts for comparison
-                    import re
-                    x86_nums = re.findall(r'\d+', x86_ver_str)
-                    arm_nums = re.findall(r'\d+', arm_ver_str)
-                    
-                    # Compare numeric sequences
-                    should_include = False
-                    for i in range(min(len(x86_nums), len(arm_nums))):
-                        x86_num = int(x86_nums[i])
-                        arm_num = int(arm_nums[i])
-                        if x86_num != arm_num:
-                            should_include = x86_num > arm_num
-                            break
-                    else:
-                        # If all compared numbers are equal, compare by string
-                        should_include = x86_ver_str > arm_ver_str
-            
-            arm_version = arm_basename_version  # For display purposes
+            # Compare basename versions using existing utility
+            should_include = is_version_newer(arm_bases[basename]['version'], x86_data['version'])
+            arm_version = arm_bases[basename]['version']
         else:
             # Package doesn't exist in aarch64 - don't auto-include all missing packages
             # Missing dependencies will be handled separately by find_missing_dependencies
@@ -945,33 +818,43 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
             
             newer_in_x86.append({
                 'name': basename,
+                'x86_version': x86_data['version'],
+                'arm_version': arm_version,
                 'force_latest': should_use_latest,
                 'use_aur': bool(basename in aur_packages),
                 **pkg_data
             })
     
-    # Find and add missing dependencies (always enabled except in missing_packages_mode)
+    # Find and add missing dependencies only for missing packages (not for updates)
     if not missing_packages_mode:
-        missing_deps = find_missing_dependencies(newer_in_x86, full_x86_packages, arm_packages)
-        for dep_name in missing_deps:
-            if dep_name in full_x86_packages:
-                pkg = full_x86_packages[dep_name]
-                basename = pkg['basename']
-                
-                # Check if basename is blacklisted
-                is_blacklisted = False
-                for pattern in blacklist:
-                    if fnmatch.fnmatch(basename, pattern):
-                        is_blacklisted = True
-                        break
-                
-                if not is_blacklisted and basename not in [p['name'] for p in newer_in_x86]:
-                    newer_in_x86.append({
-                        'name': basename,
-                        'force_latest': use_latest,
-                        'use_aur': False,
-                        **pkg
-                    })
+        # Only check for missing dependencies of packages that don't exist in ARM at all
+        missing_packages_only = []
+        for pkg in newer_in_x86:
+            basename = pkg['name']
+            if basename not in arm_bases and basename not in arm_provides:
+                missing_packages_only.append(pkg)
+        
+        if missing_packages_only:
+            missing_deps = find_missing_dependencies(missing_packages_only, full_x86_packages, arm_packages)
+            for dep_name in missing_deps:
+                if dep_name in full_x86_packages:
+                    pkg = full_x86_packages[dep_name]
+                    basename = pkg['basename']
+                    
+                    # Check if basename is blacklisted
+                    is_blacklisted = False
+                    for pattern in blacklist:
+                        if fnmatch.fnmatch(basename, pattern):
+                            is_blacklisted = True
+                            break
+                    
+                    if not is_blacklisted and basename not in [p['name'] for p in newer_in_x86]:
+                        newer_in_x86.append({
+                            'name': basename,
+                            'force_latest': use_latest,
+                            'use_aur': False,
+                            **pkg
+                        })
     
     return newer_in_x86, skipped_packages, blacklisted_missing
 
