@@ -18,35 +18,10 @@ import fnmatch
 import subprocess
 import re
 from pathlib import Path
-from dataclasses import dataclass
-from enum import Enum
-from typing import Dict, List, Optional
 from packaging import version
 
 # Constants
 PACKAGE_SKIP_FLAG = 1
-PACKAGE_BUILD_FLAG = 0
-
-class Architecture(Enum):
-    ANY = 'any'
-    X86_64 = 'x86_64'
-    AARCH64 = 'aarch64'
-
-class Repository(Enum):
-    CORE = 'core'
-    EXTRA = 'extra'
-    AUR = 'aur'
-    LOCAL = 'local'
-
-@dataclass
-class BuildConfig:
-    """Configuration for the build system"""
-    upstream_core_url: str = "https://geo.mirror.pkgbuild.com/core/os/x86_64/core.db"
-    upstream_extra_url: str = "https://geo.mirror.pkgbuild.com/extra/os/x86_64/extra.db"
-    target_core_url: str = "https://arch-linux-repo.drzee.net/arch/core/os/aarch64/core.db"
-    target_extra_url: str = "https://arch-linux-repo.drzee.net/arch/extra/os/aarch64/extra.db"
-    build_root: Path = Path("/scratch/builder")
-    cache_path: Path = Path("/scratch/builder/pacman-cache")
 
 def validate_package_name(pkg_name: str) -> bool:
     """

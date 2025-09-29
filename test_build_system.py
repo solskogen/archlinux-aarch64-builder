@@ -40,7 +40,7 @@ except ImportError:
 
 from utils import (
     validate_package_name, safe_path_join, is_version_newer, 
-    compare_arch_versions, PACKAGE_SKIP_FLAG, BuildConfig
+    compare_arch_versions, PACKAGE_SKIP_FLAG
 )
 from build_utils import BUILD_ROOT, CACHE_PATH
 
@@ -122,27 +122,6 @@ class TestVersionComparison:
         # Should not crash, fallback to string comparison
         result = is_version_newer("malformed", "1.0-1")
         assert isinstance(result, bool)
-
-
-class TestBuildConfig:
-    """Test build configuration"""
-    
-    def test_default_config(self):
-        """Test default configuration values"""
-        config = BuildConfig()
-        assert config.build_root == Path(BUILD_ROOT)
-        assert config.cache_path == Path(CACHE_PATH)
-        assert "core.db" in config.upstream_core_url
-        assert "extra.db" in config.upstream_extra_url
-    
-    def test_custom_config(self):
-        """Test custom configuration"""
-        config = BuildConfig(
-            build_root=Path("/custom/build"),
-            cache_path=Path("/custom/cache")
-        )
-        assert config.build_root == Path("/custom/build")
-        assert config.cache_path == Path("/custom/cache")
 
 
 class TestGenerateBuildList:
@@ -429,7 +408,6 @@ if __name__ == "__main__":
         test_classes = [
             TestPackageValidation(),
             TestVersionComparison(), 
-            TestBuildConfig(),
             TestUtilityFunctions()
         ]
         

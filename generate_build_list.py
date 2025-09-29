@@ -39,7 +39,7 @@ from packaging import version
 from utils import (
     load_blacklist, load_x86_64_packages, load_aarch64_packages,
     validate_package_name, safe_path_join, is_version_newer,
-    PACKAGE_SKIP_FLAG, PACKAGE_BUILD_FLAG
+    PACKAGE_SKIP_FLAG
 )
 
 

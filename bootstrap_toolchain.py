@@ -14,7 +14,6 @@ import argparse
 import signal
 from pathlib import Path
 from build_utils import BuildUtils, BUILD_ROOT, CACHE_PATH
-from utils import validate_package_name, safe_path_join
 
 # Toolchain configuration - staged build
 STAGE1_PACKAGES = [

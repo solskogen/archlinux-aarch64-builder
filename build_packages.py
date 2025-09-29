@@ -20,7 +20,6 @@ import os
 import subprocess
 import signal
 import argparse
-import time
 from pathlib import Path
 from build_utils import BuildUtils, BUILD_ROOT, CACHE_PATH
 from utils import (
