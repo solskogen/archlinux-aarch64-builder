@@ -43,6 +43,33 @@ from utils import (
 )
 
 
+def compare_bin_package_versions(provided_version, x86_version):
+    """
+    Compare versions for -bin packages, ignoring pkgrel differences.
+    For -bin packages, we only care about the upstream version, not the Arch package revision.
+    
+    Returns:
+        1 if provided_version > x86_version (INFO: newer)
+        -1 if provided_version < x86_version (WARNING: outdated) 
+        0 if versions are equal (no message)
+    """
+    # Extract version without pkgrel (everything before the last '-')
+    def extract_version_only(version_str):
+        if '-' in version_str:
+            return version_str.rsplit('-', 1)[0]
+        return version_str
+    
+    provided_ver_only = extract_version_only(provided_version)
+    x86_ver_only = extract_version_only(x86_version)
+    
+    if is_version_newer(provided_ver_only, x86_ver_only):
+        return -1  # provided is older
+    elif is_version_newer(x86_ver_only, provided_ver_only):
+        return 1   # provided is newer
+    else:
+        return 0   # versions are equal
+
+
 
 def get_provides_mapping():
     """
@@ -492,7 +519,8 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
                         
                         if not checkout_success:
                             print(f"Warning: Could not find tag for {basename} version {version_tag}, using latest commit")
-                            subprocess.run(["git", "pull"], cwd=f"pkgbuilds/{basename}", check=True, capture_output=True)
+                            subprocess.run(["git", "fetch", "origin"], cwd=f"pkgbuilds/{basename}", check=True, capture_output=True)
+                            subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=f"pkgbuilds/{basename}", check=True, capture_output=True)
             except subprocess.CalledProcessError as e:
                 error_msg = e.stderr.strip() if e.stderr else 'Unknown error'
                 print(f"Warning: Failed to fetch PKGBUILD for {name} (basename: {basename}): {error_msg}")
@@ -505,7 +533,9 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
             try:
                 if pkg.get('force_latest', False):
                     print(f"[{i}/{total}] Processing {name} (updating to latest commit)...")
-                    subprocess.run(["git", "pull"], cwd=pkg_repo_dir, check=True, capture_output=True)
+                    # Use fetch + reset instead of pull to handle detached HEAD
+                    subprocess.run(["git", "fetch", "origin"], cwd=pkg_repo_dir, check=True, capture_output=True)
+                    subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=pkg_repo_dir, check=True, capture_output=True)
                 else:
                     if current_version:
                         print(f"[{i}/{total}] Processing {name} (updating {current_version} -> {target_version})...")
@@ -532,9 +562,10 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
                     if not checkout_success:
                         print(f"Warning: Could not find tag for {basename} version {target_version}, using latest commit")
                         try:
-                            # Reset to clean state before pulling
+                            # Reset to clean state before updating to latest
                             subprocess.run(["git", "reset", "--hard"], cwd=pkg_repo_dir, check=True, capture_output=True)
-                            subprocess.run(["git", "pull"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
+                            subprocess.run(["git", "fetch", "origin"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
+                            subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
                         except subprocess.CalledProcessError as pull_error:
                             print(f"Warning: Failed to pull latest commit for {basename}: {pull_error}")
                             if pull_error.stderr:
@@ -807,9 +838,10 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
                         break
                 
                 if provided_version:
-                    if is_version_newer(provided_version, x86_data['version']):
+                    comparison = compare_bin_package_versions(provided_version, x86_data['version'])
+                    if comparison == -1:
                         bin_package_warnings.append(f"WARNING: {bin_pkg['name']} (provides {basename}={provided_version}) is outdated compared to x86_64 {basename} ({x86_data['version']})")
-                    elif is_version_newer(x86_data['version'], provided_version):
+                    elif comparison == 1:
                         bin_package_warnings.append(f"INFO: {bin_pkg['name']} (provides {basename}={provided_version}) is newer than x86_64 {basename} ({x86_data['version']})")
                 should_include = False  # Don't build -bin packages
                 arm_version = f"provided by {bin_pkg['name']}"
@@ -832,9 +864,10 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
                         break
                 
                 if provided_version:
-                    if is_version_newer(provided_version, x86_data['version']):
+                    comparison = compare_bin_package_versions(provided_version, x86_data['version'])
+                    if comparison == -1:
                         bin_package_warnings.append(f"WARNING: {bin_pkg['name']} (provides {basename}={provided_version}) is outdated compared to x86_64 {basename} ({x86_data['version']})")
-                    elif is_version_newer(x86_data['version'], provided_version):
+                    elif comparison == 1:
                         bin_package_warnings.append(f"INFO: {bin_pkg['name']} (provides {basename}={provided_version}) is newer than x86_64 {basename} ({x86_data['version']})")
                 should_include = False
                 arm_version = f"provided by {bin_pkg['name']}"
