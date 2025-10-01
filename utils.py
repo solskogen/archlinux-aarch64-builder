@@ -33,6 +33,7 @@ config.read('config.ini')
 BUILD_ROOT = config.get('build', 'build_root', fallback='/scratch/builder')
 CACHE_PATH = f"{BUILD_ROOT}/pacman-cache"
 UPLOAD_BUCKET = config.get('build', 'upload_bucket', fallback='arch-linux-repos.drzee.net')
+X86_64_MIRROR = config.get('build', 'x86_64_mirror', fallback='https://geo.mirror.pkgbuild.com')
 LOG_RETENTION_COUNT = 3
 
 # Constants
@@ -270,8 +271,6 @@ def parse_database_file(db_filename, include_any=False):
                             'depends': data.get('DEPENDS', []),
                             'makedepends': data.get('MAKEDEPENDS', []),
                             'provides': data.get('PROVIDES', []),
-                            'filename': data.get('FILENAME', [''])[0],
-                            'arch': arch,
                             'repo': 'unknown'
                         }
     except Exception as e:
@@ -341,8 +340,8 @@ def load_database_packages(urls, arch_suffix, download=True):
 def load_x86_64_packages(download=True, repos=None):
     """Load x86_64 packages from official repositories"""
     urls = [
-        "https://geo.mirror.pkgbuild.com/core/os/x86_64/core.db",
-        "https://geo.mirror.pkgbuild.com/extra/os/x86_64/extra.db"
+        f"{X86_64_MIRROR}/core/os/x86_64/core.db",
+        f"{X86_64_MIRROR}/extra/os/x86_64/extra.db"
     ]
     
     # Filter to specific repos if requested

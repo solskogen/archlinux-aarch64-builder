@@ -57,11 +57,7 @@ class BootstrapBuilder(BuildUtils):
         except (ValueError, FileNotFoundError):
             return 0
     
-    def save_progress(self, index):
-        """Save current progress"""
-        if not self.dry_run:
-            self.progress_file.write_text(str(index))
-    
+
     def setup_environment(self):
         """Setup chroot environment for bootstrap"""
         print("Setting up bootstrap environment...")

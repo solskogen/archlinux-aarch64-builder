@@ -626,6 +626,51 @@ def run_integration_tests():
 class TestCommandLineOptions:
     """Test command-line argument parsing for all scripts"""
     
+    def test_packages_option_pkgname_and_pkgbase(self):
+        """Test that --packages works with both package names and package base names"""
+        # Mock package data where pkgbase != pkgname
+        mock_x86_packages = {
+            'python-dbus': {
+                'name': 'python-dbus',
+                'basename': 'dbus-python',  # Different from package name
+                'version': '1.4.0-1',
+                'repo': 'extra',
+                'depends': [],
+                'makedepends': [],
+                'provides': []
+            }
+        }
+        
+        mock_arm_packages = {
+            'python-dbus': {
+                'name': 'python-dbus', 
+                'basename': 'dbus-python',
+                'version': '1.4.0-1',
+                'repo': 'extra',
+                'provides': []
+            }
+        }
+        
+        from generate_build_list import compare_versions
+        
+        # Test requesting by package name
+        packages_by_name, _, _, _ = compare_versions(
+            mock_x86_packages, mock_arm_packages, 
+            force_packages=['python-dbus']
+        )
+        assert len(packages_by_name) == 1
+        assert packages_by_name[0]['name'] == 'dbus-python'  # Should use basename
+        
+        # Test requesting by basename
+        packages_by_base, _, _, _ = compare_versions(
+            mock_x86_packages, mock_arm_packages,
+            force_packages=['dbus-python'] 
+        )
+        assert len(packages_by_base) == 1
+        assert packages_by_base[0]['name'] == 'dbus-python'
+        
+        print("✓ Packages option pkgname and pkgbase test passed")
+
     def test_generate_build_list_options(self):
         """Test generate_build_list.py command-line options"""
         import argparse

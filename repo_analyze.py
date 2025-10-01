@@ -33,7 +33,7 @@ def load_packages_with_any(urls, arch_suffix):
     
     return packages
 
-from utils import load_blacklist, parse_database_file
+from utils import load_blacklist, parse_database_file, X86_64_MIRROR
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze repository differences')
@@ -54,8 +54,8 @@ def main():
     # Load packages using shared functions
     print("Loading x86_64 packages...")
     x86_urls = [
-        "https://geo.mirror.pkgbuild.com/core/os/x86_64/core.db",
-        "https://geo.mirror.pkgbuild.com/extra/os/x86_64/extra.db"
+        f"{X86_64_MIRROR}/core/os/x86_64/core.db",
+        f"{X86_64_MIRROR}/extra/os/x86_64/extra.db"
     ]
     x86_packages = load_packages_with_any(x86_urls, '_x86_64')
     print(f"Loaded {len(x86_packages)} x86_64 package names")

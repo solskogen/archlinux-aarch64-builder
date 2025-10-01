@@ -78,29 +78,7 @@ class PackageBuilder:
         self.cleanup_temp_copies()
         sys.exit(1)
     
-    def _cleanup_temp_copies(self):
-        """
-        Clean up any temporary chroot copies created during builds.
-        
-        Uses sudo to remove temporary chroot directories that were created
-        for dependency isolation. Handles permission errors gracefully.
-        """
-        for temp_copy_path in self.temp_copies:
-            if temp_copy_path.exists():
-                try:
-                    # Check if we have sudo access before attempting cleanup
-                    result = subprocess.run([
-                        "sudo", "-n", "test", "-d", str(temp_copy_path)
-                    ], capture_output=True)
-                    
-                    if result.returncode == 0:
-                        subprocess.run([
-                            "sudo", "rm", "--recursive", "--force", "--one-file-system", str(temp_copy_path)
-                        ], check=True)
-                        print(f"Cleaned up temporary chroot: {temp_copy_path}")
-                except subprocess.CalledProcessError as e:
-                    print(f"Warning: Failed to clean up {temp_copy_path}: {e}")
-    
+
     def setup_chroot(self):
         """
         Set up or update the build chroot environment.

@@ -22,8 +22,6 @@ Usage:
     ./generate_build_list.py --missing-packages # List missing packages
 """
 
-import urllib.request
-import tarfile
 import json
 import os
 import argparse
@@ -33,13 +31,12 @@ import datetime
 import subprocess
 import re
 import shutil
-import tempfile
 from pathlib import Path
 from packaging import version
 from utils import (
     load_blacklist, load_x86_64_packages, load_aarch64_packages,
     validate_package_name, safe_path_join, is_version_newer,
-    PACKAGE_SKIP_FLAG, parse_pkgbuild_deps, parse_database_file
+    PACKAGE_SKIP_FLAG, parse_pkgbuild_deps, parse_database_file, X86_64_MIRROR
 )
 
 
@@ -82,7 +79,11 @@ def get_provides_mapping():
     Returns:
         dict: Mapping of provided names to providing package basenames
     """
-    mirror_url = 'https://archlinux.carebears.no'
+    import urllib.request
+    import tarfile
+    import tempfile
+    
+    mirror_url = X86_64_MIRROR
     provides_map = {}
     
     for repo in ['core', 'extra']:
@@ -155,85 +156,7 @@ def write_results(packages, args):
 
 
 
-def load_state_packages():
-    """Load x86_64 packages from state repository with consistency checking"""
-    update_state_repo()
-    return _load_state_packages_no_update()
 
-def _load_state_packages_no_update():
-    """Load x86_64 packages from existing state repository without updating"""
-    
-    x86_packages = {}
-    package_basenames = {}
-    
-    for repo in ["core", "extra"]:
-        packages = parse_state_repo(repo)
-        
-        # Check for basenames that exist in multiple repositories (this indicates an error)
-        for pkg_name, pkg_data in packages.items():
-            basename = pkg_data['basename']
-            if basename in package_basenames:
-                print(f"ERROR: Package basename '{basename}' found in both {package_basenames[basename]} and {repo} repositories")
-                sys.exit(1)
-            package_basenames[basename] = repo
-        
-        x86_packages.update(packages)
-    
-    return x86_packages
-
-def update_state_repo():
-    """Update the state repository to get latest package versions"""
-    state_dir = Path("state")
-    if not state_dir.exists():
-        print("Cloning state repository...")
-        subprocess.run(["git", "clone", "https://gitlab.archlinux.org/archlinux/packaging/state"], check=True, stdout=subprocess.DEVNULL)
-    else:
-        print("Updating state repository...")
-        try:
-            subprocess.run(["git", "pull"], cwd=state_dir, check=True, stdout=subprocess.DEVNULL)
-        except subprocess.CalledProcessError:
-            print("State repository corrupted, re-cloning...")
-            shutil.rmtree(state_dir)
-            subprocess.run(["git", "clone", "https://gitlab.archlinux.org/archlinux/packaging/state"], check=True, stdout=subprocess.DEVNULL)
-
-def parse_state_repo(repo_name):
-    """Parse packages from state repository - only core-x86_64 and extra-x86_64"""
-    state_dir = Path("state") / f"{repo_name}-x86_64"
-    packages = {}
-    
-    if not state_dir.exists():
-        print(f"Warning: {state_dir} not found in state repository")
-        return packages
-    
-    # Get all files at once and process in batch
-    pkg_files = [f for f in state_dir.iterdir() if f.is_file()]
-    total_files = len(pkg_files)
-    
-    print(f"Parsing {total_files} packages from {repo_name}...")
-    
-    for i, pkg_file in enumerate(pkg_files, 1):
-        if i % 1000 == 0 or i == total_files:
-            print(f"  Progress: {i}/{total_files} ({i*100//total_files}%)")
-        
-        try:
-            line = pkg_file.read_text().strip()
-            parts = line.split()
-            if len(parts) >= 2:
-                name = pkg_file.name
-                version = parts[1]  # Use second field (version)
-                packages[name] = {
-                    'name': name,
-                    'basename': name,
-                    'version': version,
-                    'depends': [],
-                    'makedepends': [],
-                    'provides': [],
-                    'repo': repo_name
-                }
-        except Exception as e:
-            print(f"Warning: Failed to parse {pkg_file}: {e}")
-    
-    return packages
 
 
 def fetch_pkgbuild_deps(packages_to_build, no_update=False):
@@ -441,43 +364,7 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
     
     return all_packages
 
-def download_and_parse_db(url, arch_suffix, repo_name, packages_dict):
-    """Download and immediately parse a database file"""
-    filename = url.split('/')[-1].replace('.db', f'_{arch_suffix}.db')
-    
-    if os.path.exists(filename):
-        print(f"Using existing {filename}")
-    else:
-        print(f"Downloading {filename}...")
-        urllib.request.urlretrieve(url, filename)
-    
-    print(f"Parsing {filename}...")
-    repo_packages = extract_packages(filename, repo_name)
-    packages_dict.update(repo_packages)
-    return filename
 
-def download_dbs(x86_urls, arm_urls, skip_if_exists=False, skip_x86=False):
-    x86_files = []
-    arm_files = []
-    
-    if not skip_x86:
-        for url in x86_urls:
-            filename = url.split('/')[-1].replace('.db', '_x86_64.db')
-            if skip_if_exists and os.path.exists(filename):
-                print(f"Using existing {filename}")
-            else:
-                urllib.request.urlretrieve(url, filename)
-            x86_files.append(filename)
-    
-    for url in arm_urls:
-        filename = url.split('/')[-1].replace('.db', '_aarch64.db')
-        if skip_if_exists and os.path.exists(filename):
-            print(f"Using existing {filename}")
-        else:
-            urllib.request.urlretrieve(url, filename)
-        arm_files.append(filename)
-    
-    return x86_files, arm_files
 
 
 
@@ -618,8 +505,9 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
         arm_version = "not found"
         
         if force_packages:
-            # When --packages is specified, only include those packages
-            should_include = basename in force_packages
+            # When --packages is specified, check if any individual package name is requested
+            should_include = (basename in force_packages or 
+                            any(pkg_name in force_packages for pkg_name in x86_data['packages']))
             if basename in arm_bases:
                 arm_version = arm_bases[basename]['version']
             elif basename in arm_provides and arm_provides[basename]['name'].endswith('-bin'):
