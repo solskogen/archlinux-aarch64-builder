@@ -4,7 +4,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from generate_build_list import extract_packages
+from utils import parse_database_file
 
 def find_dependents(target_package, packages):
     """Find all packages that depend on the target package"""
@@ -40,7 +40,9 @@ def main():
     for db_file, repo_name in db_files:
         db_path = Path(db_file)
         if db_path.exists():
-            repo_packages = extract_packages(db_path, repo_name)
+            repo_packages = parse_database_file(db_path)
+            for pkg in repo_packages.values():
+                pkg['repo'] = repo_name
             packages.update(repo_packages)
         else:
             print(f"Warning: {db_file} not found", file=sys.stderr)

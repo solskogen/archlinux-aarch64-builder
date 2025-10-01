@@ -39,7 +39,7 @@ from packaging import version
 from utils import (
     load_blacklist, load_x86_64_packages, load_aarch64_packages,
     validate_package_name, safe_path_join, is_version_newer,
-    PACKAGE_SKIP_FLAG
+    PACKAGE_SKIP_FLAG, parse_pkgbuild_deps, parse_database_file
 )
 
 
@@ -153,50 +153,7 @@ def write_results(packages, args):
         for stage in sorted(stages.keys()):
             print(f"  Stage {stage}: {stages[stage]} packages")
 
-def parse_database_file(db_filename):
-    """Parse a pacman database file and return packages"""
-    import tarfile
-    packages = {}
-    
-    try:
-        with tarfile.open(db_filename, 'r:gz') as tar:
-            for member in tar.getmembers():
-                if member.name.endswith('/desc'):
-                    desc_content = tar.extractfile(member).read().decode('utf-8')
-                    
-                    # Parse desc content manually (don't filter ARCH=any for ARM packages)
-                    lines = desc_content.strip().split('\n')
-                    data = {}
-                    current_key = None
-                    
-                    for line in lines:
-                        if line.startswith('%') and line.endswith('%'):
-                            current_key = line[1:-1]
-                            data[current_key] = []
-                        elif current_key and line:
-                            data[current_key].append(line)
-                    
-                    if 'NAME' in data and 'VERSION' in data:
-                        # Skip packages with ARCH=any
-                        if data.get('ARCH', [''])[0] == 'any':
-                            continue
-                            
-                        name = data['NAME'][0]
-                        version = data['VERSION'][0]
-                        
-                        packages[name] = {
-                            'name': name,
-                            'version': version,
-                            'basename': data.get('BASE', [name])[0],
-                            'depends': data.get('DEPENDS', []),
-                            'makedepends': data.get('MAKEDEPENDS', []),
-                            'provides': data.get('PROVIDES', []),
-                            'repo': 'unknown'  # Will be set by caller
-                        }
-    except Exception as e:
-        print(f"Error parsing {db_filename}: {e}")
-    
-    return packages
+
 
 def load_state_packages():
     """Load x86_64 packages from state repository with consistency checking"""
@@ -278,134 +235,6 @@ def parse_state_repo(repo_name):
     
     return packages
 
-def parse_pkgbuild_deps(pkgbuild_path):
-    """
-    Extract dependencies from PKGBUILD file with robust parsing.
-    
-    Handles various PKGBUILD formats including:
-    - Single and multi-line dependency arrays
-    - Comments within arrays (# comment)
-    - Variable expansion ($_variable)
-    - Inline comments after dependencies
-    - Multiple quoted items on same line
-    
-    Args:
-        pkgbuild_path: Path to PKGBUILD file
-        
-    Returns:
-        dict: Dictionary with depends, makedepends, checkdepends, provides lists
-    """
-    deps = {'depends': [], 'makedepends': [], 'checkdepends': [], 'provides': []}
-    
-    try:
-        with open(pkgbuild_path, 'r') as f:
-            content = f.read()
-        
-        # Parse dependency arrays more robustly
-        for dep_type in ['depends', 'makedepends', 'checkdepends', 'provides']:
-            # Match array declarations including multi-line
-            pattern = rf'^{dep_type}=\s*\('
-            lines = content.split('\n')
-            in_array = False
-            items = []
-            
-            for line in lines:
-                line_stripped = line.strip()
-                
-                if re.match(pattern, line_stripped):
-                    in_array = True
-                    # Check if it's a single-line array
-                    if ')' in line:
-                        # Single line array
-                        array_content = re.search(rf'{dep_type}=\s*\((.*?)\)', line).group(1)
-                        # Handle inline comments
-                        if '#' in array_content:
-                            array_content = array_content.split('#')[0].strip()
-                        
-                        # Parse multiple quoted items
-                        import shlex
-                        try:
-                            line_items = shlex.split(array_content)
-                            for item in line_items:
-                                if item and item not in items:  # Avoid duplicates
-                                    items.append(item)
-                        except ValueError:
-                            # Fallback if shlex fails
-                            for item in array_content.split():
-                                item = item.strip().strip('\'"')
-                                if item and item not in items:
-                                    items.append(item)
-                        in_array = False
-                    else:
-                        # Multi-line array - check if there's content after the opening parenthesis
-                        remaining = line_stripped.split('(', 1)[1] if '(' in line_stripped else ''
-                        if remaining.strip():
-                            # Handle inline comments
-                            if '#' in remaining:
-                                remaining = remaining.split('#')[0].strip()
-                            
-                            # Parse multiple quoted items
-                            import shlex
-                            try:
-                                line_items = shlex.split(remaining)
-                                for item in line_items:
-                                    if item and item not in items:  # Avoid duplicates
-                                        items.append(item)
-                            except ValueError:
-                                # Fallback if shlex fails
-                                item = remaining.strip('\'"')
-                                if item and item not in items:
-                                    items.append(item)
-                    continue
-                
-                if in_array:
-                    if ')' in line_stripped:
-                        # End of multi-line array
-                        remaining = line_stripped.split(')')[0]
-                        if remaining.strip():
-                            # Handle inline comments
-                            if '#' in remaining:
-                                remaining = remaining.split('#')[0].strip()
-                            
-                            # Parse multiple quoted items
-                            import shlex
-                            try:
-                                line_items = shlex.split(remaining)
-                                for item in line_items:
-                                    if item and item not in items:  # Avoid duplicates
-                                        items.append(item)
-                            except ValueError:
-                                # Fallback if shlex fails
-                                item = remaining.strip().strip('\'"')
-                                if item and item not in items:
-                                    items.append(item)
-                        in_array = False
-                    else:
-                        # Middle of multi-line array
-                        if line_stripped and not line_stripped.startswith('#'):
-                            # Handle inline comments - only remove comment part, keep dependency name
-                            clean_line = line_stripped
-                            if '#' in clean_line:
-                                clean_line = clean_line.split('#')[0].strip()
-                            
-                            # Parse multiple quoted items on same line
-                            import shlex
-                            try:
-                                line_items = shlex.split(clean_line)
-                                for item in line_items:
-                                    if item and item not in items:  # Avoid duplicates
-                                        items.append(item)
-                            except ValueError:
-                                # Fallback if shlex fails
-                                item = clean_line.strip('\'"')
-                                if item and item not in items:
-                                    items.append(item)
-            
-            deps[dep_type] = items
-    except Exception as e:
-        print(f"Warning: Failed to parse PKGBUILD {pkgbuild_path}: {e}")
-    
-    return deps
 
 def fetch_pkgbuild_deps(packages_to_build, no_update=False):
     """
@@ -533,9 +362,7 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
             try:
                 if pkg.get('force_latest', False):
                     print(f"[{i}/{total}] Processing {name} (updating to latest commit)...")
-                    # Use fetch + reset instead of pull to handle detached HEAD
-                    subprocess.run(["git", "fetch", "origin"], cwd=pkg_repo_dir, check=True, capture_output=True)
-                    subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=pkg_repo_dir, check=True, capture_output=True)
+                    subprocess.run(["git", "pull"], cwd=pkg_repo_dir, check=True, capture_output=True)
                 else:
                     if current_version:
                         print(f"[{i}/{total}] Processing {name} (updating {current_version} -> {target_version})...")
@@ -652,50 +479,17 @@ def download_dbs(x86_urls, arm_urls, skip_if_exists=False, skip_x86=False):
     
     return x86_files, arm_files
 
-def parse_desc(content):
-    lines = content.strip().split('\n')
-    data = {}
-    current_key = None
-    
-    for line in lines:
-        if line.startswith('%') and line.endswith('%'):
-            current_key = line[1:-1]
-            data[current_key] = []
-        elif current_key and line:
-            data[current_key].append(line)
-    
-    # Skip packages with ARCH=any
-    if data.get('ARCH', [''])[0] == 'any':
-        return None
-    
-    basename = data.get('BASE', [''])[0] or data.get('NAME', [''])[0]
-    version_str = data.get('VERSION', [''])[0]
-    
-    return {
-        'name': data.get('NAME', [''])[0],
-        'basename': basename,
-        'version': version_str,
-        'depends': data.get('DEPENDS', []),
-        'makedepends': data.get('MAKEDEPENDS', []),
-        'provides': data.get('PROVIDES', [])
-    }
+
 
 def extract_packages(db_file, repo_name):
-    packages = {}
-    with tarfile.open(db_file, "r:gz") as tar:
-        for member in tar.getmembers():
-            if member.name.endswith('/desc'):
-                desc_file = tar.extractfile(member)
-                content = desc_file.read().decode('utf-8')
-                pkg_data = parse_desc(content)
-                if pkg_data:  # Skip None (ARCH=any packages)
-                    pkg_data['repo'] = repo_name
-                    if pkg_data['name'] in packages:
-                        print(f"ERROR: Package '{pkg_data['name']}' found in multiple repositories!")
-                        print(f"  First: {packages[pkg_data['name']]['repo']} (version {packages[pkg_data['name']]['version']})")
-                        print(f"  Second: {repo_name} (version {pkg_data['version']})")
-                        exit(1)
-                    packages[pkg_data['name']] = pkg_data
+    packages = parse_database_file(db_file)
+    for pkg in packages.values():
+        pkg['repo'] = repo_name
+        if pkg['name'] in packages:
+            print(f"ERROR: Package '{pkg['name']}' found in multiple repositories!")
+            print(f"  First: {packages[pkg['name']]['repo']} (version {packages[pkg['name']]['version']})")
+            print(f"  Second: {repo_name} (version {pkg['version']})")
+            exit(1)
     return packages
 
 def find_missing_dependencies(packages, x86_packages, arm_packages):

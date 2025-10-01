@@ -6,48 +6,6 @@ from packaging import version
 import tarfile
 import fnmatch
 
-def parse_database_file_with_any(db_filename):
-    """Parse a pacman database file including ARCH=any packages"""
-    packages = {}
-    
-    try:
-        with tarfile.open(db_filename, 'r:gz') as tar:
-            for member in tar.getmembers():
-                if member.name.endswith('/desc'):
-                    desc_content = tar.extractfile(member).read().decode('utf-8')
-                    
-                    lines = desc_content.strip().split('\n')
-                    data = {}
-                    current_key = None
-                    
-                    for line in lines:
-                        if line.startswith('%') and line.endswith('%'):
-                            current_key = line[1:-1]
-                            data[current_key] = []
-                        elif current_key and line:
-                            data[current_key].append(line)
-                    
-                    if 'NAME' in data and 'VERSION' in data:
-                        name = data['NAME'][0]
-                        version = data['VERSION'][0]
-                        arch = data.get('ARCH', [''])[0]
-                        
-                        packages[name] = {
-                            'name': name,
-                            'version': version,
-                            'basename': data.get('BASE', [name])[0],
-                            'depends': data.get('DEPENDS', []),
-                            'makedepends': data.get('MAKEDEPENDS', []),
-                            'provides': data.get('PROVIDES', []),
-                            'filename': data.get('FILENAME', [''])[0],
-                            'arch': arch,
-                            'repo': 'unknown'
-                        }
-    except Exception as e:
-        print(f"Error parsing {db_filename}: {e}")
-    
-    return packages
-
 def load_packages_with_any(urls, arch_suffix):
     """Load packages including ARCH=any packages"""
     import subprocess
@@ -62,7 +20,7 @@ def load_packages_with_any(urls, arch_suffix):
             
             repo_name = url.split('/')[-4]
             print(f"Parsing {db_filename}...")
-            repo_packages = parse_database_file_with_any(db_filename)
+            repo_packages = parse_database_file(db_filename, include_any=True)
             
             for name, pkg in repo_packages.items():
                 pkg['repo'] = repo_name
@@ -75,7 +33,7 @@ def load_packages_with_any(urls, arch_suffix):
     
     return packages
 
-from utils import load_blacklist
+from utils import load_blacklist, parse_database_file
 
 def main():
     parser = argparse.ArgumentParser(description='Analyze repository differences')

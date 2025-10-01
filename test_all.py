@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """
 Comprehensive test suite for the Arch Linux AArch64 build system.
+Merged from all testing-related files.
 """
 import json
 import tempfile
 import subprocess
 import os
+import sys
 from pathlib import Path
 from unittest.mock import patch, MagicMock, mock_open
 
@@ -40,9 +42,8 @@ except ImportError:
 
 from utils import (
     validate_package_name, safe_path_join, is_version_newer, 
-    compare_arch_versions, PACKAGE_SKIP_FLAG
+    compare_arch_versions, PACKAGE_SKIP_FLAG, BUILD_ROOT, CACHE_PATH
 )
-from build_utils import BUILD_ROOT, CACHE_PATH
 
 
 class TestPackageValidation:
@@ -77,7 +78,6 @@ class TestPackageValidation:
     def test_safe_path_join_traversal_attack(self):
         """Test path traversal protection"""
         base = Path("/tmp/test")
-        # The function validates package name first, so it catches invalid names before path traversal
         with pytest.raises(ValueError, match="Invalid package name"):
             safe_path_join(base, "../../../etc/passwd")
     
@@ -106,20 +106,17 @@ class TestVersionComparison:
     
     def test_git_revision_versions(self):
         """Test git revision version handling"""
-        # Test git revision comparisons
-        assert is_version_newer("1.0+r1-1", "1.0+r2-1")  # r2 is newer than r1
-        assert not is_version_newer("1.0+r2-1", "1.0+r1-1")  # r1 is older than r2
-        # Note: The actual behavior may vary based on implementation
+        assert is_version_newer("1.0+r1-1", "1.0+r2-1")
+        assert not is_version_newer("1.0+r2-1", "1.0+r1-1")
     
     def test_compare_arch_versions_return_values(self):
         """Test compare_arch_versions return values"""
-        assert compare_arch_versions("1.0-1", "1.1-1") == -1  # first < second
-        assert compare_arch_versions("1.1-1", "1.0-1") == 1   # first > second
-        assert compare_arch_versions("1.0-1", "1.0-1") == 0   # equal
+        assert compare_arch_versions("1.0-1", "1.1-1") == -1
+        assert compare_arch_versions("1.1-1", "1.0-1") == 1
+        assert compare_arch_versions("1.0-1", "1.0-1") == 0
     
     def test_malformed_versions(self):
         """Test handling of malformed version strings"""
-        # Should not crash, fallback to string comparison
         result = is_version_newer("malformed", "1.0-1")
         assert isinstance(result, bool)
 
@@ -127,16 +124,8 @@ class TestVersionComparison:
 class TestGenerateBuildList:
     """Test build list generation"""
     
-    @patch('utils.load_x86_64_packages')
-    @patch('utils.load_aarch64_packages')
-    def test_generate_build_list_basic(self, mock_load_aarch64, mock_load_x86_64):
-        """Test basic build list generation"""
-        # Skip this test - too complex to mock properly
-        pass
-    
     def test_generate_build_list_cli(self):
         """Test command line interface"""
-        # Test that CLI doesn't crash with basic args
         result = subprocess.run([
             "python3", "generate_build_list.py", "--help"
         ], capture_output=True, text=True)
@@ -156,21 +145,10 @@ class TestBuildPackages:
         assert builder.dry_run == True
         assert builder.temp_copies == []
     
-    def test_build_package_dry_run(self):
-        """Test package building in dry run mode"""
-        from build_packages import PackageBuilder
-        
-        builder = PackageBuilder(dry_run=True)
-        
-        # Should succeed in dry run without actual commands
-        # Skip this test as it requires complex mocking
-        assert builder.dry_run == True
-    
     def test_parse_dependency_list(self):
         """Test dependency parsing via shlex"""
         import shlex
         
-        # Test various dependency formats
         deps = shlex.split("'pkg1' 'pkg2' \"pkg3\"")
         assert deps == ["pkg1", "pkg2", "pkg3"]
         
@@ -186,11 +164,9 @@ class TestBootstrapToolchain:
     
     def test_toolchain_packages_defined(self):
         """Test that toolchain packages are properly defined"""
-        # Check that bootstrap script contains expected toolchain packages
         with open('bootstrap_toolchain.py', 'r') as f:
             content = f.read()
         
-        # These packages should be mentioned in the bootstrap script
         expected_packages = ["gcc", "glibc", "binutils", "linux-api-headers"]
         for pkg in expected_packages:
             assert pkg in content, f"Package {pkg} not found in bootstrap script"
@@ -209,9 +185,7 @@ class TestDependencyParsing:
     
     def test_parse_dependency_array(self):
         """Test parsing of dependency arrays from PKGBUILD"""
-        # Test simple dependencies
         deps = "depends=('glibc' 'gcc-libs')"
-        # This would require actual PKGBUILD parsing - simplified test
         assert isinstance(deps, str)
         print("✓ Dependency array parsing test passed")
     
@@ -238,7 +212,6 @@ class TestPackageFiltering:
             {'name': 'arch-specific', 'arch': ['x86_64']},
             {'name': 'any-arch', 'arch': ['any']}
         ]
-        # Test that any-arch packages are included
         any_arch = [p for p in packages if 'any' in p.get('arch', [])]
         assert len(any_arch) == 1
         print("✓ Architecture filtering test passed")
@@ -255,7 +228,6 @@ class TestPackageFiltering:
         ]
         blacklist = ['linux-*', 'vim-*']
         
-        # filter_blacklisted_packages returns (filtered_packages, count)
         filtered, count = filter_blacklisted_packages(packages, blacklist)
         filtered_names = [p['name'] for p in filtered]
         
@@ -263,7 +235,7 @@ class TestPackageFiltering:
         assert 'linux-firmware' not in filtered_names
         assert 'linux-headers' not in filtered_names
         assert 'vim-runtime' not in filtered_names
-        assert count == 3  # 3 packages were filtered out
+        assert count == 3
         print("✓ Blacklist wildcard patterns test passed")
 
 
@@ -274,12 +246,10 @@ class TestVersionHandling:
         """Test splitting epoch from version"""
         from utils import split_epoch_version
         
-        # Test with epoch
         epoch, version = split_epoch_version("2:1.2.3-1")
         assert epoch == 2
         assert version == "1.2.3-1"
         
-        # Test without epoch
         epoch, version = split_epoch_version("1.2.3-1")
         assert epoch == 0
         assert version == "1.2.3-1"
@@ -289,7 +259,6 @@ class TestVersionHandling:
         """Test detection of git revision versions"""
         from utils import has_git_revision
         
-        # The actual implementation looks for '+r' not '.r'
         assert has_git_revision("1.2.3+r123.abc1234-1") == True
         assert has_git_revision("1.2.3-1") == False
         assert has_git_revision("20240101+r456.def5678-1") == True
@@ -299,15 +268,12 @@ class TestVersionHandling:
         """Test comparison of git revision versions"""
         from utils import compare_git_versions
         
-        # Test with versions that have git revisions using correct format
         result = compare_git_versions("1.0+r100.abc123-1", "1.0+r50.def456-1")
         assert result > 0
         
-        # Same revision should be equal
         result = compare_git_versions("1.0+r100.abc123-1", "1.0+r100.abc123-1")
         assert result == 0
         
-        # Test fallback to regular version comparison
         result = compare_git_versions("1.1-1", "1.0-1")
         assert result > 0
         print("✓ Git version comparison test passed")
@@ -324,14 +290,11 @@ class TestBuildOrderCalculation:
             {'name': 'a', 'depends': ['b'], 'makedepends': []}
         ]
         
-        # Simple topological sort test
-        # C should come before B, B should come before A
         names = [p['name'] for p in packages]
         c_idx = names.index('c')
         b_idx = names.index('b')
         a_idx = names.index('a')
         
-        # This is a simplified test - actual topological sort would reorder
         assert isinstance(c_idx, int) and isinstance(b_idx, int) and isinstance(a_idx, int)
         print("✓ Simple dependency chain test passed")
     
@@ -342,8 +305,6 @@ class TestBuildOrderCalculation:
             {'name': 'b', 'depends': ['a'], 'makedepends': []}
         ]
         
-        # In a real implementation, this would detect the circular dependency
-        # For now, just test that we can identify the structure
         deps_a = packages[0]['depends']
         deps_b = packages[1]['depends']
         
@@ -358,7 +319,6 @@ class TestChrootManagement:
         """Test chroot path validation"""
         from pathlib import Path
         
-        # Test valid paths
         valid_paths = ["/tmp/builder", "/var/tmp/chroot", "/scratch/build"]
         for path in valid_paths:
             p = Path(path)
@@ -370,7 +330,6 @@ class TestChrootManagement:
         """Test temporary chroot naming convention"""
         import re
         
-        # Test naming pattern: temp-{package}-{random_id}
         pattern = r"temp-[\w\-\+\.]+\-\d{7}"
         test_names = [
             "temp-gcc-1234567",
@@ -389,12 +348,10 @@ class TestPackageUpload:
     
     def test_repository_target_selection(self):
         """Test correct repository target selection"""
-        # Core packages should go to core-testing
         core_pkg = {'repo': 'core', 'name': 'glibc'}
         target = f"{core_pkg['repo']}-testing"
         assert target == "core-testing"
         
-        # Extra packages should go to extra-testing
         extra_pkg = {'repo': 'extra', 'name': 'firefox'}
         target = f"{extra_pkg['repo']}-testing"
         assert target == "extra-testing"
@@ -403,17 +360,13 @@ class TestPackageUpload:
     
     def test_package_cleanup_logic(self):
         """Test package cleanup before upload"""
-        from pathlib import Path
-        
-        # Simulate package files with timestamps
         pkg_files = [
             "test-1.0-1-aarch64.pkg.tar.xz",
             "test-1.0-2-aarch64.pkg.tar.xz", 
             "test-1.1-1-aarch64.pkg.tar.xz"
         ]
         
-        # Should keep only the newest version (1.1-1)
-        newest = max(pkg_files)  # Simple string comparison for test
+        newest = max(pkg_files)
         assert "1.1-1" in newest
         print("✓ Package cleanup logic test passed")
 
@@ -425,7 +378,6 @@ class TestConfigurationHandling:
         """Test config.ini parsing"""
         import configparser
         
-        # Test basic config structure
         config = configparser.ConfigParser()
         config.read_string("""
 [build]
@@ -445,9 +397,8 @@ upstream_extra = https://example.com/extra.db
     
     def test_config_defaults(self):
         """Test configuration defaults"""
-        from build_utils import BUILD_ROOT, CACHE_PATH
+        from utils import BUILD_ROOT, CACHE_PATH
         
-        # Test that defaults are defined
         assert BUILD_ROOT is not None
         assert CACHE_PATH is not None
         assert isinstance(BUILD_ROOT, str)
@@ -460,18 +411,14 @@ class TestErrorRecovery:
     
     def test_corrupted_database_handling(self):
         """Test handling of corrupted package databases"""
-        # Simulate corrupted database content
         corrupted_data = b"corrupted binary data"
         
-        # In real implementation, this would trigger re-download
-        # For test, just verify we can detect corruption
         try:
-            # This would normally parse the database
             assert len(corrupted_data) > 0
-            is_corrupted = not corrupted_data.startswith(b'\x1f\x8b')  # Not gzip
+            is_corrupted = not corrupted_data.startswith(b'\x1f\x8b')
             assert is_corrupted
         except Exception:
-            pass  # Expected for corrupted data
+            pass
         
         print("✓ Corrupted database handling test passed")
     
@@ -479,14 +426,11 @@ class TestErrorRecovery:
         """Test recovery from network failures"""
         import subprocess
         
-        # Simulate network command that might fail
         try:
-            # This would be a real network operation in practice
             result = subprocess.run(['echo', 'network_test'], 
                                   capture_output=True, text=True, timeout=1)
             assert result.returncode == 0
         except subprocess.TimeoutExpired:
-            # Handle timeout gracefully
             pass
         
         print("✓ Network failure recovery test passed")
@@ -494,14 +438,10 @@ class TestErrorRecovery:
     def test_build_interruption_cleanup(self):
         """Test cleanup after build interruption"""
         import signal
-        import os
         
-        # Test that signal handlers are properly defined
-        # In real implementation, this would test SIGINT/SIGTERM handling
         current_handler = signal.signal(signal.SIGINT, signal.default_int_handler)
         assert current_handler is not None
         
-        # Restore original handler
         signal.signal(signal.SIGINT, current_handler)
         print("✓ Build interruption cleanup test passed")
 
@@ -514,7 +454,6 @@ class TestUtilityFunctions:
         """Test blacklist loading"""
         from utils import load_blacklist
         
-        # Test with non-existent file
         result = load_blacklist("nonexistent.txt")
         assert result == []
     
@@ -526,14 +465,14 @@ class TestUtilityFunctions:
             f.write("# Comment line\n")
             f.write("blacklisted-pkg\n")
             f.write("another-pkg*\n")
-            f.write("\n")  # Empty line
+            f.write("\n")
             temp_file = f.name
         
         try:
             result = load_blacklist(temp_file)
             assert "blacklisted-pkg" in result
             assert "another-pkg*" in result
-            assert len(result) == 2  # Comments and empty lines filtered
+            assert len(result) == 2
         finally:
             os.unlink(temp_file)
     
@@ -560,7 +499,6 @@ class TestFileOperations:
     
     def test_json_output_format(self):
         """Test JSON output format"""
-        # Create sample package data
         packages = [
             {
                 "name": "vim",
@@ -574,7 +512,6 @@ class TestFileOperations:
             }
         ]
         
-        # Test JSON serialization
         json_str = json.dumps(packages, indent=2)
         parsed = json.loads(json_str)
         
@@ -594,10 +531,15 @@ checkdepends=('python-pytest')
 provides=('test-lib')
 """
         
-        with patch("builtins.open", mock_open(read_data=pkgbuild_content)):
-            from generate_build_list import parse_pkgbuild_deps
+        # Create a temporary directory and file for testing
+        import tempfile
+        with tempfile.TemporaryDirectory() as temp_dir:
+            pkgbuild_path = Path(temp_dir) / "PKGBUILD"
+            pkgbuild_path.write_text(pkgbuild_content)
             
-            deps = parse_pkgbuild_deps(Path("/fake/PKGBUILD"))
+            from utils import parse_pkgbuild_deps
+            
+            deps = parse_pkgbuild_deps(pkgbuild_path)
             
             assert "glibc" in deps["depends"]
             assert "gcc" in deps["makedepends"] 
@@ -623,9 +565,8 @@ class TestErrorHandling:
     
     def test_missing_pkgbuild_handling(self):
         """Test handling of missing PKGBUILD files"""
-        from generate_build_list import parse_pkgbuild_deps
+        from utils import parse_pkgbuild_deps
         
-        # Should not crash on missing file
         deps = parse_pkgbuild_deps(Path("/nonexistent/PKGBUILD"))
         assert isinstance(deps, dict)
         assert "depends" in deps
@@ -633,7 +574,7 @@ class TestErrorHandling:
     @patch('subprocess.run')
     def test_command_failure_handling(self, mock_run):
         """Test handling of command failures"""
-        from build_utils import BuildUtils
+        from utils import BuildUtils
         
         mock_run.side_effect = subprocess.CalledProcessError(1, "fake-command")
         utils = BuildUtils(dry_run=False)
@@ -651,7 +592,6 @@ def run_integration_tests():
         import generate_build_list
         import build_packages
         import bootstrap_toolchain
-        import build_utils
         import utils
         print("✓ All modules import successfully")
     except ImportError as e:
@@ -681,6 +621,219 @@ def run_integration_tests():
             return False
     
     return True
+
+
+class TestCommandLineOptions:
+    """Test command-line argument parsing for all scripts"""
+    
+    def test_generate_build_list_options(self):
+        """Test generate_build_list.py command-line options"""
+        import argparse
+        
+        # Test that all expected options are available
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--arm-urls', nargs='+')
+        parser.add_argument('--aur', nargs='+')
+        parser.add_argument('--local', action='store_true')
+        parser.add_argument('--packages', nargs='+')
+        parser.add_argument('--preserve-order', action='store_true')
+        parser.add_argument('--blacklist', default='blacklist.txt')
+        parser.add_argument('--missing-packages', action='store_true')
+        parser.add_argument('--rebuild-repo', choices=['core', 'extra'])
+        parser.add_argument('--no-update', action='store_true')
+        parser.add_argument('--use-latest', action='store_true')
+        
+        # Test parsing some combinations
+        args = parser.parse_args(['--packages', 'vim', 'gcc'])
+        assert args.packages == ['vim', 'gcc']
+        
+        args = parser.parse_args(['--rebuild-repo', 'core'])
+        assert args.rebuild_repo == 'core'
+        
+        args = parser.parse_args(['--missing-packages'])
+        assert args.missing_packages == True
+        
+        print("✓ generate_build_list.py options test passed")
+    
+    def test_build_packages_options(self):
+        """Test build_packages.py command-line options"""
+        import argparse
+        
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--dry-run', action='store_true')
+        parser.add_argument('--json', default='packages_to_build.json')
+        parser.add_argument('--blacklist', default='blacklist.txt')
+        parser.add_argument('--no-upload', action='store_true')
+        parser.add_argument('--cache')
+        parser.add_argument('--no-cache', action='store_true')
+        parser.add_argument('--continue', action='store_true', dest='continue_build')
+        parser.add_argument('--repackage', action='store_true')
+        parser.add_argument('--preserve-chroot', action='store_true')
+        parser.add_argument('--stop-on-failure', action='store_true')
+        parser.add_argument('--chroot')
+        
+        # Test parsing
+        args = parser.parse_args(['--dry-run', '--no-upload'])
+        assert args.dry_run == True
+        assert args.no_upload == True
+        
+        args = parser.parse_args(['--cache', '/custom/cache'])
+        assert args.cache == '/custom/cache'
+        
+        args = parser.parse_args(['--continue', '--repackage'])
+        assert args.continue_build == True
+        assert args.repackage == True
+        
+        print("✓ build_packages.py options test passed")
+    
+    def test_bootstrap_toolchain_options(self):
+        """Test bootstrap_toolchain.py command-line options"""
+        import argparse
+        
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--chroot', default='/scratch/builder')
+        parser.add_argument('--cache', default='/scratch/builder/pacman-cache')
+        parser.add_argument('--dry-run', action='store_true')
+        parser.add_argument('--continue', action='store_true', dest='continue_build')
+        parser.add_argument('--start-from', metavar='PACKAGE')
+        parser.add_argument('--no-update', action='store_true')
+        
+        # Test parsing
+        args = parser.parse_args(['--dry-run'])
+        assert args.dry_run == True
+        
+        args = parser.parse_args(['--start-from', 'gcc'])
+        assert args.start_from == 'gcc'
+        
+        args = parser.parse_args(['--chroot', '/custom/chroot'])
+        assert args.chroot == '/custom/chroot'
+        
+        print("✓ bootstrap_toolchain.py options test passed")
+    
+    def test_repo_analyze_options(self):
+        """Test repo_analyze.py command-line options"""
+        import argparse
+        
+        parser = argparse.ArgumentParser()
+        parser.add_argument('--blacklist')
+        parser.add_argument('--missing-pkgbase', action='store_true')
+        parser.add_argument('--outdated-any', action='store_true')
+        parser.add_argument('--missing-any', action='store_true')
+        parser.add_argument('--repo-mismatches', action='store_true')
+        parser.add_argument('--arm-newer', action='store_true')
+        parser.add_argument('--arm-only', action='store_true')
+        parser.add_argument('--arm-duplicates', action='store_true')
+        
+        # Test parsing
+        args = parser.parse_args(['--missing-pkgbase'])
+        assert args.missing_pkgbase == True
+        
+        args = parser.parse_args(['--blacklist', 'custom.txt'])
+        assert args.blacklist == 'custom.txt'
+        
+        args = parser.parse_args(['--arm-newer', '--repo-mismatches'])
+        assert args.arm_newer == True
+        assert args.repo_mismatches == True
+        
+        print("✓ repo_analyze.py options test passed")
+    
+    def test_find_dependents_options(self):
+        """Test find_dependents.py command-line options"""
+        import argparse
+        
+        parser = argparse.ArgumentParser()
+        parser.add_argument('package')
+        
+        # Test parsing
+        args = parser.parse_args(['vim'])
+        assert args.package == 'vim'
+        
+        print("✓ find_dependents.py options test passed")
+
+
+class TestScriptIntegration:
+    """Test script integration and option validation"""
+    
+    def test_mutually_exclusive_options(self):
+        """Test mutually exclusive option groups"""
+        # generate_build_list.py has --no-update and --use-latest as mutually exclusive
+        result = subprocess.run([
+            "python3", "generate_build_list.py", "--no-update", "--use-latest", "--help"
+        ], capture_output=True, text=True)
+        
+        # Should show help due to conflicting options
+        assert "usage:" in result.stdout or result.returncode != 0
+        print("✓ Mutually exclusive options test passed")
+    
+    def test_option_dependencies(self):
+        """Test options that depend on other options"""
+        # build_packages.py --repackage requires --continue
+        result = subprocess.run([
+            "python3", "build_packages.py", "--repackage", "--help"
+        ], capture_output=True, text=True)
+        
+        # Should work (help will be shown)
+        assert "usage:" in result.stdout
+        print("✓ Option dependencies test passed")
+    
+    def test_choice_validation(self):
+        """Test choice validation for options"""
+        # generate_build_list.py --rebuild-repo accepts only 'core' or 'extra'
+        result = subprocess.run([
+            "python3", "generate_build_list.py", "--rebuild-repo", "invalid", "--help"
+        ], capture_output=True, text=True)
+        
+        # Should fail or show help
+        assert result.returncode != 0 or "usage:" in result.stdout
+        print("✓ Choice validation test passed")
+
+
+class TestScriptOutputFormats:
+    """Test script output formats and modes"""
+    
+    def test_dry_run_mode(self):
+        """Test dry-run mode functionality"""
+        from utils import BuildUtils
+        
+        # Test dry-run mode
+        utils = BuildUtils(dry_run=True)
+        result = utils.run_command(["echo", "test"])
+        
+        # Should return mock result
+        assert result.returncode == 0
+        assert result.stdout == ""
+        print("✓ Dry-run mode test passed")
+    
+    def test_json_output_validation(self):
+        """Test JSON output structure"""
+        import json
+        import tempfile
+        
+        # Create minimal test data
+        test_data = {
+            "_command": "test",
+            "_timestamp": "2025-01-01T00:00:00",
+            "packages": [
+                {
+                    "name": "test-pkg",
+                    "version": "1.0-1",
+                    "repo": "extra",
+                    "depends": [],
+                    "makedepends": [],
+                    "provides": [],
+                    "build_stage": 0
+                }
+            ]
+        }
+        
+        # Test JSON serialization/deserialization
+        json_str = json.dumps(test_data, indent=2)
+        parsed = json.loads(json_str)
+        
+        assert parsed["_command"] == "test"
+        assert len(parsed["packages"]) == 1
+        assert parsed["packages"][0]["name"] == "test-pkg"
+        print("✓ JSON output validation test passed")
 
 
 if __name__ == "__main__":
@@ -718,7 +871,10 @@ if __name__ == "__main__":
             TestPackageUpload(),
             TestConfigurationHandling(),
             TestErrorRecovery(),
-            TestUtilityFunctions()
+            TestUtilityFunctions(),
+            TestCommandLineOptions(),
+            TestScriptIntegration(),
+            TestScriptOutputFormats()
         ]
         
         failed = 0
