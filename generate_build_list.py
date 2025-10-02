@@ -38,7 +38,8 @@ from utils import (
     validate_package_name, safe_path_join, is_version_newer,
     PACKAGE_SKIP_FLAG, parse_pkgbuild_deps, parse_database_file, X86_64_MIRROR,
     PKGBUILDS_DIR, SEPARATOR_WIDTH, get_target_architecture,
-    should_skip_package, compare_bin_package_versions, extract_packages, find_missing_dependencies
+    should_skip_package, compare_bin_package_versions, extract_packages, find_missing_dependencies,
+    load_packages_with_any, config, load_all_packages_parallel
 )
 
 # ============================================================
@@ -134,13 +135,32 @@ def write_results(packages, args):
     print(f"Total packages to build: {len(packages)}")
     if packages:
         stages = {}
+        cycles = {}
+        unique_packages = set()
+        
         for pkg in packages:
             stage = pkg.get('build_stage', 0)
             stages[stage] = stages.get(stage, 0) + 1
+            unique_packages.add(pkg['name'])
+            
+            # Track cycle information
+            if pkg.get('cycle_group') is not None:
+                cycle_id = pkg['cycle_group']
+                if cycle_id not in cycles:
+                    cycles[cycle_id] = set()
+                cycles[cycle_id].add(pkg['name'])
+        
+        print(f"Unique packages: {len(unique_packages)}")
         print(f"Total build stages: {max(stages.keys()) + 1 if stages else 0}")
+        
+        if cycles:
+            print(f"Dependency cycles: {len(cycles)}")
+            for cycle_id, cycle_pkgs in cycles.items():
+                print(f"  Cycle {cycle_id + 1}: {', '.join(sorted(cycle_pkgs))} (built twice)")
+        
         print("Packages per stage:")
         for stage in sorted(stages.keys()):
-            print(f"  Stage {stage}: {stages[stage]} packages")
+            print(f"  Stage {stage + 1}: {stages[stage]} packages")
 
 
 
@@ -200,15 +220,22 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
             try:
                 with open(pkgbuild_path, 'r') as f:
                     content = f.read()
-                    # Extract pkgver and pkgrel - only if they don't contain complex variables
+                    # Extract pkgver, pkgrel, and epoch - only if they don't contain complex variables
                     pkgver_match = re.search(r'^pkgver=(.+)$', content, re.MULTILINE)
                     pkgrel_match = re.search(r'^pkgrel=(.+)$', content, re.MULTILINE)
+                    epoch_match = re.search(r'^epoch=(.+)$', content, re.MULTILINE)
+                    
                     if pkgver_match and pkgrel_match:
                         pkgver = pkgver_match.group(1).strip('\'"')
                         pkgrel = pkgrel_match.group(1).strip('\'"')
+                        epoch = epoch_match.group(1).strip('\'"') if epoch_match else None
+                        
                         # Only use if no complex variable substitution
                         if not ('${' in pkgver or '$(' in pkgver):
-                            current_version = f"{pkgver}-{pkgrel}"
+                            if epoch:
+                                current_version = f"{epoch}:{pkgver}-{pkgrel}"
+                            else:
+                                current_version = f"{pkgver}-{pkgrel}"
             except Exception:
                 pass  # If we can't read version, treat as if PKGBUILD doesn't exist
         
@@ -601,19 +628,109 @@ def preserve_package_order(packages, ordered_names):
     
     return ordered_packages
 
+def detect_dependency_cycles(packages):
+    """
+    Detect dependency cycles in the package list.
+    
+    Returns:
+        dict: Maps package names to their cycle group ID (if in a cycle)
+    """
+    # Create maps for quick lookup
+    pkg_map = {pkg['name']: pkg for pkg in packages}
+    provides_map = {}
+    
+    # Build provides mapping
+    for pkg in packages:
+        if pkg['name'] not in provides_map:
+            provides_map[pkg['name']] = pkg
+        for provide in pkg['provides']:
+            provide_name = provide.split('=')[0]
+            if provide_name not in provides_map:
+                provides_map[provide_name] = pkg
+    
+    # Build dependency graph
+    deps = {}
+    for pkg in packages:
+        deps[pkg['name']] = set()
+        all_deps = pkg['depends'] + pkg['makedepends']
+        if 'checkdepends' in pkg:
+            all_deps += pkg['checkdepends']
+        
+        for dep_string in all_deps:
+            for dep in dep_string.split():
+                dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
+                if dep_name in provides_map and provides_map[dep_name]['name'] in pkg_map:
+                    deps[pkg['name']].add(provides_map[dep_name]['name'])
+    
+    # Find strongly connected components (cycles)
+    visited = set()
+    rec_stack = set()
+    cycles = {}
+    cycle_id = 0
+    
+    def find_cycles(node, path):
+        nonlocal cycle_id
+        if node in rec_stack:
+            # Found a cycle - mark all nodes in the cycle
+            cycle_start = path.index(node)
+            cycle_nodes = path[cycle_start:]
+            if len(cycle_nodes) > 1:  # Only real cycles (more than 1 node)
+                for cycle_node in cycle_nodes:
+                    cycles[cycle_node] = cycle_id
+                cycle_id += 1
+            return
+        
+        if node in visited:
+            return
+        
+        visited.add(node)
+        rec_stack.add(node)
+        path.append(node)
+        
+        for neighbor in deps.get(node, []):
+            if neighbor in pkg_map:
+                find_cycles(neighbor, path)
+        
+        path.pop()
+        rec_stack.remove(node)
+    
+    # Find all cycles
+    for pkg_name in pkg_map:
+        if pkg_name not in visited:
+            find_cycles(pkg_name, [])
+    
+    return cycles
+
 def sort_by_build_order(packages):
     """
     Sort packages by dependency order using topological sort.
     
-    Ensures that dependencies are built before packages that depend on them.
-    Handles circular dependencies gracefully and assigns build stages.
+    Detects dependency cycles and marks packages for double-build when
+    all packages in a cycle need upgrading.
     
     Args:
         packages: List of package dictionaries with dependency information
         
     Returns:
-        list: Packages sorted by build order with build_stage assigned
+        list: Packages sorted by build order with build_stage and cycle info assigned
     """
+    # Detect dependency cycles
+    cycles = detect_dependency_cycles(packages)
+    
+    # Group packages by cycle
+    cycle_groups = {}
+    for pkg_name, cycle_id in cycles.items():
+        if cycle_id not in cycle_groups:
+            cycle_groups[cycle_id] = []
+        cycle_groups[cycle_id].append(pkg_name)
+    
+    # Report detected cycles
+    if cycle_groups:
+        print(f"\nDetected {len(cycle_groups)} dependency cycle(s):")
+        for cycle_id, cycle_pkgs in cycle_groups.items():
+            print(f"  Cycle {cycle_id + 1}: {' ↔ '.join(cycle_pkgs)}")
+            print(f"    These packages will be built twice to ensure compatibility")
+    
     # Create maps for quick lookup
     pkg_map = {pkg['name']: pkg for pkg in packages}
     provides_map = {}
@@ -666,14 +783,44 @@ def sort_by_build_order(packages):
     for pkg in packages:
         get_stage(pkg['name'])
     
-    # Add build_stage to packages and sort
-    sorted_pkgs = []
-    for pkg in packages:
-        pkg_copy = pkg.copy()
-        pkg_copy['build_stage'] = stages[pkg['name']]
-        sorted_pkgs.append(pkg_copy)
+    # Create final package list with cycle information
+    result_packages = []
+    next_stage = 0
     
-    return sorted(sorted_pkgs, key=lambda x: x['build_stage'])
+    # Add non-cycle packages first, tracking stages
+    stage_map = {}
+    for pkg in packages:
+        if pkg['name'] not in cycles:
+            pkg_copy = pkg.copy()
+            pkg_copy['build_stage'] = stages[pkg['name']]
+            pkg_copy['cycle_group'] = None
+            pkg_copy['cycle_stage'] = None
+            result_packages.append(pkg_copy)
+            next_stage = max(next_stage, stages[pkg['name']] + 1)
+    
+    # Add packages in cycles twice (consecutive stages)
+    for cycle_id, cycle_pkgs in cycle_groups.items():
+        # Stage 1: Build all packages in cycle
+        for pkg_name in cycle_pkgs:
+            pkg = pkg_map[pkg_name]
+            pkg_copy = pkg.copy()
+            pkg_copy['build_stage'] = next_stage
+            pkg_copy['cycle_group'] = cycle_id
+            pkg_copy['cycle_stage'] = 1
+            result_packages.append(pkg_copy)
+        
+        # Stage 2: Build all packages in cycle again
+        for pkg_name in cycle_pkgs:
+            pkg = pkg_map[pkg_name]
+            pkg_copy = pkg.copy()
+            pkg_copy['build_stage'] = next_stage + 1
+            pkg_copy['cycle_group'] = cycle_id
+            pkg_copy['cycle_stage'] = 2
+            result_packages.append(pkg_copy)
+        
+        next_stage += 2  # Move to next available stage after this cycle
+    
+    return sorted(result_packages, key=lambda x: (x['build_stage'], x.get('cycle_stage', 0)))
 
 if __name__ == "__main__":
     # Clean up state from previous builds
@@ -806,8 +953,8 @@ if __name__ == "__main__":
     x86_packages = {}
     if args.packages and not args.aur:
         print(f"Looking up versions for {len(args.packages)} specified packages...")
-        # Load full x86_64 packages for dependency resolution
-        all_x86_packages = load_x86_64_packages(download=not args.no_update)
+        # Load packages using shared parallel function
+        all_x86_packages, target_packages = load_all_packages_parallel(download=not args.no_update)
         
         # Filter to only requested packages for comparison, but keep full list for dependency resolution
         filtered_x86_packages = {}
@@ -868,15 +1015,25 @@ if __name__ == "__main__":
         # Store full package list for dependency resolution
         full_x86_packages = all_x86_packages
     elif not args.aur:
-        # Load x86_64 packages using shared function
-        repos = [args.rebuild_repo] if args.rebuild_repo else None
-        x86_packages = load_x86_64_packages(download=not args.no_update, repos=repos)
-        print(f"Loaded {len(x86_packages)} x86_64 packages")
+        # Load packages using shared parallel function
+        print("Loading packages...")
+        repo_filter = [args.rebuild_repo] if args.rebuild_repo else None
+        x86_packages, target_packages = load_all_packages_parallel(download=not args.no_update, x86_repos=repo_filter, target_repos=repo_filter)
+        
         # Use same list for dependency resolution
         full_x86_packages = x86_packages
     else:
         print("Skipping x86_64 parsing (using AUR)")
         full_x86_packages = {}
+        # For AUR mode, we still need target packages for comparison
+        target_arch = get_target_architecture()
+        target_urls = [
+            config.get('build', 'target_core_url', fallback=f"https://arch-linux-repo.drzee.net/arch/core/os/{target_arch}/core.db"),
+            config.get('build', 'target_extra_url', fallback=f"https://arch-linux-repo.drzee.net/arch/extra/os/{target_arch}/extra.db")
+        ]
+        target_packages = load_packages_with_any(target_urls, f'_{target_arch}', download=not args.no_update)
+        print(f"Loaded {len(target_packages)} {target_arch} packages")
+        
         if args.packages:
             for pkg_name in args.packages:
                 x86_packages[pkg_name] = {
@@ -888,11 +1045,6 @@ if __name__ == "__main__":
                     'provides': [],
                     'repo': 'extra'
                 }
-    
-    # Load target architecture packages using shared function
-    target_arch = get_target_architecture()
-    target_packages = load_target_arch_packages(download=not args.no_update)
-    print(f"Loaded {len(target_packages)} {target_arch} packages")
     
     print("Comparing versions...")
     # Skip blacklist entirely when using --packages

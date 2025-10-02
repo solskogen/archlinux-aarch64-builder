@@ -258,6 +258,28 @@ echo "PROVIDES_END"
                     deps[current_section].append(line)
         else:
             print(f"Warning: Failed to parse PKGBUILD with bash: {result.stderr}")
+        
+        # Also parse dependencies from package() function by reading the file directly
+        try:
+            with open(pkgbuild_path, 'r') as f:
+                content = f.read()
+                
+            # Look for depends= inside package() function
+            import re
+            package_func_match = re.search(r'package\(\)\s*\{(.*?)\n\}', content, re.DOTALL)
+            if package_func_match:
+                package_content = package_func_match.group(1)
+                depends_match = re.search(r"depends=\([^)]+\)", package_content)
+                if depends_match:
+                    depends_line = depends_match.group(0)
+                    # Extract dependencies from the line
+                    deps_in_parens = re.findall(r"'([^']+)'", depends_line)
+                    for dep in deps_in_parens:
+                        if dep not in deps['depends']:
+                            deps['depends'].append(dep)
+        except Exception as e:
+            pass  # Ignore errors in text parsing
+            
     except subprocess.TimeoutExpired:
         print("Warning: PKGBUILD parsing timed out")
     except Exception as e:
@@ -633,7 +655,50 @@ def find_missing_dependencies(packages, x86_packages, target_packages):
     
     return missing_deps
 
-def load_packages_with_any(urls, arch_suffix, download=True):
+def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None, include_any=False):
+    """Load both x86_64 and target architecture packages in parallel"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    
+    target_arch = get_target_architecture()
+    
+    # Build URLs
+    x86_urls = [
+        f"{X86_64_MIRROR}/core/os/x86_64/core.db",
+        f"{X86_64_MIRROR}/extra/os/x86_64/extra.db"
+    ]
+    target_urls = [
+        config.get('build', 'target_core_url', fallback=f"https://arch-linux-repo.drzee.net/arch/core/os/{target_arch}/core.db"),
+        config.get('build', 'target_extra_url', fallback=f"https://arch-linux-repo.drzee.net/arch/extra/os/{target_arch}/extra.db")
+    ]
+    
+    # Filter URLs if specific repos requested
+    if x86_repos:
+        if 'core' in x86_repos and 'extra' not in x86_repos:
+            x86_urls = [x86_urls[0]]
+        elif 'extra' in x86_repos and 'core' not in x86_repos:
+            x86_urls = [x86_urls[1]]
+    
+    if target_repos:
+        if 'core' in target_repos and 'extra' not in target_repos:
+            target_urls = [target_urls[0]]
+        elif 'extra' in target_repos and 'core' not in target_repos:
+            target_urls = [target_urls[1]]
+    
+    def load_arch_packages(urls, arch_suffix, arch_name):
+        packages = load_packages_with_any(urls, arch_suffix, download=download, include_any=include_any)
+        print(f"Loaded {len(packages)} {arch_name} packages")
+        return packages
+    
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        x86_future = executor.submit(load_arch_packages, x86_urls, '_x86_64', 'x86_64')
+        target_future = executor.submit(load_arch_packages, target_urls, f'_{target_arch}', target_arch)
+        
+        x86_packages = x86_future.result()
+        target_packages = target_future.result()
+    
+    return x86_packages, target_packages
+
+def load_packages_with_any(urls, arch_suffix, download=True, include_any=True):
     """Load packages including ARCH=any packages"""
     import subprocess
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -652,7 +717,7 @@ def load_packages_with_any(urls, arch_suffix, download=True):
             
             repo_name = url.split('/')[-4]
             print(f"Parsing {db_filename}...")
-            repo_packages = parse_database_file(db_filename, include_any=True)
+            repo_packages = parse_database_file(db_filename, include_any=include_any)
             
             # Add repo info to each package
             for name, pkg in repo_packages.items():

@@ -121,6 +121,26 @@ class PackageBuilder:
         Returns:
             bool: True if build succeeded, False otherwise
         """
+        # Dry-run mode: just show what would be done
+        if self.dry_run:
+            print(f"\n{'='*SEPARATOR_WIDTH}")
+            print(f"[DRY RUN] Would build {pkg_name}")
+            print(f"{'='*SEPARATOR_WIDTH}")
+            
+            pkg_dir = safe_path_join(Path("pkgbuilds"), pkg_name)
+            if not pkg_dir.exists():
+                print(f"[DRY RUN] ERROR: Package directory {pkg_dir} does not exist")
+                return False
+            
+            pkgbuild_path = pkg_dir / "PKGBUILD"
+            if not pkgbuild_path.exists():
+                print(f"[DRY RUN] ERROR: PKGBUILD not found at {pkgbuild_path}")
+                return False
+            
+            print(f"[DRY RUN] Would build package from {pkg_dir}")
+            print(f"[DRY RUN] Would upload to {pkg_data.get('repo', 'extra')}-testing repository")
+            return True
+        
         # Validate package name
         if not validate_package_name(pkg_name):
             print(f"ERROR: Invalid package name: {pkg_name}")
@@ -463,6 +483,18 @@ echo "CHECKDEPENDS_END"
         except Exception:
             pass
     
+    def _clear_cache(self):
+        """Clear pacman cache to force using newly uploaded packages"""
+        cache_dir = Path(self.cache_dir)
+        if cache_dir.exists():
+            try:
+                import shutil
+                shutil.rmtree(cache_dir)
+                cache_dir.mkdir(parents=True, exist_ok=True)
+                print(f"Cleared cache directory: {cache_dir}")
+            except Exception as e:
+                print(f"Warning: Failed to clear cache: {e}")
+    
     def build_packages(self, packages_file, blacklist_file=None, continue_build=False):
         """Build all packages from JSON file"""
         # Load packages
@@ -535,14 +567,56 @@ echo "CHECKDEPENDS_END"
         # Build packages
         failed_packages = []
         successful_packages = []
+        current_cycle_group = None
+        cycle_stage_1_success = {}  # Track which packages succeeded in stage 1 of each cycle
+        
+        # Build cycle info map for display
+        cycle_info = {}
+        for pkg in packages:
+            cycle_group = pkg.get('cycle_group')
+            if cycle_group is not None:
+                if cycle_group not in cycle_info:
+                    cycle_info[cycle_group] = set()
+                cycle_info[cycle_group].add(pkg['name'])
         
         for i, pkg in enumerate(packages[start_index:], start_index + 1):
             pkg_name = pkg['name']
-            print(f"\n[{i}/{len(packages)}] Building {pkg_name}")
+            cycle_group = pkg.get('cycle_group')
+            cycle_stage = pkg.get('cycle_stage')
+            
+            # Handle cycle stage transitions
+            if cycle_group is not None:
+                cycle_packages = sorted(cycle_info[cycle_group])
+                cycle_desc = f"Cycle {cycle_group + 1} ({' ↔ '.join(cycle_packages)})"
+                
+                if cycle_stage == 1:
+                    print(f"\n[{i}/{len(packages)}] Building {pkg_name} ({cycle_desc}, Stage 1/2)")
+                elif cycle_stage == 2:
+                    # Check if this package succeeded in stage 1
+                    if cycle_group not in cycle_stage_1_success or pkg_name not in cycle_stage_1_success[cycle_group]:
+                        print(f"\n[{i}/{len(packages)}] Skipping {pkg_name} ({cycle_desc}, Stage 2/2) - failed in Stage 1")
+                        failed_packages.append(pkg)
+                        continue
+                    
+                    # Clear cache before stage 2 of cycle
+                    if current_cycle_group != cycle_group:
+                        print(f"\nClearing cache before {cycle_desc} Stage 2...")
+                        self._clear_cache()
+                        current_cycle_group = cycle_group
+                    
+                    print(f"\n[{i}/{len(packages)}] Building {pkg_name} ({cycle_desc}, Stage 2/2)")
+            else:
+                print(f"\n[{i}/{len(packages)}] Building {pkg_name}")
             
             try:
                 if self.build_package(pkg_name, pkg):
                     successful_packages.append(pkg_name)
+                    
+                    # Track cycle stage 1 successes
+                    if cycle_group is not None and cycle_stage == 1:
+                        if cycle_group not in cycle_stage_1_success:
+                            cycle_stage_1_success[cycle_group] = set()
+                        cycle_stage_1_success[cycle_group].add(pkg_name)
                 else:
                     failed_packages.append(pkg)
                     if self.stop_on_failure:
