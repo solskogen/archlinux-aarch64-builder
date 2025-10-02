@@ -579,6 +579,30 @@ echo "CHECKDEPENDS_END"
                 except Exception as e:
                     print(f"Warning: Failed to remove lock file {lock_file}: {e}")
 
+    def _cleanup_temp_chroot(self, temp_copy_path):
+        """Clean up temporary chroot"""
+        if temp_copy_path in self.temp_copies:
+            should_cleanup = True
+            if self.stop_on_failure or self.preserve_chroot:
+                should_cleanup = False
+                print(f"Preserving temporary chroot: {temp_copy_path}")
+            
+            if should_cleanup:
+                try:
+                    subprocess.run([
+                        "sudo", "rm", "--recursive", "--force", "--one-file-system", str(temp_copy_path)
+                    ], check=True)
+                    self.temp_copies.remove(temp_copy_path)
+                except subprocess.CalledProcessError as e:
+                    print(f"Warning: Failed to cleanup chroot {temp_copy_path}: {e}")
+                except Exception as e:
+                    print(f"Error during cleanup: {e}")
+                finally:
+                    try:
+                        self.temp_copies.remove(temp_copy_path)
+                    except ValueError:
+                        pass
+
 
 class BuildError:
     """Centralized error message formatting"""

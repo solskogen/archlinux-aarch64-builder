@@ -327,10 +327,12 @@ def parse_database_file(db_filename, include_any=False):
                         packages[name] = {
                             'name': name,
                             'version': version,
+                            'arch': arch,
                             'basename': data.get('BASE', [name])[0],
                             'depends': data.get('DEPENDS', []),
                             'makedepends': data.get('MAKEDEPENDS', []),
                             'provides': data.get('PROVIDES', []),
+                            'filename': data.get('FILENAME', [''])[0],
                             'repo': 'unknown'
                         }
     except Exception as e:

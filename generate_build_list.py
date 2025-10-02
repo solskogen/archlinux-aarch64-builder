@@ -492,9 +492,9 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
                             any(pkg_name in force_packages for pkg_name in x86_data['packages']))
             if basename in target_bases:
                 target_version = target_bases[basename]['version']
-            elif basename in arm_provides and arm_provides[basename]['name'].endswith('-bin'):
+            elif basename in target_provides and target_provides[basename]['name'].endswith('-bin'):
                 # Check if a -bin package provides this package
-                bin_pkg = arm_provides[basename]
+                bin_pkg = target_provides[basename]
                 provided_version = None
                 for provide in bin_pkg['provides']:
                     if provide.startswith(f"{basename}="):
