@@ -21,7 +21,7 @@ STAGE1_PACKAGES = [
 ]
 
 STAGE2_PACKAGES = [
-    "glibc", "binutils", "gcc", "libtool", "valgrind"
+    "glibc", "binutils", "gcc", "gmp", "mpfr", "libmpc", "libisl", "libtool", "valgrind"
 ]
 
 REQUIRED_TOOLS = ['makechrootpkg', 'pkgctl', 'repo-upload', 'arch-nspawn']
@@ -266,11 +266,18 @@ class BootstrapBuilder(BuildUtils):
                     sys.exit(1)
             
             # Validate gcc/glibc directories exist before starting
+            missing_packages = []
             for pkg_name in ["gcc", "glibc"]:
                 pkg_dir = self.build_dir / pkg_name
                 if not pkg_dir.exists():
-                    print(f"ERROR: {pkg_dir} not found - please checkout {pkg_name} from special repo manually")
-                    sys.exit(1)
+                    missing_packages.append(pkg_name)
+            
+            if missing_packages:
+                print("ERROR: Missing required special repositories:")
+                for pkg_name in missing_packages:
+                    pkg_dir = self.build_dir / pkg_name
+                    print(f"  {pkg_dir} not found - please checkout {pkg_name} from special repo manually")
+                sys.exit(1)
             
             # Clear build directory for fresh start (unless continuing)
             if not self.continue_build and not self.start_from:

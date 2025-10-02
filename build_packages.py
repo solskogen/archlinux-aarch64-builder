@@ -101,56 +101,12 @@ class PackageBuilder:
         
 
     
-    def build_package(self, pkg_name, pkg_data):
-        """
-        Build a single package in a clean chroot environment.
-        
-        This is the core build method that:
-        1. Validates the package name and paths
-        2. Creates a temporary chroot copy for isolation
-        3. Parses PKGBUILD dependencies with variable expansion
-        4. Installs all dependencies in the temporary chroot
-        5. Builds the package using makechrootpkg
-        6. Uploads the built packages to the appropriate repository
-        7. Cleans up temporary files
-        
-        Args:
-            pkg_name: Name of the package to build
-            pkg_data: Package metadata dictionary
-            
-        Returns:
-            bool: True if build succeeded, False otherwise
-        """
-        # Dry-run mode: just show what would be done
-        if self.dry_run:
-            print(f"\n{'='*SEPARATOR_WIDTH}")
-            print(f"[DRY RUN] Would build {pkg_name}")
-            print(f"{'='*SEPARATOR_WIDTH}")
-            
-            pkg_dir = safe_path_join(Path("pkgbuilds"), pkg_name)
-            if not pkg_dir.exists():
-                print(f"[DRY RUN] ERROR: Package directory {pkg_dir} does not exist")
-                return False
-            
-            pkgbuild_path = pkg_dir / "PKGBUILD"
-            if not pkgbuild_path.exists():
-                print(f"[DRY RUN] ERROR: PKGBUILD not found at {pkgbuild_path}")
-                return False
-            
-            print(f"[DRY RUN] Would build package from {pkg_dir}")
-            print(f"[DRY RUN] Would upload to {pkg_data.get('repo', 'extra')}-testing repository")
-            return True
-        
-        # Validate package name
+    def _validate_build_inputs(self, pkg_name, pkg_data):
+        """Validate package name and required paths"""
         if not validate_package_name(pkg_name):
             print(f"ERROR: Invalid package name: {pkg_name}")
             return False
             
-        print(f"\n{'='*SEPARATOR_WIDTH}")
-        print(f"Building {pkg_name}")
-        print(f"{'='*SEPARATOR_WIDTH}")
-        
-        # Check that root chroot exists
         root_chroot = self.chroot_path / "root"
         if not root_chroot.exists():
             print(f"ERROR: Root chroot {root_chroot} does not exist")
@@ -166,8 +122,36 @@ class PackageBuilder:
         if not pkgbuild_path.exists():
             print(f"ERROR: PKGBUILD not found at {pkgbuild_path}")
             return False
+            
+        return True
+
+    def _setup_temp_chroot(self, pkg_name):
+        """Create or find temporary chroot for package"""
+        temp_dirs = list(self.chroot_path.glob(f"temp-{pkg_name}-*"))
+        if len(temp_dirs) == 1:
+            temp_copy_path = temp_dirs[0]
+            print(f"Found preserved chroot: {temp_copy_path.name}")
+            return temp_copy_path
+        elif len(temp_dirs) > 1:
+            print(f"ERROR: Multiple preserved chroots found for {pkg_name}:")
+            for temp_dir in temp_dirs:
+                print(f"  {temp_dir.name}")
+            raise RuntimeError("Multiple preserved chroots found")
+        else:
+            import uuid
+            temp_copy_name = f"temp-{pkg_name}-{uuid.uuid4().hex[:8]}"
+            temp_copy_path = self.chroot_path / temp_copy_name
+            while temp_copy_path.exists():
+                temp_copy_name = f"temp-{pkg_name}-{uuid.uuid4().hex[:8]}"
+                temp_copy_path = self.chroot_path / temp_copy_name
+            self.temp_copies.append(temp_copy_path)
+            return temp_copy_path
+
+    def _prepare_build_environment(self, temp_copy_path, pkg_name, pkg_dir):
+        """Setup chroot environment and install dependencies"""
+        root_chroot = self.chroot_path / "root"
         
-        # Import GPG keys if present
+        # Import GPG keys
         keys_dir = pkg_dir / "keys" / "pgp"
         if keys_dir.exists():
             print("Importing GPG keys...")
@@ -178,30 +162,61 @@ class PackageBuilder:
                 except subprocess.CalledProcessError as e:
                     print(f"Warning: Failed to import GPG key {key_file}: {e}")
         
-        # Clear cache if no-cache mode
+        # Clear cache if needed
         if self.no_cache:
             print("Clearing pacman cache...")
             if self.cache_dir.exists():
                 try:
-                    # Use find to delete all files and directories in cache
                     subprocess.run([
                         "sudo", "find", str(self.cache_dir), "-mindepth", "1", "-delete"
                     ], check=True)
                 except subprocess.CalledProcessError as e:
                     print(f"Warning: Failed to clear cache: {e}")
         
-        # Set SOURCE_DATE_EPOCH for reproducible builds
-        env = os.environ.copy()
-        env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
+        # Create temp chroot
+        print(f"Creating temporary chroot: {temp_copy_path.name}")
+        try:
+            subprocess.run([
+                "sudo", "rsync", "-a", "--delete", "-q", "-W", "-x", 
+                f"{root_chroot}/", str(temp_copy_path) + "/"
+            ], check=True, capture_output=True, text=True)
+            print("Rsync completed successfully")
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(f"Rsync failed: {e}")
         
-        # Parse PKGBUILD for depends, makedepends, and checkdepends using bash
-        depends = []
-        makedepends = []
-        checkdepends = []
+        # Update package database
+        print("Updating package database in temporary chroot...")
+        try:
+            subprocess.run([
+                "sudo", "arch-nspawn", 
+                "-c", str(self.cache_dir),
+                str(temp_copy_path), "pacman", "-Suy", "--noconfirm"
+            ], check=True)
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: Failed to update package database: {e}")
         
-        # Create a temporary script to source PKGBUILD and extract dependencies
+        # Parse and install dependencies
+        depends, makedepends, checkdepends = self._parse_pkgbuild_deps(pkg_dir)
+        all_deps = depends + makedepends + checkdepends
+        if all_deps:
+            print(f"Installing dependencies: {' '.join(all_deps)}")
+            try:
+                env = os.environ.copy()
+                env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
+                subprocess.run([
+                    "sudo", "arch-nspawn", 
+                    "-c", str(self.cache_dir),
+                    str(temp_copy_path),
+                    "pacman", "-S", "--noconfirm"
+                ] + all_deps, check=True, env=env)
+            except KeyboardInterrupt:
+                sys.exit(1)
+
+    def _parse_pkgbuild_deps(self, pkg_dir):
+        """Parse PKGBUILD dependencies using bash"""
+        import shlex
         temp_script = f"""#!/bin/bash
-cd "{pkg_dir}"
+cd {shlex.quote(str(pkg_dir))}
 source PKGBUILD 2>/dev/null || exit 1
 echo "DEPENDS_START"
 printf '%s\\n' "${{depends[@]}}"
@@ -214,14 +229,16 @@ printf '%s\\n' "${{checkdepends[@]}}"
 echo "CHECKDEPENDS_END"
 """
         
+        depends = []
+        makedepends = []
+        checkdepends = []
+        
         try:
             result = subprocess.run(['bash', '-c', temp_script], 
                                   capture_output=True, text=True, timeout=GIT_COMMAND_TIMEOUT)
             if result.returncode == 0:
-                output = result.stdout
                 current_section = None
-                
-                for line in output.split('\n'):
+                for line in result.stdout.split('\n'):
                     line = line.strip()
                     if line == "DEPENDS_START":
                         current_section = "depends"
@@ -249,217 +266,67 @@ echo "CHECKDEPENDS_END"
         except Exception as e:
             print(f"Warning: Error parsing PKGBUILD: {e}")
         
-        # Always create temporary chroot for build isolation
-        # Each package gets its own temporary chroot copy to prevent dependency conflicts
+        return depends, makedepends, checkdepends
+
+    def _execute_build(self, pkg_name, pkg_data, temp_copy_path, pkg_dir):
+        """Execute the actual package build"""
+        env = os.environ.copy()
+        env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
         
-        # Check if there's a preserved chroot from a previous failed build
-        temp_dirs = list(self.chroot_path.glob(f"temp-{pkg_name}-*"))
-        if len(temp_dirs) == 1:
-            temp_copy_path = temp_dirs[0]
-            temp_copy_name = temp_copy_path.name
-            print(f"Found preserved chroot: {temp_copy_name}")
-        elif len(temp_dirs) > 1:
-            print(f"ERROR: Multiple preserved chroots found for {pkg_name}:")
-            for temp_dir in temp_dirs:
-                print(f"  {temp_dir.name}")
-            print("Please remove the unwanted chroots and try again")
-            return False
-        else:
-            import random
-            random_chroot_id = random.randint(TEMP_CHROOT_ID_MIN, TEMP_CHROOT_ID_MAX)
-            temp_copy_name = f"temp-{pkg_name}-{random_chroot_id}"
-            temp_copy_path = self.chroot_path / temp_copy_name
-            self.temp_copies.append(temp_copy_path)
+        cmd = [
+            "makechrootpkg", "-l", temp_copy_path.name, "-r", str(self.chroot_path),
+            "-d", str(self.cache_dir),
+            "--", "--ignorearch"
+        ]
         
-        build_success = False
+        print(f"Running: {' '.join(cmd)}")
+        
+        # Create log file
+        timestamp = subprocess.run(['date', '+%Y%m%d-%H%M%S'], capture_output=True, text=True).stdout.strip()
+        log_file = self.logs_dir / f"{pkg_name}-{timestamp}-build.log"
+        self.build_utils.cleanup_old_logs(pkg_name)
         
         try:
-            # Always rsync root chroot to temporary chroot
-            print(f"Creating temporary chroot: {temp_copy_name}")
-            try:
-                result = subprocess.run([
-                    "sudo", "rsync", "-a", "--delete", "-q", "-W", "-x", 
-                    f"{root_chroot}/", str(temp_copy_path) + "/"
-                ], check=True, capture_output=True, text=True)
-                print(f"Rsync completed successfully")
-            except subprocess.CalledProcessError as e:
-                print(f"ERROR: Rsync failed: {e}")
-                print(f"Stderr: {e.stderr}")
-                return False
-            except KeyboardInterrupt:
-                sys.exit(1)
-            
-            # Update package database in temporary chroot
-            print("Updating package database in temporary chroot...")
-            try:
-                subprocess.run([
-                    "sudo", "arch-nspawn", 
-                    "-c", str(self.cache_dir),  # Bind mount cache directory
-                    str(temp_copy_path), "pacman", "-Suy", "--noconfirm"
-                ], check=True)
-            except subprocess.CalledProcessError as e:
-                print(f"Warning: Failed to update package database: {e}")
-            except KeyboardInterrupt:
-                sys.exit(1)
-            
-            # Install all dependencies if any
-            all_deps = depends + makedepends + checkdepends
-            if all_deps:
-                print(f"Installing dependencies: {' '.join(all_deps)}")
-                try:
-                    subprocess.run([
-                        "sudo", "arch-nspawn", 
-                        "-c", str(self.cache_dir),  # Bind mount cache directory
-                        str(temp_copy_path),
-                        "pacman", "-S", "--noconfirm"
-                    ] + all_deps, check=True, env=env)
-                except KeyboardInterrupt:
-                    sys.exit(1)
-            
-            # Always build with temporary chroot
-            cmd = [
-                "makechrootpkg", "-l", temp_copy_name, "-r", str(self.chroot_path),
-                "-d", str(self.cache_dir),
-                "--", "--ignorearch"
-            ]
-            
-            # Execute build
-            print(f"Running: {' '.join(cmd)}")
-            try:
-                # Stream output in real-time and capture for logging
-                stdout_lines = []
-                stderr_lines = []
-                
+            with open(log_file, 'w') as f:
                 process = subprocess.Popen(cmd, cwd=pkg_dir, env=env, 
-                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
-                                         text=True, bufsize=1, universal_newlines=True)
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
+                                         text=True, bufsize=1)
                 
-                # Read output line by line
-                import select
-                while process.poll() is None:
-                    ready, _, _ = select.select([process.stdout, process.stderr], [], [], 0.1)
-                    for stream in ready:
-                        if stream == process.stdout:
-                            line = stream.readline()
-                            if line:
-                                print(line, end='')
-                                stdout_lines.append(line)
-                        elif stream == process.stderr:
-                            line = stream.readline()
-                            if line:
-                                print(line, end='', file=sys.stderr)
-                                stderr_lines.append(line)
+                # Stream output to both console and log file
+                while True:
+                    line = process.stdout.readline()
+                    if not line and process.poll() is not None:
+                        break
+                    if line:
+                        print(line, end='')
+                        f.write(line)
+                        f.flush()
                 
-                # Read any remaining output
-                remaining_stdout, remaining_stderr = process.communicate()
-                if remaining_stdout:
-                    print(remaining_stdout, end='')
-                    stdout_lines.append(remaining_stdout)
-                if remaining_stderr:
-                    print(remaining_stderr, end='', file=sys.stderr)
-                    stderr_lines.append(remaining_stderr)
+                process.wait()
                 
                 if process.returncode != 0:
-                    # Write build log on failure
-                    self.logs_dir.mkdir(exist_ok=True)
-                    timestamp = subprocess.run(['date', '+%Y%m%d-%H%M%S'], capture_output=True, text=True).stdout.strip()
-                    log_file = self.logs_dir / f"{pkg_name}-{timestamp}-build.log"
-                    self.build_utils.cleanup_old_logs(pkg_name)
+                    f.write(f"\nBuild failed with return code: {process.returncode}\n")
+                    raise subprocess.CalledProcessError(process.returncode, cmd)
                     
-                    with open(log_file, 'w') as f:
-                        f.write(f"Build failed for {pkg_name}\n")
-                        f.write(f"Command: {' '.join(cmd)}\n")
-                        f.write(f"Return code: {process.returncode}\n\n")
-                        if stdout_lines:
-                            f.write("STDOUT:\n")
-                            f.write(''.join(stdout_lines))
-                            f.write("\n\n")
-                        if stderr_lines:
-                            f.write("STDERR:\n")
-                            f.write(''.join(stderr_lines))
-                            f.write("\n")
-                    
-                    print(f"ERROR: Build failed for {pkg_name}")
-                    print(f"Build log saved to: {log_file}")
-                    return False
-                elif self.preserve_chroot:
-                    # Save build log on success when preserving chroot
-                    self.logs_dir.mkdir(exist_ok=True)
-                    timestamp = subprocess.run(['date', '+%Y%m%d-%H%M%S'], capture_output=True, text=True).stdout.strip()
-                    log_file = self.logs_dir / f"{pkg_name}-{timestamp}-build.log"
-                    self.build_utils.cleanup_old_logs(pkg_name)
-                    
-                    with open(log_file, 'w') as f:
-                        f.write(f"Build succeeded for {pkg_name}\n")
-                        f.write(f"Command: {' '.join(cmd)}\n")
-                        f.write(f"Return code: {process.returncode}\n\n")
-                        if stdout_lines:
-                            f.write("STDOUT:\n")
-                            f.write(''.join(stdout_lines))
-                            f.write("\n\n")
-                        if stderr_lines:
-                            f.write("STDERR:\n")
-                            f.write(''.join(stderr_lines))
-                            f.write("\n")
-                    
-                    print(f"Build log saved to: {log_file}")
-                    
-            except KeyboardInterrupt:
-                print(f"\nBuild interrupted for {pkg_name}")
-                sys.exit(1)
-            
-            # Upload packages if not disabled
-            if not self.no_upload:
-                target_repo = f"{pkg_data.get('repo', 'extra')}-testing"
-                from utils import upload_packages
-                uploaded_count = upload_packages(pkg_dir, target_repo, self.dry_run)
-                print(f"Successfully uploaded {uploaded_count} packages to {target_repo}")
-            
-            print(f"Successfully built {pkg_name}")
-            self._update_last_successful(pkg_name)
-            build_success = True
-            return True
-            
-        except subprocess.CalledProcessError as e:
-            print(f"ERROR: Failed to prepare build environment: {e}")
+        except subprocess.CalledProcessError:
+            error_msg = BuildError.format_build_failure(pkg_name, log_file, "Package compilation failed")
+            print(error_msg)
             return False
-        finally:
-            # Clean up temporary chroot copy (unless preserving or build failed with stop-on-failure)
-            if temp_copy_path in self.temp_copies:
-                should_cleanup = True
-                if self.stop_on_failure and not build_success:
-                    should_cleanup = False
-                    print(f"Preserving temporary chroot for debugging: {temp_copy_path}")
-                    # Also preserve for potential repackaging
-                    self.preserved_chroot = temp_copy_path
-                elif self.preserve_chroot:
-                    should_cleanup = False
-                    print(f"Preserving temporary chroot (--preserve-chroot): {temp_copy_path}")
-                
-                if should_cleanup:
-                    try:
-                        subprocess.run([
-                            "sudo", "rm", "--recursive", "--force", "--one-file-system", str(temp_copy_path)
-                        ], check=True)
-                        self.temp_copies.remove(temp_copy_path)
-                    except (subprocess.CalledProcessError, KeyboardInterrupt, Exception):
-                        # Silent cleanup failure - don't let cleanup issues stop the build process
-                        try:
-                            self.temp_copies.remove(temp_copy_path)
-                        except ValueError:
-                            pass
-            elif not build_success:
-                # Preserve chroot for debugging on build failure
-                self.preserved_chroot = temp_copy_path
-                print(f"Preserving chroot for debugging: {temp_copy_path}")
-            
-            # Clean up lock files created during this build
-            for lock_file in self.chroot_path.glob("*.lock"):
-                try:
-                    lock_file.unlink()
-                except Exception:
-                    pass
-    
+        except KeyboardInterrupt:
+            print(f"\nBuild interrupted for {pkg_name}")
+            sys.exit(1)
+        
+        # Upload packages
+        if not self.no_upload:
+            target_repo = f"{pkg_data.get('repo', 'extra')}-testing"
+            from utils import upload_packages
+            uploaded_count = upload_packages(pkg_dir, target_repo, self.dry_run)
+            print(f"Successfully uploaded {uploaded_count} packages to {target_repo}")
+        
+        print(f"Successfully built {pkg_name}")
+        self._update_last_successful(pkg_name)
+        return True
+
     def _find_last_successful_package(self, packages):
         """Find the index of the last successfully built package"""
         state_file = Path("last_successful.txt")
@@ -480,8 +347,8 @@ echo "CHECKDEPENDS_END"
         """Update the last successful package state file"""
         try:
             Path("last_successful.txt").write_text(pkg_name)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"Warning: Failed to update last successful package: {e}")
     
     def _clear_cache(self):
         """Clear pacman cache to force using newly uploaded packages"""
@@ -494,7 +361,7 @@ echo "CHECKDEPENDS_END"
                 print(f"Cleared cache directory: {cache_dir}")
             except Exception as e:
                 print(f"Warning: Failed to clear cache: {e}")
-    
+
     def build_packages(self, packages_file, blacklist_file=None, continue_build=False):
         """Build all packages from JSON file"""
         # Load packages
@@ -651,6 +518,121 @@ echo "CHECKDEPENDS_END"
             print("Failed packages:")
             for pkg in failed_packages:
                 print(f"  - {pkg['name']}")
+
+    def build_package(self, pkg_name, pkg_data):
+        """Build a single package in a clean chroot environment"""
+        # Dry-run mode
+        if self.dry_run:
+            print(f"\n{'='*SEPARATOR_WIDTH}")
+            print(f"[DRY RUN] Would build {pkg_name}")
+            print(f"{'='*SEPARATOR_WIDTH}")
+            
+            pkg_dir = safe_path_join(Path("pkgbuilds"), pkg_name)
+            if not pkg_dir.exists():
+                print(f"[DRY RUN] ERROR: Package directory {pkg_dir} does not exist")
+                return False
+            
+            pkgbuild_path = pkg_dir / "PKGBUILD"
+            if not pkgbuild_path.exists():
+                print(f"[DRY RUN] ERROR: PKGBUILD not found at {pkgbuild_path}")
+                return False
+            
+            print(f"[DRY RUN] Would build package from {pkg_dir}")
+            print(f"[DRY RUN] Would upload to {pkg_data.get('repo', 'extra')}-testing repository")
+            return True
+        
+        print(f"\n{'='*SEPARATOR_WIDTH}")
+        print(f"Building {pkg_name}")
+        print(f"{'='*SEPARATOR_WIDTH}")
+        
+        # Validate inputs
+        if not self._validate_build_inputs(pkg_name, pkg_data):
+            return False
+        
+        pkg_dir = safe_path_join(Path("pkgbuilds"), pkg_name)
+        
+        # Setup temp chroot
+        try:
+            temp_copy_path = self._setup_temp_chroot(pkg_name)
+        except RuntimeError as e:
+            print(f"ERROR: {e}")
+            return False
+        
+        try:
+            # Prepare build environment
+            self._prepare_build_environment(temp_copy_path, pkg_name, pkg_dir)
+            
+            # Execute build
+            return self._execute_build(pkg_name, pkg_data, temp_copy_path, pkg_dir)
+            
+        except Exception as e:
+            error_msg = BuildError.format_setup_failure(pkg_name, str(e))
+            print(error_msg)
+            return False
+        finally:
+            self._cleanup_temp_chroot(temp_copy_path)
+            
+            # Clean up lock files
+            for lock_file in self.chroot_path.glob("*.lock"):
+                try:
+                    lock_file.unlink()
+                except Exception as e:
+                    print(f"Warning: Failed to remove lock file {lock_file}: {e}")
+
+
+class BuildError:
+    """Centralized error message formatting"""
+    
+    @staticmethod
+    def format_build_failure(pkg_name: str, log_file: Path, context: str = "") -> str:
+        return f"""
+BUILD FAILED: {pkg_name}
+{f'Context: {context}' if context else ''}
+Log file: {log_file}
+Troubleshooting:
+  - Check build log for detailed error messages
+  - Run with --preserve-chroot to debug in chroot environment
+  - Verify all dependencies are available
+  - Check for architecture-specific build issues
+"""
+
+    @staticmethod
+    def format_setup_failure(pkg_name: str, error: str) -> str:
+        return f"""
+SETUP FAILED: {pkg_name}
+Error: {error}
+Troubleshooting:
+  - Ensure chroot environment is properly initialized
+  - Check disk space and permissions
+  - Verify network connectivity for dependency downloads
+"""
+        """Clean up temporary chroot"""
+        if temp_copy_path in self.temp_copies:
+            should_cleanup = True
+            if self.stop_on_failure or self.preserve_chroot:
+                should_cleanup = False
+                print(f"Preserving temporary chroot: {temp_copy_path}")
+            
+            if should_cleanup:
+                try:
+                    subprocess.run([
+                        "sudo", "rm", "--recursive", "--force", "--one-file-system", str(temp_copy_path)
+                    ], check=True)
+                    self.temp_copies.remove(temp_copy_path)
+                except subprocess.CalledProcessError as e:
+                    print(f"Warning: Failed to cleanup chroot {temp_copy_path}: {e}")
+                except Exception as e:
+                    print(f"Error during cleanup: {e}")
+                finally:
+                    try:
+                        self.temp_copies.remove(temp_copy_path)
+                    except ValueError:
+                        pass
+                    try:
+                        lock_file.unlink()
+                    except Exception as e:
+                        print(f"Warning: Failed to remove lock file {lock_file}: {e}")
+
 
 def main():
     parser = argparse.ArgumentParser(description='Build Arch Linux packages for AArch64')

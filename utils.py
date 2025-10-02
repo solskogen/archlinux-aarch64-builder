@@ -22,6 +22,7 @@ import re
 import configparser
 import threading
 import tarfile
+import concurrent.futures
 from pathlib import Path
 from packaging import version
 
@@ -32,7 +33,7 @@ config.read('config.ini')
 # Configuration constants
 BUILD_ROOT = config.get('build', 'build_root', fallback='/scratch/builder')
 CACHE_PATH = f"{BUILD_ROOT}/pacman-cache"
-UPLOAD_BUCKET = config.get('build', 'upload_bucket', fallback='arch-linux-repos.drzee.net')
+UPLOAD_BUCKET = config.get('build', 'upload_bucket')
 X86_64_MIRROR = config.get('build', 'x86_64_mirror', fallback='https://geo.mirror.pkgbuild.com')
 LOG_RETENTION_COUNT = 3
 
@@ -112,90 +113,95 @@ def safe_path_join(base: Path, user_input: str) -> Path:
         raise ValueError("Path traversal detected")
     return path
 
+class ArchVersionComparator:
+    """Centralized version comparison for Arch Linux packages"""
+    
+    @staticmethod
+    def compare(version1: str, version2: str) -> int:
+        """
+        Compare two Arch Linux version strings.
+        Returns: -1 if version1 < version2, 0 if equal, 1 if version1 > version2
+        """
+        epoch1, ver1 = ArchVersionComparator._split_epoch_version(version1)
+        epoch2, ver2 = ArchVersionComparator._split_epoch_version(version2)
+        
+        # Compare epochs first
+        if epoch1 != epoch2:
+            return -1 if epoch1 < epoch2 else 1
+        
+        # Handle git revision versions
+        if ArchVersionComparator._has_git_revision(ver1) or ArchVersionComparator._has_git_revision(ver2):
+            return ArchVersionComparator._compare_git_versions(ver1, ver2)
+        
+        # Use packaging.version for standard versions
+        try:
+            v1 = version.parse(ver1)
+            v2 = version.parse(ver2)
+            if v1 < v2:
+                return -1
+            elif v1 > v2:
+                return 1
+            return 0
+        except Exception:
+            # Fallback to string comparison
+            return -1 if ver1 < ver2 else (1 if ver1 > ver2 else 0)
+    
+    @staticmethod
+    def is_newer(current_version: str, target_version: str) -> bool:
+        """Return True if target_version is newer than current_version"""
+        return ArchVersionComparator.compare(current_version, target_version) < 0
+    
+    @staticmethod
+    def _split_epoch_version(version_str: str) -> tuple:
+        """Split version string into epoch and version parts"""
+        if ':' in version_str:
+            epoch_str, ver_str = version_str.split(':', 1)
+            return int(epoch_str), ver_str
+        return 0, version_str
+    
+    @staticmethod
+    def _has_git_revision(version_str: str) -> bool:
+        """Check if version contains git revision marker"""
+        return '+r' in version_str
+    
+    @staticmethod
+    def _compare_git_versions(ver1: str, ver2: str) -> int:
+        """Compare versions that may contain git revisions"""
+        # Extract base versions
+        base1 = re.split(r'\+r\d+', ver1)[0]
+        base2 = re.split(r'\+r\d+', ver2)[0]
+        
+        try:
+            base_v1 = version.parse(base1)
+            base_v2 = version.parse(base2)
+            
+            if base_v1 != base_v2:
+                return -1 if base_v1 < base_v2 else 1
+            
+            # Same base version, compare revision numbers
+            r1_match = re.search(r'\+r(\d+)', ver1)
+            r2_match = re.search(r'\+r(\d+)', ver2)
+            
+            if r1_match and r2_match:
+                r1 = int(r1_match.group(1))
+                r2 = int(r2_match.group(1))
+                return -1 if r1 < r2 else (1 if r1 > r2 else 0)
+            elif r1_match and not r2_match:
+                return 1  # Git revision is newer than release
+            elif not r1_match and r2_match:
+                return -1  # Release is older than git revision
+            
+            return 0
+        except Exception:
+            return -1 if ver1 < ver2 else (1 if ver1 > ver2 else 0)
+
 def is_version_newer(current_version: str, target_version: str) -> bool:
     """Return True if target_version is newer than current_version"""
-    return compare_arch_versions(current_version, target_version) < 0
+    return ArchVersionComparator.is_newer(current_version, target_version)
 
 def compare_arch_versions(version1: str, version2: str) -> int:
-    """
-    Compare two Arch Linux version strings using proper semantics.
-    
-    Handles Arch Linux specific version formats including:
-    - Epoch versions (1:2.0-1)
-    - Git revision versions (1.0+r123.abc123-1)  
-    - Standard semantic versions (1.2.3-1)
-    
-    Args:
-        version1: First version string
-        version2: Second version string
-        
-    Returns:
-        int: -1 if version1 < version2, 0 if equal, 1 if version1 > version2
-    """
-    epoch1, ver1 = split_epoch_version(version1)
-    epoch2, ver2 = split_epoch_version(version2)
-    
-    # Compare epochs first
-    if epoch1 != epoch2:
-        return epoch1 - epoch2
-    
-    # Handle git revision versions
-    if has_git_revision(ver1) or has_git_revision(ver2):
-        return compare_git_versions(ver1, ver2)
-    
-    # Use packaging.version for standard versions
-    try:
-        v1 = version.parse(ver1)
-        v2 = version.parse(ver2)
-        if v1 < v2:
-            return -1
-        elif v1 > v2:
-            return 1
-        return 0
-    except Exception:
-        # Fallback to string comparison
-        return -1 if ver1 < ver2 else (1 if ver1 > ver2 else 0)
-
-def split_epoch_version(version_str: str) -> tuple:
-    """Split version string into epoch and version parts"""
-    if ':' in version_str:
-        epoch_str, ver_str = version_str.split(':', 1)
-        return int(epoch_str), ver_str
-    return 0, version_str
-
-def has_git_revision(version_str: str) -> bool:
-    """Check if version contains git revision marker"""
-    return '+r' in version_str
-
-def compare_git_versions(ver1: str, ver2: str) -> int:
-    """Compare versions that may contain git revisions"""
-    # Extract base versions
-    base1 = re.split(r'\+r\d+', ver1)[0]
-    base2 = re.split(r'\+r\d+', ver2)[0]
-    
-    try:
-        base_v1 = version.parse(base1)
-        base_v2 = version.parse(base2)
-        
-        if base_v1 != base_v2:
-            return -1 if base_v1 < base_v2 else 1
-        
-        # Same base version, compare revision numbers
-        r1_match = re.search(r'\+r(\d+)', ver1)
-        r2_match = re.search(r'\+r(\d+)', ver2)
-        
-        if r1_match and r2_match:
-            r1 = int(r1_match.group(1))
-            r2 = int(r2_match.group(1))
-            return -1 if r1 < r2 else (1 if r1 > r2 else 0)
-        elif r1_match and not r2_match:
-            return 1  # Git revision is newer than release
-        elif not r1_match and r2_match:
-            return -1  # Release is older than git revision
-        
-        return 0
-    except Exception:
-        return -1 if ver1 < ver2 else (1 if ver1 > ver2 else 0)
+    """Compare two Arch Linux version strings using proper semantics"""
+    return ArchVersionComparator.compare(version1, version2)
 
 def parse_pkgbuild_deps(pkgbuild_path):
     """
@@ -213,8 +219,9 @@ def parse_pkgbuild_deps(pkgbuild_path):
         pkg_dir = pkgbuild_path.parent
         
         # Create a temporary script to source PKGBUILD and extract dependencies
+        import shlex
         temp_script = f"""#!/bin/bash
-cd "{pkg_dir}"
+cd {shlex.quote(str(pkg_dir))}
 source PKGBUILD 2>/dev/null || exit 1
 echo "DEPENDS_START"
 printf '%s\\n' "${{depends[@]}}"
@@ -333,20 +340,11 @@ def parse_database_file(db_filename, include_any=False):
 
 def load_database_packages(urls, arch_suffix, download=True):
     """
-    Download and parse database files for given URLs.
-    
-    Downloads pacman database files and extracts package information.
-    Filters out ARCH=any packages since they don't need rebuilding.
-    
-    Args:
-        urls: List of database URLs to download
-        arch_suffix: Suffix for local filename (e.g., '_x86_64', '_aarch64')
-        download: Whether to download files (False = use existing files)
-    
-    Returns:
-        dict: Package name -> package data mapping
+    Download and parse database files for given URLs in parallel.
     """
-    def download_and_parse(url, packages_dict, lock):
+    import concurrent.futures
+    
+    def download_and_parse(url):
         """Download and immediately parse a database file"""
         try:
             db_filename = url.split('/')[-1].replace('.db', f'{arch_suffix}.db')
@@ -364,29 +362,27 @@ def load_database_packages(urls, arch_suffix, download=True):
             print(f"Parsing {db_filename}...")
             repo_packages = parse_database_file(db_filename)
             
-            with lock:
-                for name, pkg in repo_packages.items():
-                    pkg['repo'] = repo_name
-                    packages_dict[name] = pkg
+            for name, pkg in repo_packages.items():
+                pkg['repo'] = repo_name
+            
+            return repo_packages
                     
         except subprocess.CalledProcessError as e:
             print(f"Warning: Failed to download {url}: {e}")
+            return {}
         except Exception as e:
             print(f"Warning: Failed to parse database: {e}")
+            return {}
     
     packages = {}
-    lock = threading.Lock()
-    threads = []
     
-    # Start download+parse threads
-    for url in urls:
-        thread = threading.Thread(target=download_and_parse, args=(url, packages, lock))
-        thread.start()
-        threads.append(thread)
-    
-    # Wait for all to complete
-    for thread in threads:
-        thread.join()
+    # Use ThreadPoolExecutor for parallel downloads
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(4, len(urls))) as executor:
+        future_to_url = {executor.submit(download_and_parse, url): url for url in urls}
+        
+        for future in concurrent.futures.as_completed(future_to_url):
+            repo_packages = future.result()
+            packages.update(repo_packages)
     
     return packages
 
@@ -419,10 +415,18 @@ def load_target_arch_packages(download=True, urls=None):
     
     if urls is None:
         # Get URLs from config
-        urls = [
-            config.get('build', 'target_core_url', fallback=f"https://arch-linux-repo.drzee.net/arch/core/os/{target_arch}/core.db"),
-            config.get('build', 'target_extra_url', fallback=f"https://arch-linux-repo.drzee.net/arch/extra/os/{target_arch}/extra.db")
-        ]
+        try:
+            base_url = config.get('build', 'target_base_url')
+            urls = [
+                f"{base_url}/core/os/{target_arch}/core.db",
+                f"{base_url}/extra/os/{target_arch}/extra.db"
+            ]
+        except configparser.NoOptionError as e:
+            print(f"ERROR: Missing configuration in config.ini: {e}")
+            print("Please add the following to your config.ini:")
+            print("[build]")
+            print("target_base_url = https://your-repo.com/arch")
+            sys.exit(1)
     
     if not download:
         print(f"Using existing {target_arch} databases...")
@@ -666,10 +670,19 @@ def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None,
         f"{X86_64_MIRROR}/core/os/x86_64/core.db",
         f"{X86_64_MIRROR}/extra/os/x86_64/extra.db"
     ]
-    target_urls = [
-        config.get('build', 'target_core_url', fallback=f"https://arch-linux-repo.drzee.net/arch/core/os/{target_arch}/core.db"),
-        config.get('build', 'target_extra_url', fallback=f"https://arch-linux-repo.drzee.net/arch/extra/os/{target_arch}/extra.db")
-    ]
+    target_urls = []
+    try:
+        base_url = config.get('build', 'target_base_url')
+        target_urls = [
+            f"{base_url}/core/os/{target_arch}/core.db",
+            f"{base_url}/extra/os/{target_arch}/extra.db"
+        ]
+    except configparser.NoOptionError as e:
+        print(f"ERROR: Missing configuration in config.ini: {e}")
+        print("Please add the following to your config.ini:")
+        print("[build]")
+        print("target_base_url = https://your-repo.com/arch")
+        sys.exit(1)
     
     # Filter URLs if specific repos requested
     if x86_repos:

@@ -28,6 +28,7 @@ import argparse
 import fnmatch
 import sys
 import datetime
+import configparser
 import subprocess
 import re
 import shutil
@@ -257,20 +258,14 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
                 else:
                     print(f"[{i}/{total}] Processing {name} (fetching {target_version})...")
                     # Use git directly for more reliable tag switching
-                    # Convert ++ to plusplus for GitLab URLs
-                    gitlab_basename = basename.replace('++', 'plusplus')
-                    if pkg.get('force_latest', False):
-                        # Clone and stay on main branch
-                        result = subprocess.run(["git", "clone", f"https://gitlab.archlinux.org/archlinux/packaging/packages/{gitlab_basename}.git", basename], 
-                                             cwd=PKGBUILDS_DIR, check=True, 
-                                             capture_output=True, text=True)
-                    else:
-                        # Clone and checkout specific version tag
+                    # Clone repository (convert ++ to plusplus for GitLab URLs)
+                    result = subprocess.run(["git", "clone", f"https://gitlab.archlinux.org/archlinux/packaging/packages/{basename.replace('++', 'plusplus')}.git", basename], 
+                                         cwd=PKGBUILDS_DIR, check=True, 
+                                         capture_output=True, text=True)
+                    
+                    if not pkg.get('force_latest', False):
+                        # Checkout specific version tag
                         version_tag = pkg['version']
-                        result = subprocess.run(["git", "clone", f"https://gitlab.archlinux.org/archlinux/packaging/packages/{gitlab_basename}.git", basename], 
-                                             cwd="pkgbuilds", check=True, 
-                                             capture_output=True, text=True)
-                        # Checkout the specific tag - try different tag formats
                         git_version_tag = version_tag.replace(':', '-')
                         tag_formats = [git_version_tag, version_tag, f"v{git_version_tag}", f"{basename}-{git_version_tag}"]
                         checkout_success = False
@@ -355,27 +350,26 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
     print("Loading provides mapping from upstream databases...")
     provides_map = get_provides_mapping()
     
-    # Clean up dependencies - only keep deps that are in the build list
+    # Filter dependencies to only include packages that are in the build list
+    # This ensures we only consider build order between packages being built
     build_list_names = {pkg['name'] for pkg in all_packages}
     build_list_basenames = {pkg.get('basename', pkg['name']) for pkg in all_packages}
     
     for pkg in all_packages:
         for dep_type in ['depends', 'makedepends', 'checkdepends']:
             if dep_type in pkg:
-                cleaned_deps = []
+                # Only keep dependencies that are also being built
+                filtered_deps = []
                 
                 for dep in pkg[dep_type]:
                     dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
-                    # Keep dependency if it's in the build list (by name or basename)
-                    if dep_name in build_list_names or dep_name in build_list_basenames:
-                        cleaned_deps.append(dep)
-                    # Also check if .so dependency resolves to a package in build list
-                    elif dep_name in provides_map:
-                        providing_basename = provides_map[dep_name]
-                        if providing_basename in build_list_basenames:
-                            cleaned_deps.append(dep)
+                    # Keep dependency only if it's also in the build list
+                    if (dep_name in build_list_names or 
+                        dep_name in build_list_basenames or
+                        (dep_name in provides_map and provides_map[dep_name] in build_list_basenames)):
+                        filtered_deps.append(dep)
                 
-                pkg[dep_type] = cleaned_deps
+                pkg[dep_type] = filtered_deps
     
     return all_packages
 
@@ -557,11 +551,15 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
             
             newer_in_x86.append({
                 'name': basename,
-                'x86_version': x86_data['version'],
-                'target_version': target_version,
+                'version': x86_data['version'],
+                'current_version': target_version,
+                'basename': pkg_data['basename'],
+                'repo': pkg_data['repo'],
+                'depends': pkg_data['depends'],
+                'makedepends': pkg_data['makedepends'],
+                'provides': pkg_data['provides'],
                 'force_latest': should_use_latest,
                 'use_aur': bool(basename in aur_packages),
-                **pkg_data
             })
     
     # Find and add missing dependencies only for missing packages (not for updates)
@@ -703,18 +701,11 @@ def detect_dependency_cycles(packages):
 
 def sort_by_build_order(packages):
     """
-    Sort packages by dependency order using topological sort.
-    
-    Detects dependency cycles and marks packages for double-build when
-    all packages in a cycle need upgrading.
-    
-    Args:
-        packages: List of package dictionaries with dependency information
-        
-    Returns:
-        list: Packages sorted by build order with build_stage and cycle info assigned
+    Sort packages by dependency order using optimized topological sort.
     """
-    # Detect dependency cycles
+    from collections import defaultdict, deque
+    
+    # Detect dependency cycles first
     cycles = detect_dependency_cycles(packages)
     
     # Group packages by cycle
@@ -735,7 +726,7 @@ def sort_by_build_order(packages):
     pkg_map = {pkg['name']: pkg for pkg in packages}
     provides_map = {}
     
-    # Build provides mapping - don't overwrite existing entries
+    # Build provides mapping
     for pkg in packages:
         if pkg['name'] not in provides_map:
             provides_map[pkg['name']] = pkg
@@ -744,61 +735,69 @@ def sort_by_build_order(packages):
             if provide_name not in provides_map:
                 provides_map[provide_name] = pkg
     
-    # Build dependency graph
-    deps = {}
+    # Build dependency graph using optimized approach
+    graph = defaultdict(list)
+    in_degree = defaultdict(int)
+    
+    # Initialize in_degree for all packages
     for pkg in packages:
-        deps[pkg['name']] = set()
+        in_degree[pkg['name']] = 0
+    
+    # Build graph in O(V + E) time
+    for pkg in packages:
+        pkg_name = pkg['name']
         all_deps = pkg['depends'] + pkg['makedepends']
         if 'checkdepends' in pkg:
             all_deps += pkg['checkdepends']
         
         for dep_string in all_deps:
-            # Split space-separated dependencies
             for dep in dep_string.split():
                 dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
                 if dep_name in provides_map and provides_map[dep_name]['name'] in pkg_map:
-                    deps[pkg['name']].add(provides_map[dep_name]['name'])
+                    provider_name = provides_map[dep_name]['name']
+                    if provider_name != pkg_name:  # Avoid self-dependencies
+                        graph[provider_name].append(pkg_name)
+                        in_degree[pkg_name] += 1
     
-    # Calculate build stages
-    stages = {}
-    visiting = set()
+    # Kahn's algorithm for topological sort - O(V + E)
+    queue = deque([pkg_name for pkg_name in pkg_map.keys() if in_degree[pkg_name] == 0])
+    topo_order = []
+    stage_assignments = {}
+    current_stage = 0
     
-    def get_stage(pkg_name):
-        if pkg_name in stages:
-            return stages[pkg_name]
-        if pkg_name in visiting:
-            return 0  # Break cycle
+    # Process packages level by level (all independent packages get same stage)
+    while queue:
+        # All packages in current queue have no remaining dependencies
+        current_level = list(queue)
+        queue.clear()
         
-        visiting.add(pkg_name)
-        max_dep_stage = -1
-        for dep in deps.get(pkg_name, []):
-            if dep in pkg_map:
-                max_dep_stage = max(max_dep_stage, get_stage(dep))
+        # Assign current stage to all packages in this level
+        for pkg_name in current_level:
+            topo_order.append(pkg_name)
+            stage_assignments[pkg_name] = current_stage
+            
+            # Remove this package from dependency graph
+            for neighbor in graph[pkg_name]:
+                in_degree[neighbor] -= 1
+                if in_degree[neighbor] == 0:
+                    queue.append(neighbor)
         
-        visiting.remove(pkg_name)
-        stages[pkg_name] = max_dep_stage + 1
-        return stages[pkg_name]
+        current_stage += 1
     
-    # Assign stages to all packages
-    for pkg in packages:
-        get_stage(pkg['name'])
-    
-    # Create final package list with cycle information
+    # Create result with build stages
     result_packages = []
-    next_stage = 0
     
-    # Add non-cycle packages first, tracking stages
-    stage_map = {}
+    # Add non-cycle packages first
     for pkg in packages:
         if pkg['name'] not in cycles:
             pkg_copy = pkg.copy()
-            pkg_copy['build_stage'] = stages[pkg['name']]
+            pkg_copy['build_stage'] = stage_assignments.get(pkg['name'], 0)
             pkg_copy['cycle_group'] = None
             pkg_copy['cycle_stage'] = None
             result_packages.append(pkg_copy)
-            next_stage = max(next_stage, stages[pkg['name']] + 1)
     
     # Add packages in cycles twice (consecutive stages)
+    next_stage = current_stage
     for cycle_id, cycle_pkgs in cycle_groups.items():
         # Stage 1: Build all packages in cycle
         for pkg_name in cycle_pkgs:
@@ -818,7 +817,7 @@ def sort_by_build_order(packages):
             pkg_copy['cycle_stage'] = 2
             result_packages.append(pkg_copy)
         
-        next_stage += 2  # Move to next available stage after this cycle
+        next_stage += 2
     
     return sorted(result_packages, key=lambda x: (x['build_stage'], x.get('cycle_stage', 0)))
 
@@ -1027,10 +1026,18 @@ if __name__ == "__main__":
         full_x86_packages = {}
         # For AUR mode, we still need target packages for comparison
         target_arch = get_target_architecture()
-        target_urls = [
-            config.get('build', 'target_core_url', fallback=f"https://arch-linux-repo.drzee.net/arch/core/os/{target_arch}/core.db"),
-            config.get('build', 'target_extra_url', fallback=f"https://arch-linux-repo.drzee.net/arch/extra/os/{target_arch}/extra.db")
-        ]
+        try:
+            base_url = config.get('build', 'target_base_url')
+            target_urls = [
+                f"{base_url}/core/os/{target_arch}/core.db",
+                f"{base_url}/extra/os/{target_arch}/extra.db"
+            ]
+        except configparser.NoOptionError as e:
+            print(f"ERROR: Missing configuration in config.ini: {e}")
+            print("Please add the following to your config.ini:")
+            print("[build]")
+            print("target_base_url = https://your-repo.com/arch")
+            sys.exit(1)
         target_packages = load_packages_with_any(target_urls, f'_{target_arch}', download=not args.no_update)
         print(f"Loaded {len(target_packages)} {target_arch} packages")
         
@@ -1153,7 +1160,7 @@ if __name__ == "__main__":
         for pkg_name in args.packages:
             if pkg_name in newer_packages:
                 pkg = newer_packages[pkg_name]
-                if pkg.get('x86_version') == pkg.get('target_version'):
+                if pkg.get('version') == pkg.get('current_version'):
                     rebuild_packages.append(pkg_name)
                 else:
                     update_packages.append(pkg_name)
@@ -1165,6 +1172,14 @@ if __name__ == "__main__":
             print(f"Found {len(newer_packages)} packages")
     else:
         print(f"Found {len(newer_packages)} packages where x86_64 is newer")
+    
+    # Show version upgrades
+    if newer_packages:
+        print("\nVersion upgrades:")
+        for pkg in newer_packages:
+            current = pkg.get('current_version', 'unknown')
+            new = pkg['version']
+            print(f"  {pkg['name']}: {current} → {new}")
     
     if args.preserve_order and args.packages:
         print("Preserving command line order...")

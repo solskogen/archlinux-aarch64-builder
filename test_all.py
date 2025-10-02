@@ -41,8 +41,8 @@ except ImportError:
             return RaisesContext(exception_type, match)
 
 from utils import (
-    validate_package_name, safe_path_join, is_version_newer, 
-    compare_arch_versions, PACKAGE_SKIP_FLAG, BUILD_ROOT, CACHE_PATH
+    validate_package_name, safe_path_join, ArchVersionComparator, 
+    PACKAGE_SKIP_FLAG, BUILD_ROOT, CACHE_PATH
 )
 
 
@@ -93,31 +93,31 @@ class TestVersionComparison:
     
     def test_basic_version_comparison(self):
         """Test basic version comparisons"""
-        assert is_version_newer("1.0.0-1", "1.0.1-1")
-        assert is_version_newer("1.0-1", "1.1-1")
-        assert not is_version_newer("1.1-1", "1.0-1")
-        assert not is_version_newer("1.0-1", "1.0-1")
+        assert ArchVersionComparator.is_newer("1.0.0-1", "1.0.1-1")
+        assert ArchVersionComparator.is_newer("1.0-1", "1.1-1")
+        assert not ArchVersionComparator.is_newer("1.1-1", "1.0-1")
+        assert not ArchVersionComparator.is_newer("1.0-1", "1.0-1")
     
     def test_epoch_versions(self):
         """Test epoch version handling"""
-        assert is_version_newer("1.0-1", "1:1.0-1")
-        assert is_version_newer("1:1.0-1", "2:0.9-1")
-        assert not is_version_newer("2:1.0-1", "1:1.1-1")
+        assert ArchVersionComparator.is_newer("1.0-1", "1:1.0-1")
+        assert ArchVersionComparator.is_newer("1:1.0-1", "2:0.9-1")
+        assert not ArchVersionComparator.is_newer("2:1.0-1", "1:1.1-1")
     
     def test_git_revision_versions(self):
         """Test git revision version handling"""
-        assert is_version_newer("1.0+r1-1", "1.0+r2-1")
-        assert not is_version_newer("1.0+r2-1", "1.0+r1-1")
+        assert ArchVersionComparator.is_newer("1.0+r1-1", "1.0+r2-1")
+        assert not ArchVersionComparator.is_newer("1.0+r2-1", "1.0+r1-1")
     
     def test_compare_arch_versions_return_values(self):
         """Test compare_arch_versions return values"""
-        assert compare_arch_versions("1.0-1", "1.1-1") == -1
-        assert compare_arch_versions("1.1-1", "1.0-1") == 1
-        assert compare_arch_versions("1.0-1", "1.0-1") == 0
+        assert ArchVersionComparator.compare("1.0-1", "1.1-1") == -1
+        assert ArchVersionComparator.compare("1.1-1", "1.0-1") == 1
+        assert ArchVersionComparator.compare("1.0-1", "1.0-1") == 0
     
     def test_malformed_versions(self):
         """Test handling of malformed version strings"""
-        result = is_version_newer("malformed", "1.0-1")
+        result = ArchVersionComparator.is_newer("malformed", "1.0-1")
         assert isinstance(result, bool)
 
 
@@ -244,37 +244,31 @@ class TestVersionHandling:
     
     def test_epoch_version_splitting(self):
         """Test splitting epoch from version"""
-        from utils import split_epoch_version
-        
-        epoch, version = split_epoch_version("2:1.2.3-1")
+        epoch, version = ArchVersionComparator._split_epoch_version("2:1.2.3-1")
         assert epoch == 2
         assert version == "1.2.3-1"
         
-        epoch, version = split_epoch_version("1.2.3-1")
+        epoch, version = ArchVersionComparator._split_epoch_version("1.2.3-1")
         assert epoch == 0
         assert version == "1.2.3-1"
         print("✓ Epoch version splitting test passed")
     
     def test_git_revision_detection(self):
         """Test detection of git revision versions"""
-        from utils import has_git_revision
-        
-        assert has_git_revision("1.2.3+r123.abc1234-1") == True
-        assert has_git_revision("1.2.3-1") == False
-        assert has_git_revision("20240101+r456.def5678-1") == True
+        assert ArchVersionComparator._has_git_revision("1.2.3+r123.abc1234-1") == True
+        assert ArchVersionComparator._has_git_revision("1.2.3-1") == False
+        assert ArchVersionComparator._has_git_revision("20240101+r456.def5678-1") == True
         print("✓ Git revision detection test passed")
     
     def test_git_version_comparison(self):
         """Test comparison of git revision versions"""
-        from utils import compare_git_versions
-        
-        result = compare_git_versions("1.0+r100.abc123-1", "1.0+r50.def456-1")
+        result = ArchVersionComparator._compare_git_versions("1.0+r100.abc123-1", "1.0+r50.def456-1")
         assert result > 0
         
-        result = compare_git_versions("1.0+r100.abc123-1", "1.0+r100.abc123-1")
+        result = ArchVersionComparator._compare_git_versions("1.0+r100.abc123-1", "1.0+r100.abc123-1")
         assert result == 0
         
-        result = compare_git_versions("1.1-1", "1.0-1")
+        result = ArchVersionComparator._compare_git_versions("1.1-1", "1.0-1")
         assert result > 0
         print("✓ Git version comparison test passed")
 
