@@ -36,8 +36,39 @@ UPLOAD_BUCKET = config.get('build', 'upload_bucket', fallback='arch-linux-repos.
 X86_64_MIRROR = config.get('build', 'x86_64_mirror', fallback='https://geo.mirror.pkgbuild.com')
 LOG_RETENTION_COUNT = 3
 
+# Directory constants
+PKGBUILDS_DIR = "pkgbuilds"
+LOGS_DIR = "logs"
+
+# Build constants
+TEMP_CHROOT_ID_MIN = 1000000  # 7-digit random ID range for temp chroots
+TEMP_CHROOT_ID_MAX = 9999999
+SEPARATOR_WIDTH = 60          # Width of === separator lines
+GIT_COMMAND_TIMEOUT = 10      # Seconds to wait for git commands
+
 # Constants
 PACKAGE_SKIP_FLAG = 1
+
+def get_target_architecture():
+    """Read target architecture from chroot-config/makepkg.conf"""
+    makepkg_conf = Path("chroot-config/makepkg.conf")
+    if not makepkg_conf.exists():
+        print("ERROR: chroot-config/makepkg.conf not found")
+        sys.exit(1)
+    
+    try:
+        with open(makepkg_conf, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('CARCH='):
+                    # Extract value from CARCH="value"
+                    return line.split('=')[1].strip('"\'')
+        
+        print("ERROR: CARCH not found in chroot-config/makepkg.conf")
+        sys.exit(1)
+    except Exception as e:
+        print(f"ERROR: Failed to read chroot-config/makepkg.conf: {e}")
+        sys.exit(1)
 
 def validate_package_name(pkg_name: str) -> bool:
     """
@@ -360,20 +391,28 @@ def load_x86_64_packages(download=True, repos=None):
     
     return load_database_packages(urls, '_x86_64', download)
 
-def load_aarch64_packages(download=True, urls=None):
-    """Load AArch64 packages from configured repositories"""
+def load_target_arch_packages(download=True, urls=None):
+    """Load target architecture packages from configured repositories"""
+    target_arch = get_target_architecture()
+    
     if urls is None:
+        # Get URLs from config
         urls = [
-            "https://arch-linux-repo.drzee.net/arch/core/os/aarch64/core.db",
-            "https://arch-linux-repo.drzee.net/arch/extra/os/aarch64/extra.db"
+            config.get('build', 'target_core_url', fallback=f"https://arch-linux-repo.drzee.net/arch/core/os/{target_arch}/core.db"),
+            config.get('build', 'target_extra_url', fallback=f"https://arch-linux-repo.drzee.net/arch/extra/os/{target_arch}/extra.db")
         ]
     
     if not download:
-        print("Using existing AArch64 databases...")
+        print(f"Using existing {target_arch} databases...")
     else:
-        print("Downloading AArch64 databases...")
+        print(f"Downloading {target_arch} databases...")
     
-    return load_database_packages(urls, '_aarch64', download)
+    return load_database_packages(urls, f'_{target_arch}', download)
+
+# Compatibility alias for existing code
+def load_aarch64_packages(download=True, urls=None):
+    """Compatibility alias - use load_target_arch_packages instead"""
+    return load_target_arch_packages(download, urls)
 
 def load_blacklist(blacklist_file):
     """
@@ -427,7 +466,7 @@ class BuildUtils:
     
     def __init__(self, dry_run=False):
         self.dry_run = dry_run
-        self.logs_dir = Path("logs")
+        self.logs_dir = Path(LOGS_DIR)
     
     def run_command(self, cmd, cwd=None, capture_output=False):
         """
@@ -529,7 +568,130 @@ class BuildUtils:
         else:
             print("Using existing chroot...")
     
-    def upload_packages(self, pkg_dir, target_repo):
+def should_skip_package(pkg_name, blacklist):
+    """Determine if package should be skipped based on blacklist"""
+    import fnmatch
+    return any(fnmatch.fnmatch(pkg_name, pattern) for pattern in blacklist)
+
+def compare_bin_package_versions(provided_version, x86_version):
+    """
+    Compare versions for -bin packages, ignoring pkgrel differences.
+    
+    For -bin packages, we only care about the upstream version part,
+    not the Arch packaging revision (pkgrel). This prevents unnecessary
+    rebuilds when only packaging changes.
+    
+    Returns: True if provided_version is older than x86_version
+    """
+    # Extract version without pkgrel (everything before the last '-')
+    def extract_version_only(version_str):
+        if '-' in version_str:
+            return version_str.rsplit('-', 1)[0]
+        return version_str
+    
+    try:
+        provided_base = extract_version_only(provided_version)
+        x86_base = extract_version_only(x86_version)
+        return is_version_newer(provided_base, x86_base)
+    except Exception:
+        # If version parsing fails, assume we need to rebuild
+        return True
+
+def extract_packages(db_file, repo_name):
+    """Extract packages from database file with repository information"""
+    packages = parse_database_file(db_file)
+    for pkg in packages.values():
+        pkg['repo'] = repo_name
+        if pkg['name'] in packages:
+            print(f"ERROR: Package '{pkg['name']}' found in multiple repositories!")
+            print(f"  First: {packages[pkg['name']]['repo']} (version {packages[pkg['name']]['version']})")
+            print(f"  Second: {repo_name} (version {pkg['version']})")
+            exit(1)
+    return packages
+
+def find_missing_dependencies(packages, x86_packages, target_packages):
+    """Find dependencies that exist in x86_64 but missing from target architecture"""
+    missing_deps = set()
+    
+    # Build provides mapping for target architecture packages
+    target_provides = {}
+    for name, pkg in target_packages.items():
+        target_provides[name] = pkg
+        for provide in pkg['provides']:
+            provide_name = provide.split('=')[0]
+            target_provides[provide_name] = pkg
+    
+    for pkg in packages:
+        all_deps = pkg['depends'] + pkg['makedepends']
+        if 'checkdepends' in pkg:
+            all_deps += pkg['checkdepends']
+            
+        for dep in all_deps:
+            dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
+            if dep_name in x86_packages and dep_name not in target_packages and dep_name not in target_provides:
+                missing_deps.add(dep_name)
+    
+    return missing_deps
+
+def load_packages_with_any(urls, arch_suffix, download=True):
+    """Load packages including ARCH=any packages"""
+    import subprocess
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    packages = {}
+    
+    def download_and_parse(url):
+        """Download and immediately parse a database file"""
+        try:
+            db_filename = url.split('/')[-1].replace('.db', f'{arch_suffix}.db')
+            
+            if download:
+                print(f"Downloading {db_filename}...")
+                subprocess.run(["wget", "-q", "-O", db_filename, url], check=True)
+            else:
+                print(f"Using existing {db_filename}...")
+            
+            repo_name = url.split('/')[-4]
+            print(f"Parsing {db_filename}...")
+            repo_packages = parse_database_file(db_filename, include_any=True)
+            
+            # Add repo info to each package
+            for name, pkg in repo_packages.items():
+                pkg['repo'] = repo_name
+            
+            return repo_packages
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: Failed to download {url}: {e}")
+            return {}
+        except Exception as e:
+            print(f"Warning: Failed to parse {db_filename}: {e}")
+            return {}
+    
+    # Process all URLs in parallel
+    with ThreadPoolExecutor(max_workers=len(urls)) as executor:
+        future_to_url = {executor.submit(download_and_parse, url): url for url in urls}
+        
+        for future in as_completed(future_to_url):
+            repo_packages = future.result()
+            packages.update(repo_packages)
+    
+    return packages
+
+def import_gpg_keys():
+    """Import GPG keys from keys/pgp/ directory"""
+    keys_dir = Path("keys/pgp")
+    if not keys_dir.exists():
+        return
+    
+    for key_file in keys_dir.glob("*.asc"):
+        try:
+            print(f"Importing GPG key: {key_file.name}")
+            subprocess.run(["gpg", "--import", str(key_file)], 
+                         check=True, capture_output=True)
+        except subprocess.CalledProcessError as e:
+            print(f"ERROR: Failed to import GPG key {key_file}: {e}")
+
+
+def upload_packages(pkg_dir, target_repo, dry_run=False):
         """
         Upload all built packages to repository.
         
@@ -551,13 +713,17 @@ class BuildUtils:
         
         for pkg in built_packages:
             try:
-                self.run_command([
+                cmd = [
                     "repo-upload", pkg,
                     "--arch", "aarch64",
                     "--repo", target_repo,
                     "--bucket", UPLOAD_BUCKET
-                ])
-                print(f"Uploaded {Path(pkg).name} to {target_repo}")
+                ]
+                if dry_run:
+                    print(f"Would run: {' '.join(cmd)}")
+                else:
+                    subprocess.run(cmd, check=True)
+                    print(f"Uploaded {Path(pkg).name} to {target_repo}")
             except subprocess.CalledProcessError as e:
                 print(f"ERROR: Failed to upload {Path(pkg).name}: {e}")
                 sys.exit(1)

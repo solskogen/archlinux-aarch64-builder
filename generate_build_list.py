@@ -34,37 +34,25 @@ import shutil
 from pathlib import Path
 from packaging import version
 from utils import (
-    load_blacklist, load_x86_64_packages, load_aarch64_packages,
+    load_blacklist, load_x86_64_packages, load_target_arch_packages,
     validate_package_name, safe_path_join, is_version_newer,
-    PACKAGE_SKIP_FLAG, parse_pkgbuild_deps, parse_database_file, X86_64_MIRROR
+    PACKAGE_SKIP_FLAG, parse_pkgbuild_deps, parse_database_file, X86_64_MIRROR,
+    PKGBUILDS_DIR, SEPARATOR_WIDTH, get_target_architecture,
+    should_skip_package, compare_bin_package_versions, extract_packages, find_missing_dependencies
 )
 
+# ============================================================
+# Helper Functions for Package Classification
+# ============================================================
 
-def compare_bin_package_versions(provided_version, x86_version):
-    """
-    Compare versions for -bin packages, ignoring pkgrel differences.
-    For -bin packages, we only care about the upstream version, not the Arch package revision.
-    
-    Returns:
-        1 if provided_version > x86_version (INFO: newer)
-        -1 if provided_version < x86_version (WARNING: outdated) 
-        0 if versions are equal (no message)
-    """
-    # Extract version without pkgrel (everything before the last '-')
-    def extract_version_only(version_str):
-        if '-' in version_str:
-            return version_str.rsplit('-', 1)[0]
-        return version_str
-    
-    provided_ver_only = extract_version_only(provided_version)
-    x86_ver_only = extract_version_only(x86_version)
-    
-    if is_version_newer(provided_ver_only, x86_ver_only):
-        return -1  # provided is older
-    elif is_version_newer(x86_ver_only, provided_ver_only):
-        return 1   # provided is newer
-    else:
-        return 0   # versions are equal
+def is_bootstrap_package(pkg_name):
+    """Check if package is bootstrap-only (excluded from normal builds)"""
+    bootstrap_only = {'linux-api-headers', 'glibc', 'binutils', 'gcc'}
+    return pkg_name in bootstrap_only
+
+# ============================================================
+# Package Version Comparison Logic  
+# ============================================================
 
 
 
@@ -193,7 +181,7 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
         print("Error: git not found. Please install git package.")
         sys.exit(1)
     
-    Path("pkgbuilds").mkdir(exist_ok=True)
+    Path(PKGBUILDS_DIR).mkdir(exist_ok=True)
     
     # Filter out blacklisted packages for PKGBUILD fetching
     packages_to_fetch = [pkg for pkg in packages_to_build if pkg.get('skip', 0) != 1]
@@ -203,8 +191,8 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
     for i, pkg in enumerate(packages_to_fetch, 1):
         name = pkg['name']
         basename = pkg.get('basename', name)  # Use basename for git operations
-        pkgbuild_dir = Path("pkgbuilds") / basename
-        pkgbuild_path = pkgbuild_dir / "PKGBUILD"
+        pkgbuild_directory = Path(PKGBUILDS_DIR) / basename
+        pkgbuild_path = pkgbuild_directory / "PKGBUILD"
         
         # Check if PKGBUILD exists and get current version
         current_version = None
@@ -237,7 +225,7 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
                 if pkg.get('use_aur', False):
                     print(f"[{i}/{total}] Processing {name} (fetching from AUR)...")
                     result = subprocess.run(["git", "clone", f"https://aur.archlinux.org/{basename}.git", basename], 
-                                         cwd="pkgbuilds", check=True, 
+                                         cwd=PKGBUILDS_DIR, check=True, 
                                          capture_output=True, text=True)
                 else:
                     print(f"[{i}/{total}] Processing {name} (fetching {target_version})...")
@@ -247,7 +235,7 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
                     if pkg.get('force_latest', False):
                         # Clone and stay on main branch
                         result = subprocess.run(["git", "clone", f"https://gitlab.archlinux.org/archlinux/packaging/packages/{gitlab_basename}.git", basename], 
-                                             cwd="pkgbuilds", check=True, 
+                                             cwd=PKGBUILDS_DIR, check=True, 
                                              capture_output=True, text=True)
                     else:
                         # Clone and checkout specific version tag
@@ -368,44 +356,12 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
 
 
 
-def extract_packages(db_file, repo_name):
-    packages = parse_database_file(db_file)
-    for pkg in packages.values():
-        pkg['repo'] = repo_name
-        if pkg['name'] in packages:
-            print(f"ERROR: Package '{pkg['name']}' found in multiple repositories!")
-            print(f"  First: {packages[pkg['name']]['repo']} (version {packages[pkg['name']]['version']})")
-            print(f"  Second: {repo_name} (version {pkg['version']})")
-            exit(1)
-    return packages
 
-def find_missing_dependencies(packages, x86_packages, arm_packages):
-    """Find dependencies that exist in x86_64 but missing from aarch64"""
-    missing_deps = set()
-    
-    # Build provides mapping for ARM packages
-    arm_provides = {}
-    for name, pkg in arm_packages.items():
-        arm_provides[name] = pkg
-        for provide in pkg['provides']:
-            provide_name = provide.split('=')[0]
-            arm_provides[provide_name] = pkg
-    
-    for pkg in packages:
-        all_deps = pkg['depends'] + pkg['makedepends']
-        if 'checkdepends' in pkg:
-            all_deps += pkg['checkdepends']
-            
-        for dep in all_deps:
-            dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
-            if dep_name in x86_packages and dep_name not in arm_packages and dep_name not in arm_provides:
-                missing_deps.add(dep_name)
-    
-    return missing_deps
 
-def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=None, missing_packages_mode=False, aur_packages=None, use_latest=False):
+
+def compare_versions(x86_packages, target_packages, force_packages=None, blacklist=None, missing_packages_mode=False, aur_packages=None, use_latest=False):
     """
-    Compare package versions between x86_64 and AArch64 repositories.
+    Compare package versions between x86_64 and target architecture repositories.
     
     Identifies packages that need building by comparing versions and handling
     various scenarios like missing packages, blacklisted packages, and
@@ -413,7 +369,7 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
     
     Args:
         x86_packages: Dictionary of x86_64 packages
-        arm_packages: Dictionary of AArch64 packages  
+        target_packages: Dictionary of target architecture packages  
         force_packages: Set of packages to force rebuild
         blacklist: List of blacklist patterns
         missing_packages_mode: Only return missing packages
@@ -428,33 +384,38 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
     blacklist = blacklist or []
     
     # Bootstrap-only packages (excluded from normal builds but not from bootstrap detection)
-    bootstrap_only = {'linux-api-headers', 'glibc', 'binutils', 'gcc'}
+    # Note: Using helper function for consistency
     
     skipped_packages = []
     blacklisted_missing = []
     
     # Group packages by basename
     x86_bases = {}
-    arm_bases = {}
+    target_bases = {}
     
-    # Build provides mapping for ARM packages (only if needed for missing deps)
-    arm_provides = {name: pkg for name, pkg in arm_packages.items()}
+    # ============================================================
+    # Group packages by basename and build provides mapping
+    # ============================================================
+    
+    # Build provides mapping for target architecture packages (only if needed for missing deps)
+    target_provides = {name: pkg for name, pkg in target_packages.items()}
     if not missing_packages_mode:
-        for pkg in arm_packages.values():
+        for pkg in target_packages.values():
             for provide in pkg['provides']:
                 provide_name = provide.split('=')[0]
-                arm_provides[provide_name] = pkg
+                target_provides[provide_name] = pkg
     
+    # Group x86_64 packages by basename
     for name, pkg in x86_packages.items():
         basename = pkg['basename']
         if basename not in x86_bases:
             x86_bases[basename] = {'packages': [], 'version': pkg['version'], 'pkg_data': pkg}
         x86_bases[basename]['packages'].append(name)
     
-    for name, pkg in arm_packages.items():
+    for name, pkg in target_packages.items():
         basename = pkg['basename']
-        if basename not in arm_bases:
-            arm_bases[basename] = {'version': pkg['version']}
+        if basename not in target_bases:
+            target_bases[basename] = {'version': pkg['version']}
     
     newer_in_x86 = []
     bin_package_warnings = []
@@ -472,7 +433,7 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
                 break
         
         # Check if this is a missing package for blacklist tracking
-        is_missing = basename not in arm_bases and basename not in arm_provides
+        is_missing = basename not in target_bases and basename not in target_provides
         
         if blacklist_reason:
             if missing_packages_mode and is_missing:
@@ -493,23 +454,23 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
             continue
         
         # Skip bootstrap-only packages unless explicitly forced
-        if basename in bootstrap_only and not force_packages:
-            has_newer_version = (basename not in arm_bases or 
-                               is_version_newer(arm_bases[basename]['version'], x86_data['version']))
+        if is_bootstrap_package(basename) and not force_packages:
+            has_newer_version = (basename not in target_bases or 
+                               is_version_newer(target_bases[basename]['version'], x86_data['version']))
             
             if has_newer_version:
                 skipped_packages.append(f"{basename} (bootstrap-only package - newer version available, run bootstrap script)")
             continue
             
         should_include = False
-        arm_version = "not found"
+        target_version = "not found"
         
         if force_packages:
             # When --packages is specified, check if any individual package name is requested
             should_include = (basename in force_packages or 
                             any(pkg_name in force_packages for pkg_name in x86_data['packages']))
-            if basename in arm_bases:
-                arm_version = arm_bases[basename]['version']
+            if basename in target_bases:
+                target_version = target_bases[basename]['version']
             elif basename in arm_provides and arm_provides[basename]['name'].endswith('-bin'):
                 # Check if a -bin package provides this package
                 bin_pkg = arm_provides[basename]
@@ -526,18 +487,18 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
                     elif comparison == 1:
                         bin_package_warnings.append(f"INFO: {bin_pkg['name']} (provides {basename}={provided_version}) is newer than x86_64 {basename} ({x86_data['version']})")
                 should_include = False  # Don't build -bin packages
-                arm_version = f"provided by {bin_pkg['name']}"
+                target_version = f"provided by {bin_pkg['name']}"
         elif missing_packages_mode:
             # Only include packages missing from aarch64
-            should_include = basename not in arm_bases and basename not in arm_provides
-        elif basename in arm_bases:
+            should_include = basename not in target_bases and basename not in target_provides
+        elif basename in target_bases:
             # Compare basename versions using existing utility
-            should_include = is_version_newer(arm_bases[basename]['version'], x86_data['version'])
-            arm_version = arm_bases[basename]['version']
+            should_include = is_version_newer(target_bases[basename]['version'], x86_data['version'])
+            target_version = target_bases[basename]['version']
         else:
             # Check if a -bin package provides this package
-            if basename in arm_provides and arm_provides[basename]['name'].endswith('-bin'):
-                bin_pkg = arm_provides[basename]
+            if basename in target_provides and target_provides[basename]['name'].endswith('-bin'):
+                bin_pkg = target_provides[basename]
                 # Extract version from provides (e.g., "electron37=37.3.1" -> "37.3.1")
                 provided_version = None
                 for provide in bin_pkg['provides']:
@@ -552,7 +513,7 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
                     elif comparison == 1:
                         bin_package_warnings.append(f"INFO: {bin_pkg['name']} (provides {basename}={provided_version}) is newer than x86_64 {basename} ({x86_data['version']})")
                 should_include = False
-                arm_version = f"provided by {bin_pkg['name']}"
+                target_version = f"provided by {bin_pkg['name']}"
             else:
                 # Package doesn't exist in aarch64 - don't auto-include all missing packages
                 # Missing dependencies will be handled separately by find_missing_dependencies
@@ -570,7 +531,7 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
             newer_in_x86.append({
                 'name': basename,
                 'x86_version': x86_data['version'],
-                'arm_version': arm_version,
+                'target_version': target_version,
                 'force_latest': should_use_latest,
                 'use_aur': bool(basename in aur_packages),
                 **pkg_data
@@ -582,11 +543,11 @@ def compare_versions(x86_packages, arm_packages, force_packages=None, blacklist=
         missing_packages_only = []
         for pkg in newer_in_x86:
             basename = pkg['name']
-            if basename not in arm_bases and basename not in arm_provides:
+            if basename not in target_bases and basename not in target_provides:
                 missing_packages_only.append(pkg)
         
         if missing_packages_only:
-            missing_deps = find_missing_dependencies(missing_packages_only, full_x86_packages, arm_packages)
+            missing_deps = find_missing_dependencies(missing_packages_only, full_x86_packages, target_packages)
             for dep_name in missing_deps:
                 if dep_name in full_x86_packages:
                     pkg = full_x86_packages[dep_name]
@@ -721,11 +682,9 @@ if __name__ == "__main__":
     except FileNotFoundError:
         pass
     
-    parser = argparse.ArgumentParser(description='Generate build list by comparing Arch Linux package versions between x86_64 and AArch64 repositories')
-    parser.add_argument('--arm-urls', nargs='+',
-                        default=["https://arch-linux-repo.drzee.net/arch/core/os/aarch64/core.db",
-                                 "https://arch-linux-repo.drzee.net/arch/extra/os/aarch64/extra.db"],
-                        help='URLs for AArch64 repository databases')
+    target_arch = get_target_architecture()
+    
+    parser = argparse.ArgumentParser(description=f'Generate build list by comparing Arch Linux package versions between x86_64 and {target_arch} repositories')
     parser.add_argument('--aur', nargs='+',
                         help='Get specified packages from AUR (implies --packages mode)')
     parser.add_argument('--local', action='store_true',
@@ -930,9 +889,10 @@ if __name__ == "__main__":
                     'repo': 'extra'
                 }
     
-    # Load AArch64 packages using shared function
-    arm_packages = load_aarch64_packages(download=not args.no_update, urls=args.arm_urls)
-    print(f"Loaded {len(arm_packages)} AArch64 packages")
+    # Load target architecture packages using shared function
+    target_arch = get_target_architecture()
+    target_packages = load_target_arch_packages(download=not args.no_update)
+    print(f"Loaded {len(target_packages)} {target_arch} packages")
     
     print("Comparing versions...")
     # Skip blacklist entirely when using --packages
@@ -944,7 +904,7 @@ if __name__ == "__main__":
         if blacklist:
             print(f"Loaded blacklist with {len(blacklist)} packages")
     
-    newer_packages, skipped_packages, blacklisted_missing, bin_package_warnings = compare_versions(x86_packages, arm_packages, args.packages, blacklist, args.missing_packages, args.use_aur_for_packages, args.use_latest)
+    newer_packages, skipped_packages, blacklisted_missing, bin_package_warnings = compare_versions(x86_packages, target_packages, args.packages, blacklist, args.missing_packages, args.use_aur_for_packages, args.use_latest)
     
     # Report blacklisted missing packages
     if args.missing_packages and blacklisted_missing:
@@ -954,10 +914,10 @@ if __name__ == "__main__":
     
     # Report -bin package warnings
     if bin_package_warnings:
-        print("\n" + "="*60)
+        print("\n" + "="*SEPARATOR_WIDTH)
         for warning in bin_package_warnings:
             print(warning)
-        print("="*60)
+        print("="*SEPARATOR_WIDTH)
     
     # Handle --rebuild-repo option
     if args.rebuild_repo:
@@ -1041,7 +1001,7 @@ if __name__ == "__main__":
         for pkg_name in args.packages:
             if pkg_name in newer_packages:
                 pkg = newer_packages[pkg_name]
-                if pkg.get('x86_version') == pkg.get('arm_version'):
+                if pkg.get('x86_version') == pkg.get('target_version'):
                     rebuild_packages.append(pkg_name)
                 else:
                     update_packages.append(pkg_name)

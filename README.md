@@ -1,11 +1,14 @@
-# Arch Linux AArch64 Builder
+# Arch Linux Multi-Architecture Builder
 
-This automated build system maintains an AArch64 port of Arch Linux by continuously monitoring package versions between x86_64 and AArch64 repositories, automatically identifying outdated packages, and building them in correct dependency order using clean chroot environments. It handles the complete workflow from package discovery to compilation and deployment to testing repositories.
+This automated build system maintains ports of Arch Linux for multiple architectures by continuously monitoring package versions between x86_64 and target architecture repositories, automatically identifying outdated packages, and building them in correct dependency order using clean chroot environments. It handles the complete workflow from package discovery to compilation and deployment to testing repositories.
+
+The target architecture is automatically detected from `chroot-config/makepkg.conf` (CARCH variable), making it easy to use for AArch64, RISC-V, s390x, or other architectures.
 
 ## Features
 
 - Uses Arch Linux state repository for fast, comprehensive package information
-- Compares x86_64 (core + extra) against AArch64 repositories from configured mirrors
+- Compares x86_64 (core + extra) against target architecture repositories from configured mirrors
+- Target architecture automatically detected from `chroot-config/makepkg.conf` (CARCH variable)
 - Filters out architecture-independent packages (`ARCH=any`)
 - Extracts comprehensive package metadata including source repository
 - Fetches PKGBUILDs for complete dependency information with intelligent update detection
@@ -18,7 +21,7 @@ This automated build system maintains an AArch64 port of Arch Linux by continuou
 - Detects missing dependencies and includes them automatically (always enabled)
 - Detects repository inconsistencies (packages in both core and extra)
 - Handles corrupted state repository by re-cloning automatically
-- Generate lists of packages missing from AArch64 repository
+- Generate lists of packages missing from target architecture repository
 - Repository analysis and version comparison tools
 - Support for local, AUR, and official package sources
 - Efficient processing: reads existing PKGBUILDs first to determine current versions before git operations
@@ -37,7 +40,7 @@ This automated build system maintains an AArch64 port of Arch Linux by continuou
 ### Key Features
 
 - **Clean Chroot Builds**: Uses `makechrootpkg` with isolated build environments
-- **Cross-Architecture**: Builds x86_64 packages on AArch64 using `--ignorearch`
+- **Cross-Architecture**: Builds x86_64 packages on target architecture using `--ignorearch`
 - **Test Dependencies**: Automatically handles `checkdepends` using temporary chroot copies when `!check` is used
 - **Dependency Management**: Builds packages in topological dependency order
 - **S3 Integration**: Uploads built packages to hosted staging repository
@@ -48,6 +51,26 @@ This automated build system maintains an AArch64 port of Arch Linux by continuou
 - **Auto-Recovery**: Handles corrupted state repository by re-cloning automatically
 - **GPG Key Import**: Automatically imports GPG keys from `keys/pgp/` directory
 - **Signal Handling**: Properly cleans up temporary chroot copies on interruption
+
+## Configuration
+
+The system uses `config.ini` for configuration settings:
+
+```ini
+[build]
+build_root = /tmp/builder
+upload_bucket = arch-linux-repos.drzee.net
+target_core_url = https://example.com/core/os/aarch64/core.db
+target_extra_url = https://example.com/extra/os/aarch64/extra.db
+```
+
+**Configuration Options:**
+- `build_root`: Root directory for build operations
+- `upload_bucket`: S3 bucket for package uploads  
+- `target_core_url`: URL for target architecture core repository (optional)
+- `target_extra_url`: URL for target architecture extra repository (optional)
+
+If repository URLs are not specified, defaults are used based on the target architecture detected from `chroot-config/makepkg.conf`.
 
 ## Usage
 
@@ -107,11 +130,6 @@ This automated build system maintains an AArch64 port of Arch Linux by continuou
 ```bash
 ./generate_build_list.py --rebuild-repo core
 ./generate_build_list.py --rebuild-repo extra
-```
-
-#### Custom AArch64 repository URLs
-```bash
-./generate_build_list.py --arm-urls https://example.com/core.db https://example.com/extra.db
 ```
 
 #### Skip git updates (use existing PKGBUILDs)
@@ -370,7 +388,6 @@ git clone <special-glibc-repo> pkgbuilds/glibc
 
 | Option | Description |
 |--------|-------------|
-| `--arm-urls URL [URL ...]` | URLs for AArch64 repository databases |
 | `--packages PKG [PKG ...]` | Force rebuild specific packages by name |
 | `--preserve-order` | Preserve exact order specified in --packages (skip dependency sorting) |
 | `--local` | Build packages from local PKGBUILDs only (use with --packages) |
