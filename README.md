@@ -121,7 +121,7 @@ If repository URLs are not specified, defaults are used based on the target arch
 ./generate_build_list.py --blacklist blacklist.txt
 ```
 
-#### List packages missing from AArch64 repository
+#### List packages missing from target architecture repository
 ```bash
 ./generate_build_list.py --missing-packages
 ```
@@ -214,10 +214,7 @@ This messaging system ensures users know exactly what operations are being perfo
 
 #### Bootstrap build toolchain packages (separate script)
 ```bash
-# First, manually checkout special toolchain repositories:
-git clone <special-gcc-repo-url> pkgbuilds/gcc
-git clone <special-glibc-repo-url> pkgbuilds/glibc
-
+# Bootstrap toolchain (automatically clones special repositories)
 ./bootstrap_toolchain.py
 ```
 
@@ -329,15 +326,15 @@ mkdir -p pkgbuilds/my-package
 ```
 
 ### 9. Repository Analysis
-**Scenario**: Analyze differences between x86_64 and AArch64 repositories.
+**Scenario**: Analyze differences between x86_64 and target architecture repositories.
 
 ```bash
 # Comprehensive repository analysis
 ./repo_analyze.py
 
 # Shows:
-# - Packages where AArch64 is newer than x86_64
-# - Packages that exist only in AArch64
+# - Packages where target architecture is newer than x86_64
+# - Packages that exist only in target architecture
 # - Repository mismatches (packages in wrong repo)
 ```
 
@@ -345,11 +342,7 @@ mkdir -p pkgbuilds/my-package
 **Scenario**: Bootstrap a complete toolchain from scratch.
 
 ```bash
-# First, manually checkout special toolchain repositories
-git clone <special-gcc-repo> pkgbuilds/gcc
-git clone <special-glibc-repo> pkgbuilds/glibc
-
-# Bootstrap the toolchain
+# Bootstrap toolchain (automatically clones special repositories)
 ./bootstrap_toolchain.py
 ```
 
@@ -485,7 +478,7 @@ The `bootstrap_toolchain.py` script builds core toolchain packages in a staged a
 **Stage 2 - Final Rebuild**: glibc → binutils → gcc → libtool → valgrind
 
 **Special Requirements**:
-- `gcc` and `glibc` must be manually checked out from their special repositories
+- Special gcc and glibc repositories are automatically cloned from configured sources
 - Other packages are automatically cloned from Arch Linux GitLab if missing
 - Uses lock file (bootstrap.lock) to prevent multiple simultaneous runs
 - Shows progress indication per stage and package
@@ -829,7 +822,7 @@ git clone <special-glibc-repo-url> pkgbuilds/glibc
 ```
 
 ### 7. Missing Package Discovery
-**Scenario**: Find packages available in x86_64 but missing from AArch64.
+**Scenario**: Find packages available in x86_64 but missing from target architecture.
 
 ```bash
 # Generate list of missing packages
@@ -918,7 +911,7 @@ The `bootstrap_toolchain.py` script builds core toolchain packages in a staged a
 **Stage 2 - Final Rebuild**: glibc → binutils → gcc → libtool → valgrind
 
 **Special Requirements**:
-- `gcc` and `glibc` must be manually checked out from their special repositories
+- Special gcc and glibc repositories are automatically cloned from configured sources
 - Other packages are automatically cloned from Arch Linux GitLab if missing
 - Uses lock file (bootstrap.lock) to prevent multiple simultaneous runs
 - Shows progress indication per stage and package
@@ -931,10 +924,7 @@ The `bootstrap_toolchain.py` script builds core toolchain packages in a staged a
 
 **Usage**:
 ```bash
-# First, manually checkout special repos:
-# git clone <special-gcc-repo> pkgbuilds/gcc
-# git clone <special-glibc-repo> pkgbuilds/glibc
-
+# Bootstrap toolchain (automatically clones special repositories)
 ./bootstrap_toolchain.py
 ```
 

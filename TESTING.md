@@ -1,6 +1,6 @@
 # Test Suite Documentation
 
-## 🧪 Full Test Suite for Arch Linux AArch64 Build System
+## 🧪 Full Test Suite for Arch Linux Multi-Architecture Build System
 
 This comprehensive test suite validates all components of the build system with **100+ test cases** covering:
 
@@ -135,7 +135,7 @@ mock_packages = {
 ## **Test Results Example**
 
 ```
-🧪 Arch Linux AArch64 Build System Test Suite
+🧪 Arch Linux Multi-Architecture Build System Test Suite
 ==============================================
 📦 Running tests with pytest...
 🔍 Running unit tests...

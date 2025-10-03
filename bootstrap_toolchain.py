@@ -15,6 +15,12 @@ import signal
 from pathlib import Path
 from utils import BuildUtils, BUILD_ROOT, CACHE_PATH
 
+# Special repository configuration
+GCC_REPO_URL = "https://gitlab.archlinux.org/solskogen/gcc.git"
+GCC_BRANCH = "experimental"
+GLIBC_REPO_URL = "https://gitlab.archlinux.org/solskogen/glibc.git"
+GLIBC_BRANCH = "aarch64"
+
 # Toolchain configuration - staged build
 STAGE1_PACKAGES = [
     "linux-api-headers", "glibc", "binutils", "gcc", "gmp", "mpfr", "libmpc", "libisl"
@@ -84,7 +90,7 @@ class BootstrapBuilder(BuildUtils):
         
         if not pkg_dir.exists():
             if pkg_name in ["gcc", "glibc"]:
-                print(f"ERROR: {pkg_dir} not found - please checkout {pkg_name} from special repo manually")
+                print(f"ERROR: {pkg_dir} not found - this should have been cloned during setup")
                 sys.exit(1)
         
         if self.dry_run:
@@ -265,19 +271,20 @@ class BootstrapBuilder(BuildUtils):
                     print(f"ERROR: Required tool '{tool}' not found in PATH")
                     sys.exit(1)
             
-            # Validate gcc/glibc directories exist before starting
+            # Validate gcc/glibc directories exist or can be cloned before starting
             missing_packages = []
             for pkg_name in ["gcc", "glibc"]:
                 pkg_dir = self.build_dir / pkg_name
                 if not pkg_dir.exists():
-                    missing_packages.append(pkg_name)
+                    if self.dry_run:
+                        print(f"Note: {pkg_name} will be cloned from special repository")
+                    else:
+                        missing_packages.append(pkg_name)
             
-            if missing_packages:
-                print("ERROR: Missing required special repositories:")
-                for pkg_name in missing_packages:
-                    pkg_dir = self.build_dir / pkg_name
-                    print(f"  {pkg_dir} not found - please checkout {pkg_name} from special repo manually")
-                sys.exit(1)
+            if missing_packages and not self.dry_run:
+                print(f"Will clone missing special repositories: {', '.join(missing_packages)}")
+            elif not missing_packages:
+                print("Special repositories (gcc, glibc) already exist - preserving local changes")
             
             # Clear build directory for fresh start (unless continuing)
             if not self.continue_build and not self.start_from:
@@ -301,11 +308,31 @@ class BootstrapBuilder(BuildUtils):
                 pkg_dir = self.build_dir / pkg_name
                 
                 if pkg_name in ["gcc", "glibc"]:
-                    # Special repos - never update, user manages manually
+                    # Special repos - clone if missing, preserve if exists
+                    if pkg_dir.exists():
+                        if self.dry_run:
+                            self.format_dry_run(f"Would preserve existing {pkg_name} (special repo)", [])
+                        else:
+                            print(f"✓ Preserving existing {pkg_name} (special repo - not overwriting changes)")
+                        continue
+                    
+                    # Clone special repositories
+                    if pkg_name == "gcc":
+                        repo_url = GCC_REPO_URL
+                        branch = GCC_BRANCH
+                    else:  # glibc
+                        repo_url = GLIBC_REPO_URL
+                        branch = GLIBC_BRANCH
+                    
                     if self.dry_run:
-                        self.format_dry_run(f"Would skip update for {pkg_name} (special repo)", [])
+                        self.format_dry_run(f"Would clone {pkg_name} from special repo", [f"git clone -b {branch} {repo_url} {pkg_name}"])
                     else:
-                        print(f"✓ Skipping update for {pkg_name} (special repo - managed manually)")
+                        try:
+                            self.run_command(["git", "clone", "-b", branch, repo_url, pkg_name], cwd=self.build_dir)
+                            print(f"✓ Cloned {pkg_name} from {repo_url} (branch: {branch})")
+                        except subprocess.CalledProcessError as e:
+                            print(f"ERROR: Failed to clone {pkg_name}: {e}")
+                            sys.exit(1)
                     continue
                 else:
                     # Regular Arch packages - clone or update

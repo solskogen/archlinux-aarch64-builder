@@ -1,11 +1,11 @@
-# Arch Linux AArch64 Builder - Complete Architecture Specification
+# Arch Linux Multi-Architecture Builder - Complete Architecture Specification
 
-This document provides complete specifications to recreate the Arch Linux AArch64 build system with identical functionality.
+This document provides complete specifications to recreate the Arch Linux multi-architecture build system with identical functionality.
 
 ## System Overview
 
-The system automatically maintains an AArch64 port of Arch Linux by:
-1. Comparing package versions between x86_64 and AArch64 repositories
+The system automatically maintains ports of Arch Linux for multiple architectures by:
+1. Comparing package versions between x86_64 and target architecture repositories
 2. Identifying outdated packages and missing dependencies
 3. Building packages in correct dependency order using clean chroot environments
 4. Uploading built packages to testing repositories
@@ -19,7 +19,7 @@ The system automatically maintains an AArch64 port of Arch Linux by:
 
 **Key Functions**:
 - Downloads and parses Arch Linux package databases (core.db, extra.db)
-- Compares x86_64 vs AArch64 package versions using Arch Linux state repository
+- Compares x86_64 vs target architecture package versions using Arch Linux state repository
 - Filters out ARCH=any packages (don't need rebuilding)
 - Extracts complete package metadata including dependencies
 - Fetches PKGBUILDs from git repositories with version tag checkout
@@ -27,13 +27,13 @@ The system automatically maintains an AArch64 port of Arch Linux by:
 - Outputs JSON build list with metadata
 
 **Command Line Options**:
-- `--arm-urls URL [URL ...]`: AArch64 repository database URLs
+- `--target-urls URL [URL ...]`: Target architecture repository database URLs
 - `--packages PKG [PKG ...]`: Force rebuild specific packages
 - `--preserve-order`: Skip dependency sorting, use exact command line order
 - `--local`: Build from local PKGBUILDs only
 - `--aur`: Get packages from AUR instead of official repos
 - `--blacklist FILE`: Skip packages matching patterns in file
-- `--missing-packages`: List packages missing from AArch64
+- `--missing-packages`: List packages missing from target architecture
 - `--rebuild-repo {core,extra}`: Rebuild all packages from repository
 - `--no-update`: Skip git updates, use existing PKGBUILDs
 - `--use-latest`: Use latest git commit instead of version tags
@@ -151,8 +151,8 @@ The system automatically maintains an AArch64 port of Arch Linux by:
 
 **Analysis Types**:
 - Repository mismatches (packages in wrong repo)
-- Version differences (AArch64 newer than x86_64)
-- Architecture-specific packages (AArch64 only)
+- Version differences (target architecture newer than x86_64)
+- Architecture-specific packages (target architecture only)
 - Outdated/missing ARCH=any packages
 - Packages in multiple repositories
 
@@ -162,8 +162,8 @@ The system automatically maintains an AArch64 port of Arch Linux by:
 - `--outdated-any`: Show outdated any packages
 - `--missing-any`: Show missing any packages  
 - `--repo-mismatches`: Show repository mismatches
-- `--arm-newer`: Show packages where AArch64 is newer
-- `--arm-only`: Show AArch64 only packages
+- `--target-newer`: Show packages where target architecture is newer
+- `--target-only`: Show target architecture only packages
 - `--arm-duplicates`: Show packages in both core and extra
 
 #### `find_dependents.py`
@@ -191,7 +191,7 @@ The system automatically maintains an AArch64 port of Arch Linux by:
 - `parse_database_file(db_file, include_any=False)`: Parse pacman database
 - `load_database_packages(urls, arch_suffix, download=True)`: Download and parse multiple databases
 - `load_x86_64_packages(download=True, repos=None)`: Load x86_64 packages
-- `load_aarch64_packages(download=True, urls=None)`: Load AArch64 packages
+- `load_target_arch_packages(download=True, urls=None)`: Load target architecture packages
 
 **PKGBUILD Processing**:
 - `parse_pkgbuild_deps(pkgbuild_path)`: Extract dependencies using bash sourcing
@@ -238,7 +238,7 @@ The system automatically maintains an AArch64 port of Arch Linux by:
 ## Data Flow
 
 ### Package Discovery Flow
-1. Download x86_64 and AArch64 database files (.db)
+1. Download x86_64 and target architecture database files (.db)
 2. Parse databases to extract package metadata
 3. Filter out ARCH=any packages
 4. Compare versions between architectures

@@ -380,7 +380,7 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
 
 
 
-def compare_versions(x86_packages, target_packages, force_packages=None, blacklist=None, missing_packages_mode=False, aur_packages=None, use_latest=False):
+def compare_versions(x86_packages, target_packages, force_packages=None, blacklist=None, missing_packages_mode=False, aur_packages=None, use_latest=False, full_x86_packages=None):
     """
     Compare package versions between x86_64 and target architecture repositories.
     
@@ -510,7 +510,7 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
                 should_include = False  # Don't build -bin packages
                 target_version = f"provided by {bin_pkg['name']}"
         elif missing_packages_mode:
-            # Only include packages missing from aarch64
+            # Only include packages missing from target architecture
             should_include = basename not in target_bases and basename not in target_provides
         elif basename in target_bases:
             # Compare basename versions using existing utility
@@ -536,7 +536,7 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
                 should_include = False
                 target_version = f"provided by {bin_pkg['name']}"
             else:
-                # Package doesn't exist in aarch64 - don't auto-include all missing packages
+                # Package doesn't exist in target architecture - don't auto-include all missing packages
                 # Missing dependencies will be handled separately by find_missing_dependencies
                 should_include = False
         
@@ -562,36 +562,28 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
                 'use_aur': bool(basename in aur_packages),
             })
     
-    # Find and add missing dependencies only for missing packages (not for updates)
-    if not missing_packages_mode:
-        # Only check for missing dependencies of packages that don't exist in ARM at all
-        missing_packages_only = []
-        for pkg in newer_in_x86:
-            basename = pkg['name']
-            if basename not in target_bases and basename not in target_provides:
-                missing_packages_only.append(pkg)
-        
-        if missing_packages_only:
-            missing_deps = find_missing_dependencies(missing_packages_only, full_x86_packages, target_packages)
-            for dep_name in missing_deps:
-                if dep_name in full_x86_packages:
-                    pkg = full_x86_packages[dep_name]
-                    basename = pkg['basename']
-                    
-                    # Check if basename is blacklisted
-                    is_blacklisted = False
-                    for pattern in blacklist:
-                        if fnmatch.fnmatch(basename, pattern):
-                            is_blacklisted = True
-                            break
-                    
-                    if not is_blacklisted and basename not in [p['name'] for p in newer_in_x86]:
-                        newer_in_x86.append({
-                            'name': basename,
-                            'force_latest': use_latest,
-                            'use_aur': False,
-                            **pkg
-                        })
+    # Find and add missing dependencies for all packages being built
+    if not missing_packages_mode and full_x86_packages:
+        missing_deps = find_missing_dependencies(newer_in_x86, full_x86_packages, target_packages)
+        for dep_name in missing_deps:
+            if dep_name in full_x86_packages:
+                pkg = full_x86_packages[dep_name]
+                basename = pkg['basename']
+                
+                # Check if basename is blacklisted
+                is_blacklisted = False
+                for pattern in blacklist:
+                    if fnmatch.fnmatch(basename, pattern):
+                        is_blacklisted = True
+                        break
+                
+                if not is_blacklisted and basename not in [p['name'] for p in newer_in_x86]:
+                    newer_in_x86.append({
+                        'name': basename,
+                        'force_latest': use_latest,
+                        'use_aur': False,
+                        **pkg
+                    })
     
     return newer_in_x86, skipped_packages, blacklisted_missing, bin_package_warnings
 
@@ -701,125 +693,102 @@ def detect_dependency_cycles(packages):
 
 def sort_by_build_order(packages):
     """
-    Sort packages by dependency order using optimized topological sort.
+    Sort packages by dependency order using simple topological sort.
     """
     from collections import defaultdict, deque
     
-    # Detect dependency cycles first
-    cycles = detect_dependency_cycles(packages)
-    
-    # Group packages by cycle
-    cycle_groups = {}
-    for pkg_name, cycle_id in cycles.items():
-        if cycle_id not in cycle_groups:
-            cycle_groups[cycle_id] = []
-        cycle_groups[cycle_id].append(pkg_name)
-    
-    # Report detected cycles
-    if cycle_groups:
-        print(f"\nDetected {len(cycle_groups)} dependency cycle(s):")
-        for cycle_id, cycle_pkgs in cycle_groups.items():
-            print(f"  Cycle {cycle_id + 1}: {' ↔ '.join(cycle_pkgs)}")
-            print(f"    These packages will be built twice to ensure compatibility")
-    
-    # Create maps for quick lookup
+    # Create package name to package mapping
     pkg_map = {pkg['name']: pkg for pkg in packages}
-    provides_map = {}
     
-    # Build provides mapping
-    for pkg in packages:
-        if pkg['name'] not in provides_map:
-            provides_map[pkg['name']] = pkg
-        for provide in pkg['provides']:
-            provide_name = provide.split('=')[0]
-            if provide_name not in provides_map:
-                provides_map[provide_name] = pkg
-    
-    # Build dependency graph using optimized approach
-    graph = defaultdict(list)
-    in_degree = defaultdict(int)
+    # Build dependency graph - only consider packages in our build list
+    graph = defaultdict(set)  # pkg -> set of packages that depend on it
+    in_degree = defaultdict(int)  # pkg -> number of dependencies
     
     # Initialize in_degree for all packages
     for pkg in packages:
         in_degree[pkg['name']] = 0
     
-    # Build graph in O(V + E) time
+    # Build the dependency graph
     for pkg in packages:
         pkg_name = pkg['name']
-        all_deps = pkg['depends'] + pkg['makedepends']
-        if 'checkdepends' in pkg:
-            all_deps += pkg['checkdepends']
         
-        for dep_string in all_deps:
-            for dep in dep_string.split():
-                dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
-                if dep_name in provides_map and provides_map[dep_name]['name'] in pkg_map:
-                    provider_name = provides_map[dep_name]['name']
-                    if provider_name != pkg_name:  # Avoid self-dependencies
-                        graph[provider_name].append(pkg_name)
-                        in_degree[pkg_name] += 1
+        # Collect all dependencies
+        all_deps = []
+        for dep_type in ['depends', 'makedepends', 'checkdepends']:
+            all_deps.extend(pkg.get(dep_type, []))
+        
+        # Process each dependency
+        for dep_str in all_deps:
+            # Extract package name (remove version constraints)
+            dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+            
+            # Only create edge if dependency is also in our build list
+            if dep_name in pkg_map and dep_name != pkg_name:
+                graph[dep_name].add(pkg_name)
+                in_degree[pkg_name] += 1
     
-    # Kahn's algorithm for topological sort - O(V + E)
-    queue = deque([pkg_name for pkg_name in pkg_map.keys() if in_degree[pkg_name] == 0])
-    topo_order = []
-    stage_assignments = {}
+    # Topological sort using Kahn's algorithm
+    result = []
+    queue = deque()
+    
+    # Find all packages with no dependencies
+    for pkg_name in pkg_map:
+        if in_degree[pkg_name] == 0:
+            queue.append((pkg_name, 0))  # (package_name, stage)
+    
     current_stage = 0
     
-    # Process packages level by level (all independent packages get same stage)
     while queue:
-        # All packages in current queue have no remaining dependencies
-        current_level = list(queue)
-        queue.clear()
+        # Process all packages at current stage level
+        next_queue = deque()
+        stage_packages = []
         
-        # Assign current stage to all packages in this level
-        for pkg_name in current_level:
-            topo_order.append(pkg_name)
-            stage_assignments[pkg_name] = current_stage
+        # Get all packages that can be built at current stage
+        while queue:
+            pkg_name, stage = queue.popleft()
+            if stage == current_stage:
+                stage_packages.append(pkg_name)
+            else:
+                next_queue.append((pkg_name, stage))
+        
+        # If no packages at current stage, move to next stage
+        if not stage_packages:
+            current_stage += 1
+            queue = next_queue
+            continue
+        
+        # Add packages at current stage to result
+        for pkg_name in stage_packages:
+            pkg = pkg_map[pkg_name].copy()
+            pkg['build_stage'] = current_stage
+            pkg['cycle_group'] = None
+            pkg['cycle_stage'] = None
+            result.append(pkg)
             
-            # Remove this package from dependency graph
-            for neighbor in graph[pkg_name]:
-                in_degree[neighbor] -= 1
-                if in_degree[neighbor] == 0:
-                    queue.append(neighbor)
+            # Remove this package from graph and update in_degrees
+            for dependent in graph[pkg_name]:
+                in_degree[dependent] -= 1
+                if in_degree[dependent] == 0:
+                    next_queue.append((dependent, current_stage + 1))
         
+        # Move to next stage
         current_stage += 1
+        queue = next_queue
     
-    # Create result with build stages
-    result_packages = []
-    
-    # Add non-cycle packages first
+    # Handle any remaining packages (cycles) - put them at the end
+    remaining_packages = []
     for pkg in packages:
-        if pkg['name'] not in cycles:
+        if not any(p['name'] == pkg['name'] for p in result):
             pkg_copy = pkg.copy()
-            pkg_copy['build_stage'] = stage_assignments.get(pkg['name'], 0)
-            pkg_copy['cycle_group'] = None
-            pkg_copy['cycle_stage'] = None
-            result_packages.append(pkg_copy)
-    
-    # Add packages in cycles twice (consecutive stages)
-    next_stage = current_stage
-    for cycle_id, cycle_pkgs in cycle_groups.items():
-        # Stage 1: Build all packages in cycle
-        for pkg_name in cycle_pkgs:
-            pkg = pkg_map[pkg_name]
-            pkg_copy = pkg.copy()
-            pkg_copy['build_stage'] = next_stage
-            pkg_copy['cycle_group'] = cycle_id
+            pkg_copy['build_stage'] = current_stage
+            pkg_copy['cycle_group'] = 0
             pkg_copy['cycle_stage'] = 1
-            result_packages.append(pkg_copy)
-        
-        # Stage 2: Build all packages in cycle again
-        for pkg_name in cycle_pkgs:
-            pkg = pkg_map[pkg_name]
-            pkg_copy = pkg.copy()
-            pkg_copy['build_stage'] = next_stage + 1
-            pkg_copy['cycle_group'] = cycle_id
-            pkg_copy['cycle_stage'] = 2
-            result_packages.append(pkg_copy)
-        
-        next_stage += 2
+            remaining_packages.append(pkg_copy)
     
-    return sorted(result_packages, key=lambda x: (x['build_stage'], x.get('cycle_stage', 0)))
+    result.extend(remaining_packages)
+    
+    # Sort by build stage
+    return sorted(result, key=lambda x: (x['build_stage'], x['name']))
 
 if __name__ == "__main__":
     # Clean up state from previous builds
@@ -842,7 +811,7 @@ if __name__ == "__main__":
     parser.add_argument('--blacklist', default='blacklist.txt',
                         help='File containing packages to skip (default: blacklist.txt)')
     parser.add_argument('--missing-packages', action='store_true',
-                        help='Generate list of all packages present in x86_64 but missing from aarch64')
+                        help=f'Generate list of all packages present in x86_64 but missing from {target_arch}')
     parser.add_argument('--rebuild-repo', choices=['core', 'extra'],
                         help='Rebuild all packages from specified repository regardless of version')
     
@@ -1063,7 +1032,7 @@ if __name__ == "__main__":
         if blacklist:
             print(f"Loaded blacklist with {len(blacklist)} packages")
     
-    newer_packages, skipped_packages, blacklisted_missing, bin_package_warnings = compare_versions(x86_packages, target_packages, args.packages, blacklist, args.missing_packages, args.use_aur_for_packages, args.use_latest)
+    newer_packages, skipped_packages, blacklisted_missing, bin_package_warnings = compare_versions(x86_packages, target_packages, args.packages, blacklist, args.missing_packages, args.use_aur_for_packages, args.use_latest, full_x86_packages)
     
     # Report blacklisted missing packages
     if args.missing_packages and blacklisted_missing:

@@ -795,7 +795,7 @@ def upload_packages(pkg_dir, target_repo, dry_run=False):
             try:
                 cmd = [
                     "repo-upload", pkg,
-                    "--arch", "aarch64",
+                    "--arch", get_target_architecture(),
                     "--repo", target_repo,
                     "--bucket", UPLOAD_BUCKET
                 ]
