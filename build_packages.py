@@ -25,7 +25,8 @@ from utils import (
     load_blacklist, filter_blacklisted_packages, 
     validate_package_name, safe_path_join, PACKAGE_SKIP_FLAG,
     BuildUtils, BUILD_ROOT, CACHE_PATH, TEMP_CHROOT_ID_MIN, TEMP_CHROOT_ID_MAX, 
-    SEPARATOR_WIDTH, GIT_COMMAND_TIMEOUT, import_gpg_keys
+    SEPARATOR_WIDTH, GIT_COMMAND_TIMEOUT, import_gpg_keys, upload_packages,
+    safe_command_execution
 )
 
 class PackageBuilder:
@@ -138,11 +139,14 @@ class PackageBuilder:
                 print(f"  {temp_dir.name}")
             raise RuntimeError("Multiple preserved chroots found")
         else:
-            import uuid
-            temp_copy_name = f"temp-{pkg_name}-{uuid.uuid4().hex[:8]}"
+            import datetime
+            timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+            temp_copy_name = f"temp-{pkg_name}-{timestamp}"
             temp_copy_path = self.chroot_path / temp_copy_name
             while temp_copy_path.exists():
-                temp_copy_name = f"temp-{pkg_name}-{uuid.uuid4().hex[:8]}"
+                # If timestamp collision, add microseconds
+                timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")[:14]
+                temp_copy_name = f"temp-{pkg_name}-{timestamp}"
                 temp_copy_path = self.chroot_path / temp_copy_name
             self.temp_copies.append(temp_copy_path)
             return temp_copy_path
@@ -319,7 +323,6 @@ echo "CHECKDEPENDS_END"
         # Upload packages
         if not self.no_upload:
             target_repo = f"{pkg_data.get('repo', 'extra')}-testing"
-            from utils import upload_packages
             uploaded_count = upload_packages(pkg_dir, target_repo, self.dry_run)
             print(f"Successfully uploaded {uploaded_count} packages to {target_repo}")
         

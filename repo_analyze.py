@@ -59,9 +59,6 @@ def main():
         if len(repos) > 1:
             target_duplicates.append(f"{basename}: present in {', '.join(sorted(repos))}")
     
-    print(f"x86_64 packages: {len(x86_bases)} pkgbase")
-    print(f"{target_arch} packages: {len(target_bases)} pkgbase")
-    
     # Build provides lookup for x86_64
     x86_provides = {}
     for pkg_name, pkg_data in x86_packages.items():

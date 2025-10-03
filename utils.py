@@ -494,6 +494,83 @@ class BuildUtils:
     
     def __init__(self, dry_run=False):
         self.dry_run = dry_run
+        self.logs_dir = Path("logs")
+
+    def run_command(self, cmd, cwd=None, capture_output=False, timeout=None):
+        """
+        Execute command with consistent error handling and dry-run support.
+        
+        Args:
+            cmd: Command to execute (list or string)
+            cwd: Working directory
+            capture_output: Whether to capture stdout/stderr
+            timeout: Command timeout in seconds
+            
+        Returns:
+            subprocess.CompletedProcess result
+        """
+        if self.dry_run:
+            cmd_str = ' '.join(cmd) if isinstance(cmd, list) else cmd
+            print(f"DRY RUN: {cmd_str}")
+            if cwd:
+                print(f"  (in {cwd})")
+            # Return mock result for dry run
+            from types import SimpleNamespace
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        
+        return subprocess.run(cmd, cwd=cwd, capture_output=capture_output, 
+                            text=True, timeout=timeout, check=True)
+
+    def run_git_command(self, cmd, cwd, timeout=GIT_COMMAND_TIMEOUT):
+        """Execute git command with standard timeout and error handling."""
+        full_cmd = ["git"] + cmd if isinstance(cmd, list) else ["git", cmd]
+        return self.run_command(full_cmd, cwd=cwd, capture_output=True, timeout=timeout)
+
+    def format_dry_run(self, description, commands):
+        """Format dry run output consistently."""
+        print(f"DRY RUN: {description}")
+        for cmd in commands:
+            print(f"  {cmd}")
+
+    def setup_chroot_environment(self, chroot_path, cache_path):
+        """Setup chroot environment with consistent configuration."""
+        if self.dry_run:
+            self.format_dry_run("Would setup chroot environment", [
+                f"mkdir -p {chroot_path}",
+                f"mkdir -p {cache_path}",
+                "mkarchroot setup"
+            ])
+            return
+        
+        # Create directories
+        chroot_path.mkdir(parents=True, exist_ok=True)
+        cache_path.mkdir(parents=True, exist_ok=True)
+        
+        # Setup chroot if it doesn't exist
+        chroot_root = chroot_path / "root"
+        if not chroot_root.exists():
+            print("Setting up chroot environment...")
+            self.run_command([
+                "mkarchroot", "-C", "chroot-config/pacman.conf", 
+                "-M", "chroot-config/makepkg.conf", str(chroot_root), "base-devel"
+            ])
+            print("Chroot environment created successfully")
+
+    def clear_cache(self, cache_path, description="cache"):
+        """Clear cache directory with consistent handling."""
+        if self.dry_run:
+            self.format_dry_run(f"Would clear {description}", [f"rm -rf {cache_path}/*"])
+            return 0
+        
+        try:
+            cache_files = list(cache_path.glob("*.pkg.tar.*"))
+            for cache_file in cache_files:
+                cache_file.unlink()
+            print(f"Cleared {len(cache_files)} cached packages from {description}")
+            return len(cache_files)
+        except Exception as e:
+            print(f"Warning: Failed to clear {description}: {e}")
+            return 0
         self.logs_dir = Path(LOGS_DIR)
     
     def run_command(self, cmd, cwd=None, capture_output=False):
@@ -661,6 +738,142 @@ def find_missing_dependencies(packages, x86_packages, target_packages):
     
     return missing_deps
 
+def load_packages_unified(download=True, include_any=False, use_existing=False, x86_repos=None, target_repos=None):
+    """
+    Unified package loading function for all scripts.
+    
+    Args:
+        download: Whether to download fresh databases
+        include_any: Whether to include ARCH=any packages
+        use_existing: Use existing database files without downloading
+        x86_repos: Filter x86_64 repos (for compatibility)
+        target_repos: Filter target repos (for compatibility)
+        
+    Returns:
+        tuple: (x86_64_packages, target_packages)
+    """
+    if use_existing:
+        download = False
+    
+    print("Loading packages...")
+    
+    # Get target architecture
+    target_arch = get_target_architecture()
+    
+    # Load packages using existing parallel function
+    x86_packages, target_packages = load_all_packages_parallel(
+        download=download, include_any=include_any, 
+        x86_repos=x86_repos, target_repos=target_repos
+    )
+    
+    return x86_packages, target_packages
+
+def git_clone_package(basename, use_aur=False, target_dir=None):
+    """Clone package repository with consistent error handling."""
+    if target_dir is None:
+        target_dir = PKGBUILDS_DIR
+    
+    try:
+        if use_aur:
+            url = f"https://aur.archlinux.org/{basename}.git"
+        else:
+            # Convert ++ to plusplus for GitLab URLs
+            gitlab_name = basename.replace('++', 'plusplus')
+            url = f"https://gitlab.archlinux.org/archlinux/packaging/packages/{gitlab_name}.git"
+        
+        safe_command_execution(
+            ["git", "clone", url, basename], 
+            f"Clone {basename}", 
+            cwd=target_dir
+        )
+        return True
+    except Exception:
+        return False
+
+def git_checkout_version(pkg_dir, version, basename):
+    """Checkout specific version with fallback to latest."""
+    git_version_tag = version.replace(':', '-')
+    tag_formats = [
+        f"v{git_version_tag}",
+        git_version_tag,
+        f"{basename}-{git_version_tag}",
+        f"release-{git_version_tag}"
+    ]
+    
+    # Fetch tags first
+    safe_command_execution(["git", "fetch", "--tags"], "Fetch tags", cwd=pkg_dir)
+    
+    # Try different tag formats
+    for tag_format in tag_formats:
+        try:
+            safe_command_execution(
+                ["git", "checkout", tag_format], 
+                f"Checkout {tag_format}", 
+                cwd=pkg_dir, 
+                exit_on_error=False
+            )
+            return True
+        except:
+            continue
+    
+    # Fallback to latest
+    print(f"Warning: Could not find tag for {basename} version {version}, using latest commit")
+    safe_command_execution(["git", "fetch", "origin"], "Fetch origin", cwd=pkg_dir)
+    safe_command_execution(["git", "reset", "--hard", "origin/main"], "Reset to main", cwd=pkg_dir)
+    return False
+
+def git_update_to_latest(pkg_dir):
+    """Update repository to latest commit."""
+    safe_command_execution(["git", "reset", "--hard"], "Reset repository", cwd=pkg_dir)
+    safe_command_execution(["git", "fetch", "origin"], "Fetch origin", cwd=pkg_dir)
+    safe_command_execution(["git", "reset", "--hard", "origin/main"], "Reset to main", cwd=pkg_dir)
+
+def handle_command_error(e, operation_name, exit_on_error=True):
+    """Consistent error handling for subprocess commands."""
+    error_msg = f"ERROR: {operation_name} failed: {e}"
+    print(error_msg)
+    if exit_on_error:
+        sys.exit(1)
+    return False
+
+def handle_file_error(e, operation_name, filename, exit_on_error=True):
+    """Consistent error handling for file operations."""
+    error_msg = f"ERROR: {operation_name} failed for {filename}: {e}"
+    print(error_msg)
+    if exit_on_error:
+        sys.exit(1)
+    return False
+
+def safe_file_operation(operation, filename, exit_on_error=True):
+    """Safely execute file operations with consistent error handling."""
+    try:
+        return operation()
+    except Exception as e:
+        return handle_file_error(e, "File operation", filename, exit_on_error)
+
+def safe_command_execution(cmd, operation_name, cwd=None, exit_on_error=True, **kwargs):
+    """Safely execute commands with consistent error handling."""
+    try:
+        return subprocess.run(cmd, cwd=cwd, check=True, **kwargs)
+    except subprocess.CalledProcessError as e:
+        return handle_command_error(e, operation_name, exit_on_error)
+    except Exception as e:
+        return handle_command_error(e, operation_name, exit_on_error)
+
+def load_config():
+    """Load configuration with consistent error handling."""
+    import configparser
+    config = configparser.ConfigParser()
+    
+    try:
+        config.read('config.ini')
+        return {
+            'build': dict(config['build']) if 'build' in config else {},
+            'repositories': dict(config['repositories']) if 'repositories' in config else {}
+        }
+    except Exception:
+        return {'build': {}, 'repositories': {}}
+
 def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None, include_any=False):
     """Load both x86_64 and target architecture packages in parallel"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -701,7 +914,10 @@ def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None,
     
     def load_arch_packages(urls, arch_suffix, arch_name):
         packages = load_packages_with_any(urls, arch_suffix, download=download, include_any=include_any)
-        print(f"Loaded {len(packages)} {arch_name} packages")
+        # Count unique pkgbase
+        pkgbase_count = len(set(pkg.get('basename', pkg['name']) for pkg in packages.values()))
+        any_note = "" if include_any else " (excluding ARCH=any)"
+        print(f"Loaded {len(packages)} {arch_name} packages ({pkgbase_count} pkgbase){any_note}")
         return packages
     
     with ThreadPoolExecutor(max_workers=2) as executor:

@@ -13,7 +13,7 @@ import shutil
 import argparse
 import signal
 from pathlib import Path
-from utils import BuildUtils, BUILD_ROOT, CACHE_PATH
+from utils import BuildUtils, BUILD_ROOT, CACHE_PATH, upload_packages, safe_command_execution
 
 # Special repository configuration
 GCC_REPO_URL = "https://gitlab.archlinux.org/solskogen/gcc.git"
@@ -183,7 +183,20 @@ class BootstrapBuilder(BuildUtils):
             
             # Upload to appropriate testing repository
             target_repo = "extra-testing" if pkg_name == "valgrind" else "core-testing"
-            self.upload_packages(pkg_dir, target_repo)
+            uploaded_count = upload_packages(pkg_dir, target_repo, self.dry_run)
+            print(f"Successfully uploaded {uploaded_count} packages to {target_repo}")
+            
+            # Clear pacman cache after successful build to force using newly uploaded packages
+            if not self.dry_run:
+                print("Clearing pacman cache to force using newly uploaded packages...")
+                cache_files = list(self.cache_path.glob("*.pkg.tar.*"))
+                for cache_file in cache_files:
+                    try:
+                        cache_file.unlink()
+                    except OSError:
+                        pass  # Ignore errors removing cache files
+                print(f"Cleared {len(cache_files)} cached packages")
+            
             return True
             
         except subprocess.CalledProcessError as e:
@@ -206,7 +219,10 @@ class BootstrapBuilder(BuildUtils):
                 continue
                 
             print(f"\n--- Building {pkg_name} ({i + 1}/{len(packages)}) ---")
-            self.bootstrap_build_package(pkg_name)
+            success = self.bootstrap_build_package(pkg_name)
+            if not success:
+                print(f"ERROR: Failed to build {pkg_name}")
+                sys.exit(1)
             built_count += 1
             print(f"✓ {pkg_name} built successfully")
         
@@ -407,10 +423,18 @@ class BootstrapBuilder(BuildUtils):
             total_built = 0
             
             # Stage 1: Initial build
-            total_built += self.build_stage("Stage 1 - Initial Build", STAGE1_PACKAGES, 1, 2)
+            stage1_built = self.build_stage("Stage 1 - Initial Build", STAGE1_PACKAGES, 1, 2)
+            if stage1_built == 0 and len(STAGE1_PACKAGES) > 0:
+                print("ERROR: Stage 1 failed - no packages were built")
+                sys.exit(1)
+            total_built += stage1_built
             
             # Stage 2: Final rebuild
-            total_built += self.build_stage("Stage 2 - Final Rebuild", STAGE2_PACKAGES, 2, 2)
+            stage2_built = self.build_stage("Stage 2 - Final Rebuild", STAGE2_PACKAGES, 2, 2)
+            if stage2_built == 0 and len(STAGE2_PACKAGES) > 0:
+                print("ERROR: Stage 2 failed - no packages were built")
+                sys.exit(1)
+            total_built += stage2_built
             
             print(f"\n=== Bootstrap Summary ===")
             print(f"Successfully built: {total_built} packages total")

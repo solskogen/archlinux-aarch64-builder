@@ -40,7 +40,7 @@ from utils import (
     PACKAGE_SKIP_FLAG, parse_pkgbuild_deps, parse_database_file, X86_64_MIRROR,
     PKGBUILDS_DIR, SEPARATOR_WIDTH, get_target_architecture,
     should_skip_package, compare_bin_package_versions, extract_packages, find_missing_dependencies,
-    load_packages_with_any, config, load_all_packages_parallel
+    load_packages_with_any, config, load_packages_unified, safe_command_execution
 )
 
 # ============================================================
@@ -190,15 +190,15 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
         return packages_to_build
         
     # Check if required tools are available
-    try:
-        subprocess.run(["pkgctl", "--version"], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    from utils import safe_command_execution
+    
+    if not safe_command_execution(["pkgctl", "--version"], "pkgctl version check", 
+                                 capture_output=True, exit_on_error=False):
         print("Error: pkgctl not found. Please install devtools package.")
         sys.exit(1)
     
-    try:
-        subprocess.run(["git", "--version"], capture_output=True, check=True)
-    except (subprocess.CalledProcessError, FileNotFoundError):
+    if not safe_command_execution(["git", "--version"], "git version check", 
+                                 capture_output=True, exit_on_error=False):
         print("Error: git not found. Please install git package.")
         sys.exit(1)
     
@@ -483,10 +483,30 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
                 skipped_packages.append(f"{basename} (bootstrap-only package - newer version available, run bootstrap script)")
             continue
             
-        should_include = False
-        target_version = "not found"
-        
-        if force_packages:
+        # For missing packages mode, skip all version comparison logic
+        if missing_packages_mode:
+            should_include = basename not in target_bases and basename not in target_provides
+            target_version = "not found"
+            
+            # Check if package depends on blacklisted packages
+            if should_include:
+                pkg_data = x86_data['pkg_data']
+                all_deps = pkg_data.get('depends', []) + pkg_data.get('makedepends', [])
+                
+                for dep in all_deps:
+                    # Strip version constraints from dependency name
+                    dep_name = dep.split('=')[0].split('<')[0].split('>')[0].split('>=')[0].split('<=')[0]
+                    
+                    # Check if dependency matches any blacklist pattern
+                    for pattern in blacklist:
+                        if fnmatch.fnmatch(dep_name, pattern):
+                            should_include = False
+                            skipped_packages.append(f"{basename} (depends on blacklisted package: {dep_name})")
+                            break
+                    
+                    if not should_include:
+                        break
+        elif force_packages:
             # When --packages is specified, check if any individual package name is requested
             should_include = (basename in force_packages or 
                             any(pkg_name in force_packages for pkg_name in x86_data['packages']))
@@ -509,9 +529,6 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
                         bin_package_warnings.append(f"INFO: {bin_pkg['name']} (provides {basename}={provided_version}) is newer than x86_64 {basename} ({x86_data['version']})")
                 should_include = False  # Don't build -bin packages
                 target_version = f"provided by {bin_pkg['name']}"
-        elif missing_packages_mode:
-            # Only include packages missing from target architecture
-            should_include = basename not in target_bases and basename not in target_provides
         elif basename in target_bases:
             # Compare basename versions using existing utility
             should_include = is_version_newer(target_bases[basename]['version'], x86_data['version'])
@@ -541,6 +558,16 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
                 should_include = False
         
         if should_include:
+            # Double-check blacklist before adding to results (safety check)
+            is_blacklisted = False
+            for pattern in blacklist:
+                if fnmatch.fnmatch(basename, pattern) or any(fnmatch.fnmatch(pkg_name, pattern) for pkg_name in x86_data['packages']):
+                    is_blacklisted = True
+                    break
+            
+            if is_blacklisted:
+                continue  # Skip blacklisted packages
+                
             pkg_data = x86_data['pkg_data'].copy()
             pkg_data['name'] = basename
             
@@ -553,11 +580,11 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
                 'name': basename,
                 'version': x86_data['version'],
                 'current_version': target_version,
-                'basename': pkg_data['basename'],
-                'repo': pkg_data['repo'],
-                'depends': pkg_data['depends'],
-                'makedepends': pkg_data['makedepends'],
-                'provides': pkg_data['provides'],
+                'basename': x86_data['pkg_data']['basename'],
+                'repo': x86_data['pkg_data']['repo'],
+                'depends': x86_data['pkg_data'].get('depends', []),
+                'makedepends': x86_data['pkg_data'].get('makedepends', []),
+                'provides': x86_data['pkg_data'].get('provides', []),
                 'force_latest': should_use_latest,
                 'use_aur': bool(basename in aur_packages),
             })
@@ -848,8 +875,8 @@ if __name__ == "__main__":
     x86_packages = {}
     if args.packages and not args.aur:
         print(f"Looking up versions for {len(args.packages)} specified packages...")
-        # Load packages using shared parallel function
-        all_x86_packages, target_packages = load_all_packages_parallel(download=not args.no_update)
+        # Load packages using unified function
+        all_x86_packages, target_packages = load_packages_unified(download=not args.no_update)
         
         # Filter to only requested packages for comparison, but keep full list for dependency resolution
         filtered_x86_packages = {}
@@ -910,10 +937,10 @@ if __name__ == "__main__":
         # Store full package list for dependency resolution
         full_x86_packages = all_x86_packages
     elif not args.aur:
-        # Load packages using shared parallel function
+        # Load packages using unified function
         print("Loading packages...")
         repo_filter = [args.rebuild_repo] if args.rebuild_repo else None
-        x86_packages, target_packages = load_all_packages_parallel(download=not args.no_update, x86_repos=repo_filter, target_repos=repo_filter)
+        x86_packages, target_packages = load_packages_unified(download=not args.no_update, x86_repos=repo_filter, target_repos=repo_filter)
         
         # Use same list for dependency resolution
         full_x86_packages = x86_packages
@@ -963,7 +990,7 @@ if __name__ == "__main__":
     
     # Report blacklisted missing packages
     if args.missing_packages and blacklisted_missing:
-        print(f"Found {len(newer_packages)} missing packages, {len(blacklisted_missing)} blacklisted: {' '.join(blacklisted_missing)}")
+        print(f"Found {len(newer_packages)} missing packages, {len(blacklisted_missing)} blacklisted")
     elif args.missing_packages:
         print(f"Found {len(newer_packages)} missing packages")
     
@@ -1067,15 +1094,53 @@ if __name__ == "__main__":
         else:
             print(f"Found {len(newer_packages)} packages")
     else:
-        print(f"Found {len(newer_packages)} packages where x86_64 is newer")
+        if args.missing_packages:
+            print(f"Found {len(newer_packages)} missing packages")
+        else:
+            print(f"Found {len(newer_packages)} packages where x86_64 is newer")
     
-    # Show version upgrades
+    # Categorize packages by version change type
     if newer_packages:
-        print("\nVersion upgrades:")
+        from utils import is_version_newer
+        
+        upgrades = []
+        rebuilds = []
+        downgrades = []
+        
         for pkg in newer_packages:
             current = pkg.get('current_version', 'unknown')
             new = pkg['version']
-            print(f"  {pkg['name']}: {current} → {new}")
+            
+            if current == 'unknown' or current == 'not found':
+                rebuilds.append(pkg)
+            elif current == new:
+                rebuilds.append(pkg)
+            elif is_version_newer(current, new):
+                upgrades.append(pkg)
+            else:
+                downgrades.append(pkg)
+        
+        # Show upgrades
+        if upgrades:
+            print("\nUpgrades:")
+            for pkg in upgrades:
+                current = pkg.get('current_version', 'unknown')
+                new = pkg['version']
+                print(f"  {pkg['name']}: {current} → {new}")
+        
+        # Show rebuilds
+        if rebuilds:
+            print("\nRebuilds:")
+            for pkg in rebuilds:
+                print(f"  {pkg['name']}: {pkg['version']}")
+        
+        # Show downgrades
+        if downgrades:
+            print("\nDowngrades:")
+            for pkg in downgrades:
+                current = pkg.get('current_version', 'unknown')
+                new = pkg['version']
+                print(f"  {pkg['name']}: {current} → {new}")
     
     if args.preserve_order and args.packages:
         print("Preserving command line order...")
