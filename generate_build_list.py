@@ -124,10 +124,29 @@ def get_provides_mapping():
 def write_results(packages, args):
     """Write results to packages_to_build.json"""
     print("Writing results to packages_to_build.json...")
+    
+    # Prepare packages for JSON output - use build dependencies instead of filtered ones
+    json_packages = []
+    for pkg in packages:
+        json_pkg = pkg.copy()
+        # Replace filtered dependencies with complete build dependencies
+        if 'build_depends' in pkg:
+            json_pkg['depends'] = pkg['build_depends']
+        if 'build_makedepends' in pkg:
+            json_pkg['makedepends'] = pkg['build_makedepends']
+        if 'build_checkdepends' in pkg:
+            json_pkg['checkdepends'] = pkg['build_checkdepends']
+        
+        # Remove internal fields
+        for key in ['build_depends', 'build_makedepends', 'build_checkdepends']:
+            json_pkg.pop(key, None)
+        
+        json_packages.append(json_pkg)
+    
     output_data = {
         "_command": " ".join(sys.argv),
         "_timestamp": datetime.datetime.now().isoformat(),
-        "packages": packages
+        "packages": json_packages
     }
     with open("packages_to_build.json", "w") as f:
         json.dump(output_data, f, indent=2)
@@ -168,7 +187,7 @@ def write_results(packages, args):
 
 
 
-def fetch_pkgbuild_deps(packages_to_build, no_update=False):
+def fetch_pkgbuild_deps(packages_to_build, no_update=False, provides_map=None):
     """
     Fetch PKGBUILDs for packages and extract complete dependency information.
     
@@ -336,7 +355,7 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
                     print(f"Git error: {e.stderr.strip()}")
         else:
             # Repository exists and is up to date
-            print(f"[{i}/{total}] Processing {name} (already up to date: {current_version or target_version})...")
+            print(f"[{i}/{total}] Processing {name} (PKGBUILD already up to date: {current_version or target_version})...")
         
         # Parse dependencies from existing PKGBUILD
         if pkgbuild_path.exists():
@@ -346,30 +365,32 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
     # Return combined list with blacklisted packages (unchanged) and fetched packages (with updated deps)
     all_packages = packages_to_fetch + blacklisted_packages
     
-    # Get provides mapping from upstream x86_64 databases
-    print("Loading provides mapping from upstream databases...")
-    provides_map = get_provides_mapping()
+    # Get provides mapping from upstream x86_64 databases (passed as parameter)
+    if provides_map is None:
+        provides_map = get_provides_mapping()
     
-    # Filter dependencies to only include packages that are in the build list
-    # This ensures we only consider build order between packages being built
+    # Create build list for dependency ordering (filtered dependencies)
     build_list_names = {pkg['name'] for pkg in all_packages}
     build_list_basenames = {pkg.get('basename', pkg['name']) for pkg in all_packages}
     
     for pkg in all_packages:
+        # Keep original dependencies for build system
+        pkg['build_depends'] = pkg.get('depends', []).copy()
+        pkg['build_makedepends'] = pkg.get('makedepends', []).copy() 
+        pkg['build_checkdepends'] = pkg.get('checkdepends', []).copy()
+        
+        # Filter dependencies for build ordering only
         for dep_type in ['depends', 'makedepends', 'checkdepends']:
             if dep_type in pkg:
-                # Only keep dependencies that are also being built
                 filtered_deps = []
-                
                 for dep in pkg[dep_type]:
                     dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
-                    # Keep dependency only if it's also in the build list
                     if (dep_name in build_list_names or 
                         dep_name in build_list_basenames or
                         (dep_name in provides_map and provides_map[dep_name] in build_list_basenames)):
                         filtered_deps.append(dep)
-                
                 pkg[dep_type] = filtered_deps
+    
     
     return all_packages
 
@@ -529,6 +550,8 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
                         bin_package_warnings.append(f"INFO: {bin_pkg['name']} (provides {basename}={provided_version}) is newer than x86_64 {basename} ({x86_data['version']})")
                 should_include = False  # Don't build -bin packages
                 target_version = f"provided by {bin_pkg['name']}"
+            else:
+                target_version = "not found"
         elif basename in target_bases:
             # Compare basename versions using existing utility
             should_include = is_version_newer(target_bases[basename]['version'], x86_data['version'])
@@ -588,29 +611,6 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
                 'force_latest': should_use_latest,
                 'use_aur': bool(basename in aur_packages),
             })
-    
-    # Find and add missing dependencies for all packages being built
-    if not missing_packages_mode and full_x86_packages:
-        missing_deps = find_missing_dependencies(newer_in_x86, full_x86_packages, target_packages)
-        for dep_name in missing_deps:
-            if dep_name in full_x86_packages:
-                pkg = full_x86_packages[dep_name]
-                basename = pkg['basename']
-                
-                # Check if basename is blacklisted
-                is_blacklisted = False
-                for pattern in blacklist:
-                    if fnmatch.fnmatch(basename, pattern):
-                        is_blacklisted = True
-                        break
-                
-                if not is_blacklisted and basename not in [p['name'] for p in newer_in_x86]:
-                    newer_in_x86.append({
-                        'name': basename,
-                        'force_latest': use_latest,
-                        'use_aur': False,
-                        **pkg
-                    })
     
     return newer_in_x86, skipped_packages, blacklisted_missing, bin_package_warnings
 
@@ -819,7 +819,7 @@ if __name__ == "__main__":
             })
         
         # Parse PKGBUILDs for dependencies
-        newer_packages = fetch_pkgbuild_deps(newer_packages, True)
+        newer_packages = fetch_pkgbuild_deps(newer_packages, True, provides_map)
         if args.preserve_order:
             newer_packages = preserve_package_order(newer_packages, args.packages)
         else:
@@ -860,7 +860,7 @@ if __name__ == "__main__":
             # Fetch PKGBUILDs and write results
             if newer_packages:
                 print("Processing PKGBUILDs for dependency information...")
-                newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update)
+                newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, provides_map)
             
             if args.preserve_order:
                 newer_packages = preserve_package_order(newer_packages, list(args.use_aur_for_packages))
@@ -938,7 +938,6 @@ if __name__ == "__main__":
         full_x86_packages = all_x86_packages
     elif not args.aur:
         # Load packages using unified function
-        print("Loading packages...")
         repo_filter = [args.rebuild_repo] if args.rebuild_repo else None
         x86_packages, target_packages = load_packages_unified(download=not args.no_update, x86_repos=repo_filter, target_repos=repo_filter)
         
@@ -983,38 +982,25 @@ if __name__ == "__main__":
         print("Ignoring blacklist (using --packages)")
     else:
         blacklist = load_blacklist(args.blacklist)
-        if blacklist:
-            print(f"Loaded blacklist with {len(blacklist)} packages")
     
+    # Load provides mapping once (doesn't change)
+    print("Loading provides mapping from upstream databases...")
+    provides_map = get_provides_mapping()
+    
+    # Stage 1: Find outdated packages using .db files (fast comparison)
     newer_packages, skipped_packages, blacklisted_missing, bin_package_warnings = compare_versions(x86_packages, target_packages, args.packages, blacklist, args.missing_packages, args.use_aur_for_packages, args.use_latest, full_x86_packages)
-    
-    # Report blacklisted missing packages
-    if args.missing_packages and blacklisted_missing:
-        print(f"Found {len(newer_packages)} missing packages, {len(blacklisted_missing)} blacklisted")
-    elif args.missing_packages:
-        print(f"Found {len(newer_packages)} missing packages")
-    
-    # Report -bin package warnings
-    if bin_package_warnings:
-        print("\n" + "="*SEPARATOR_WIDTH)
-        for warning in bin_package_warnings:
-            print(warning)
-        print("="*SEPARATOR_WIDTH)
     
     # Handle --rebuild-repo option
     if args.rebuild_repo:
         print(f"Rebuilding all packages from {args.rebuild_repo} repository...")
         repo_packages = []
-        # Exclude core toolchain packages that are handled by bootstrap_toolchain.py
         toolchain_packages = {'gcc', 'binutils', 'glibc'}
         
         for pkg_name, pkg_data in x86_packages.items():
             if pkg_data['repo'] == args.rebuild_repo:
-                # Skip core toolchain packages
                 if pkg_data['basename'] in toolchain_packages:
                     continue
                     
-                # Skip blacklisted packages
                 blacklist_reason = None
                 if blacklist:
                     for pattern in blacklist:
@@ -1040,10 +1026,117 @@ if __name__ == "__main__":
         newer_packages = repo_packages
         print(f"Found {len(newer_packages)} packages in {args.rebuild_repo} repository")
     
-    # Fetch PKGBUILDs for packages that need building to get complete dependency info (always enabled)
-    if newer_packages:
+    # Stage 2: Parse PKGBUILDs for complete dependency info and find missing deps
+    if newer_packages and not args.missing_packages:
+        print("Processing PKGBUILDs for complete dependency information...")
+        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, provides_map)
+        
+        if full_x86_packages:
+            print("Checking for missing dependencies (including checkdepends)...")
+            missing_deps = find_missing_dependencies(newer_packages, full_x86_packages, target_packages)
+            if missing_deps:
+                print(f"Found {len(missing_deps)} missing dependencies: {', '.join(sorted(missing_deps))}")
+                
+                # Track reasons for each missing dependency
+                dep_reasons = {}
+                for pkg in newer_packages:
+                    all_deps = pkg.get('build_depends', pkg.get('depends', [])) + pkg.get('build_makedepends', pkg.get('makedepends', []))
+                    if 'build_checkdepends' in pkg:
+                        all_deps += pkg['build_checkdepends']
+                    elif 'checkdepends' in pkg:
+                        all_deps += pkg['checkdepends']
+                    
+                    for dep in all_deps:
+                        dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
+                        if dep_name in missing_deps:
+                            if dep_name not in dep_reasons:
+                                dep_reasons[dep_name] = []
+                            
+                            # Determine dependency type
+                            if dep in pkg.get('build_checkdepends', pkg.get('checkdepends', [])):
+                                dep_type = "checkdepends"
+                            elif dep in pkg.get('build_makedepends', pkg.get('makedepends', [])):
+                                dep_type = "makedepends"
+                            else:
+                                dep_type = "depends"
+                            
+                            dep_reasons[dep_name].append(f"{dep_type} for {pkg['name']}")
+                
+                for dep_name in missing_deps:
+                    if dep_name in full_x86_packages:
+                        pkg = full_x86_packages[dep_name]
+                        basename = pkg['basename']
+                        
+                        is_blacklisted = False
+                        for pattern in blacklist:
+                            if fnmatch.fnmatch(basename, pattern):
+                                is_blacklisted = True
+                                break
+                        
+                        if not is_blacklisted and basename not in [p['name'] for p in newer_packages]:
+                            reason = ", ".join(dep_reasons.get(dep_name, ["unknown reason"]))
+                            newer_packages.append({
+                                'name': basename,
+                                'version': pkg['version'],
+                                'current_version': 'not found',
+                                'basename': pkg['basename'],
+                                'repo': pkg['repo'],
+                                'depends': pkg.get('depends', []),
+                                'makedepends': pkg.get('makedepends', []),
+                                'provides': pkg.get('provides', []),
+                                'force_latest': args.use_latest,
+                                'use_aur': False,
+                                'added_reason': reason,
+                            })
+                
+                # Parse PKGBUILDs only for newly added dependencies
+                added_deps = [dep_name for dep_name in missing_deps if dep_name in full_x86_packages]
+                if added_deps:
+                    # Create list of only the newly added packages
+                    new_packages = [pkg for pkg in newer_packages if pkg['name'] in added_deps]
+                    print("Processing PKGBUILDs for missing dependencies...")
+                    new_packages_with_deps = fetch_pkgbuild_deps(new_packages, args.no_update, provides_map)
+                    
+                    # Update the newer_packages list with the processed new packages
+                    for updated_pkg in new_packages_with_deps:
+                        for i, pkg in enumerate(newer_packages):
+                            if pkg['name'] == updated_pkg['name']:
+                                newer_packages[i] = updated_pkg
+                                break
+                    
+                    # Re-filter dependencies for all packages now that we have the complete list
+                    print("Re-filtering dependencies with complete package list...")
+                    build_list_names = {pkg['name'] for pkg in newer_packages}
+                    build_list_basenames = {pkg.get('basename', pkg['name']) for pkg in newer_packages}
+                    
+                    for pkg in newer_packages:
+                        # Filter dependencies for build ordering only
+                        for dep_type in ['depends', 'makedepends', 'checkdepends']:
+                            if dep_type in pkg:
+                                filtered_deps = []
+                                for dep in pkg.get(f'build_{dep_type}', pkg.get(dep_type, [])):
+                                    dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
+                                    if (dep_name in build_list_names or 
+                                        dep_name in build_list_basenames or
+                                        (dep_name in provides_map and provides_map[dep_name] in build_list_basenames)):
+                                        filtered_deps.append(dep)
+                                pkg[dep_type] = filtered_deps
+    elif newer_packages:
+        # For missing packages mode, still need PKGBUILD parsing
         print("Processing PKGBUILDs for dependency information...")
-        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update)
+        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, provides_map)
+    
+    # Report results
+    if args.missing_packages and blacklisted_missing:
+        print(f"Found {len(newer_packages)} missing packages, {len(blacklisted_missing)} blacklisted")
+    elif args.missing_packages:
+        print(f"Found {len(newer_packages)} missing packages")
+    
+    if bin_package_warnings:
+        print("\n" + "="*SEPARATOR_WIDTH)
+        for warning in bin_package_warnings:
+            print(warning)
+        print("="*SEPARATOR_WIDTH)
     
     # Check if any skipped packages are dependencies of packages being built
     if skipped_packages and newer_packages:
@@ -1097,7 +1190,18 @@ if __name__ == "__main__":
         if args.missing_packages:
             print(f"Found {len(newer_packages)} missing packages")
         else:
-            print(f"Found {len(newer_packages)} packages where x86_64 is newer")
+            # Count outdated vs new packages
+            outdated_count = len([pkg for pkg in newer_packages if pkg.get('current_version', 'unknown') not in ['not found', 'unknown']])
+            new_count = len([pkg for pkg in newer_packages if pkg.get('current_version') == 'not found'])
+            
+            if outdated_count > 0 and new_count > 0:
+                print(f"Found {outdated_count} packages where x86_64 is newer and {new_count} missing package{'s' if new_count != 1 else ''}.")
+            elif outdated_count > 0:
+                print(f"Found {outdated_count} packages where x86_64 is newer")
+            elif new_count > 0:
+                print(f"Found {new_count} missing package{'s' if new_count != 1 else ''}")
+            else:
+                print(f"Found {len(newer_packages)} packages")
     
     # Categorize packages by version change type
     if newer_packages:
@@ -1106,12 +1210,15 @@ if __name__ == "__main__":
         upgrades = []
         rebuilds = []
         downgrades = []
+        missing = []
         
         for pkg in newer_packages:
             current = pkg.get('current_version', 'unknown')
             new = pkg['version']
             
-            if current == 'unknown' or current == 'not found':
+            if current == 'not found':
+                missing.append(pkg)
+            elif current == 'unknown':
                 rebuilds.append(pkg)
             elif current == new:
                 rebuilds.append(pkg)
@@ -1127,6 +1234,16 @@ if __name__ == "__main__":
                 current = pkg.get('current_version', 'unknown')
                 new = pkg['version']
                 print(f"  {pkg['name']}: {current} → {new}")
+        
+        # Show missing packages
+        if missing:
+            print("\nNew packages:")
+            for pkg in missing:
+                reason = pkg.get('added_reason', '')
+                if reason:
+                    print(f"  {pkg['name']}: {pkg['version']} ({reason})")
+                else:
+                    print(f"  {pkg['name']}: {pkg['version']}")
         
         # Show rebuilds
         if rebuilds:
@@ -1168,8 +1285,6 @@ if __name__ == "__main__":
                 for pkg in sorted_packages:
                     if pkg.get('skip', 0) == 1:
                         print(f"  - {pkg['name']} ({pkg.get('blacklist_reason', 'blacklisted')})")
-            if skipped_packages:
-                print(f"Skipped {len(skipped_packages)} total blacklisted packages")
     
     print("Keeping downloaded database files...")
     
@@ -1193,5 +1308,4 @@ if __name__ == "__main__":
             print(f"  ./build_packages.py --bootstrap-toolchain")
             print(f"{'='*60}")
     
-    buildable_count = len([pkg for pkg in sorted_packages if pkg.get('skip', 0) != 1])
-    print(f"Complete! Found {buildable_count} packages to update.")
+    print("Complete!")

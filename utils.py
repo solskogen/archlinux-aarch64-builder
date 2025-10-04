@@ -727,8 +727,11 @@ def find_missing_dependencies(packages, x86_packages, target_packages):
             target_provides[provide_name] = pkg
     
     for pkg in packages:
-        all_deps = pkg['depends'] + pkg['makedepends']
-        if 'checkdepends' in pkg:
+        # Use build dependencies (complete, unfiltered) for missing dependency detection
+        all_deps = pkg.get('build_depends', pkg.get('depends', [])) + pkg.get('build_makedepends', pkg.get('makedepends', []))
+        if 'build_checkdepends' in pkg:
+            all_deps += pkg['build_checkdepends']
+        elif 'checkdepends' in pkg:
             all_deps += pkg['checkdepends']
             
         for dep in all_deps:
