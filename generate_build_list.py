@@ -314,7 +314,30 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False, provides_map=None):
             try:
                 if pkg.get('force_latest', False):
                     print(f"[{i}/{total}] Processing {name} (updating to latest commit)...")
+                    # Ensure we're on main branch before pulling
+                    subprocess.run(["git", "checkout", "main"], cwd=pkg_repo_dir, check=True, capture_output=True)
                     subprocess.run(["git", "pull"], cwd=pkg_repo_dir, check=True, capture_output=True)
+                    
+                    # Re-read version after git pull for --use-latest
+                    try:
+                        with open(pkgbuild_path, 'r') as f:
+                            content = f.read()
+                            pkgver_match = re.search(r'^pkgver=(.+)$', content, re.MULTILINE)
+                            pkgrel_match = re.search(r'^pkgrel=(.+)$', content, re.MULTILINE)
+                            epoch_match = re.search(r'^epoch=(.+)$', content, re.MULTILINE)
+                            
+                            if pkgver_match and pkgrel_match:
+                                pkgver = pkgver_match.group(1).strip('\'"')
+                                pkgrel = pkgrel_match.group(1).strip('\'"')
+                                epoch = epoch_match.group(1).strip('\'"') if epoch_match else None
+                                
+                                if not ('${' in pkgver or '$(' in pkgver):
+                                    if epoch:
+                                        pkg['version'] = f"{epoch}:{pkgver}-{pkgrel}"
+                                    else:
+                                        pkg['version'] = f"{pkgver}-{pkgrel}"
+                    except Exception:
+                        pass  # Keep original version if parsing fails
                 else:
                     if current_version:
                         print(f"[{i}/{total}] Processing {name} (updating {current_version} -> {target_version})...")
@@ -373,6 +396,19 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False, provides_map=None):
     build_list_names = {pkg['name'] for pkg in all_packages}
     build_list_basenames = {pkg.get('basename', pkg['name']) for pkg in all_packages}
     
+    # Build provides mapping from packages in the build list
+    build_list_provides = {}
+    for pkg in all_packages:
+        pkg_name = pkg['name']
+        basename = pkg.get('basename', pkg_name)
+        # Package provides itself
+        build_list_provides[pkg_name] = basename
+        build_list_provides[basename] = basename
+        # Add explicit provides
+        for provide in pkg.get('provides', []):
+            provide_name = provide.split('=')[0]
+            build_list_provides[provide_name] = basename
+    
     for pkg in all_packages:
         # Keep original dependencies for build system
         pkg['build_depends'] = pkg.get('depends', []).copy()
@@ -387,6 +423,7 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False, provides_map=None):
                     dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
                     if (dep_name in build_list_names or 
                         dep_name in build_list_basenames or
+                        dep_name in build_list_provides or
                         (dep_name in provides_map and provides_map[dep_name] in build_list_basenames)):
                         filtered_deps.append(dep)
                 pkg[dep_type] = filtered_deps
@@ -654,6 +691,17 @@ def sort_by_build_order(packages):
     # Create package name to package mapping
     pkg_map = {pkg['name']: pkg for pkg in packages}
     
+    # Build provides mapping from packages in the build list
+    build_list_provides = {}
+    for pkg in packages:
+        pkg_name = pkg['name']
+        basename = pkg.get('basename', pkg_name)
+        build_list_provides[pkg_name] = pkg_name
+        build_list_provides[basename] = basename
+        for provide in pkg.get('provides', []):
+            provide_name = provide.split('=')[0]
+            build_list_provides[provide_name] = pkg_name
+    
     # Build dependency graph - only consider packages in our build list
     graph = defaultdict(set)  # pkg -> set of packages that depend on it
     in_degree = defaultdict(int)  # pkg -> number of dependencies
@@ -676,9 +724,16 @@ def sort_by_build_order(packages):
             # Extract package name (remove version constraints)
             dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
             
+            # Resolve provides relationships
+            provider_pkg = None
+            if dep_name in pkg_map:
+                provider_pkg = dep_name
+            elif dep_name in build_list_provides:
+                provider_pkg = build_list_provides[dep_name]
+            
             # Only create edge if dependency is also in our build list
-            if dep_name in pkg_map and dep_name != pkg_name:
-                graph[dep_name].add(pkg_name)
+            if provider_pkg and provider_pkg in pkg_map and provider_pkg != pkg_name:
+                graph[provider_pkg].add(pkg_name)
                 in_degree[pkg_name] += 1
     
     # Topological sort using Kahn's algorithm
@@ -1109,6 +1164,17 @@ if __name__ == "__main__":
                     build_list_names = {pkg['name'] for pkg in newer_packages}
                     build_list_basenames = {pkg.get('basename', pkg['name']) for pkg in newer_packages}
                     
+                    # Build provides mapping from packages in the build list
+                    build_list_provides = {}
+                    for pkg in newer_packages:
+                        pkg_name = pkg['name']
+                        basename = pkg.get('basename', pkg_name)
+                        build_list_provides[pkg_name] = basename
+                        build_list_provides[basename] = basename
+                        for provide in pkg.get('provides', []):
+                            provide_name = provide.split('=')[0]
+                            build_list_provides[provide_name] = basename
+                    
                     for pkg in newer_packages:
                         # Filter dependencies for build ordering only
                         for dep_type in ['depends', 'makedepends', 'checkdepends']:
@@ -1118,6 +1184,7 @@ if __name__ == "__main__":
                                     dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
                                     if (dep_name in build_list_names or 
                                         dep_name in build_list_basenames or
+                                        dep_name in build_list_provides or
                                         (dep_name in provides_map and provides_map[dep_name] in build_list_basenames)):
                                         filtered_deps.append(dep)
                                 pkg[dep_type] = filtered_deps
