@@ -561,19 +561,21 @@ echo "CHECKDEPENDS_END"
             print(f"ERROR: {e}")
             return False
         
+        build_success = False
         try:
             # Prepare build environment
             self._prepare_build_environment(temp_copy_path, pkg_name, pkg_dir)
             
             # Execute build
-            return self._execute_build(pkg_name, pkg_data, temp_copy_path, pkg_dir)
+            build_success = self._execute_build(pkg_name, pkg_data, temp_copy_path, pkg_dir)
+            return build_success
             
         except Exception as e:
             error_msg = BuildError.format_setup_failure(pkg_name, str(e))
             print(error_msg)
             return False
         finally:
-            self._cleanup_temp_chroot(temp_copy_path)
+            self._cleanup_temp_chroot(temp_copy_path, not build_success)
             
             # Clean up lock files
             for lock_file in self.chroot_path.glob("*.lock"):
@@ -582,11 +584,11 @@ echo "CHECKDEPENDS_END"
                 except Exception as e:
                     print(f"Warning: Failed to remove lock file {lock_file}: {e}")
 
-    def _cleanup_temp_chroot(self, temp_copy_path):
+    def _cleanup_temp_chroot(self, temp_copy_path, build_failed=False):
         """Clean up temporary chroot"""
         if temp_copy_path in self.temp_copies:
             should_cleanup = True
-            if self.stop_on_failure or self.preserve_chroot:
+            if self.preserve_chroot or (self.stop_on_failure and build_failed):
                 should_cleanup = False
                 print(f"Preserving temporary chroot: {temp_copy_path}")
             
