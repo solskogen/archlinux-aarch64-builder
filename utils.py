@@ -235,6 +235,23 @@ echo "CHECKDEPENDS_END"
 echo "PROVIDES_START"
 printf '%s\\n' "${{provides[@]}}"
 echo "PROVIDES_END"
+
+# Extract provides from split package functions
+for pkg in "${{pkgname[@]}}"; do
+    if declare -f "package_$pkg" >/dev/null 2>&1; then
+        echo "SPLIT_PROVIDES_START:$pkg"
+        # Create a temporary function that sets provides and prints it
+        eval "
+        temp_package_$pkg() {{
+            local provides=()
+            $(declare -f "package_$pkg" | sed '1d;$d')
+            printf '%s\\n' \\"\\${{provides[@]}}\\"
+        }}
+        "
+        "temp_package_$pkg" 2>/dev/null || true
+        echo "SPLIT_PROVIDES_END:$pkg"
+    fi
+done
 """
         
         result = subprocess.run(['bash', '-c', temp_script], 
@@ -242,6 +259,7 @@ echo "PROVIDES_END"
         if result.returncode == 0:
             output = result.stdout
             current_section = None
+            current_split_pkg = None
             
             for line in output.split('\n'):
                 line = line.strip()
@@ -261,8 +279,18 @@ echo "PROVIDES_END"
                     current_section = "provides"
                 elif line == "PROVIDES_END":
                     current_section = None
+                elif line.startswith("SPLIT_PROVIDES_START:"):
+                    current_split_pkg = line.split(":", 1)[1]
+                    current_section = "split_provides"
+                elif line.startswith("SPLIT_PROVIDES_END:"):
+                    current_split_pkg = None
+                    current_section = None
                 elif line and current_section:
-                    deps[current_section].append(line)
+                    if current_section == "split_provides":
+                        # Add split package provides to main provides list
+                        deps["provides"].append(line)
+                    else:
+                        deps[current_section].append(line)
         else:
             print(f"Warning: Failed to parse PKGBUILD with bash: {result.stderr}")
         

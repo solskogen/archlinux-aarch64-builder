@@ -8,7 +8,9 @@ The system automatically maintains ports of Arch Linux for multiple architecture
 1. Comparing package versions between x86_64 and target architecture repositories
 2. Identifying outdated packages and missing dependencies
 3. Building packages in correct dependency order using clean chroot environments
-4. Uploading built packages to testing repositories
+4. **Detecting and resolving circular dependencies with two-stage builds**
+5. **Propagating build failures to prevent linking against outdated dependencies**
+6. Uploading built packages to testing repositories
 
 ## Core Components
 
@@ -250,14 +252,19 @@ The system automatically maintains ports of Arch Linux for multiple architecture
 ### Build Flow
 1. Read JSON package list
 2. Setup chroot environment
-3. For each package:
+3. **Build provides mapping for dependency failure propagation**
+4. For each package:
+   - **Check if package should be skipped due to failed dependencies**
+   - **Handle cycle stage transitions (Stage 1 → Stage 2)**
    - Create temporary chroot copy
    - Install dependencies
    - Parse PKGBUILD for runtime dependency extraction
    - Build with makechrootpkg
    - Upload to testing repository
+   - **Clear built packages from cache to prevent stale/corrupted packages**
    - Clean up temporary chroot
-4. Handle failures and interruptions gracefully
+5. **Track cycle stage 1 successes for proper continue functionality**
+6. Handle failures and interruptions gracefully
 
 ### Repository Structure
 - **Official packages**: `https://gitlab.archlinux.org/archlinux/packaging/packages/{name}.git`
@@ -300,9 +307,11 @@ Makepkg configuration with build settings (MAKEFLAGS, etc.)
 ### Topological Sort for Build Order
 1. Build dependency graph from package metadata
 2. Handle provides relationships for virtual dependencies
-3. Calculate build stages using recursive depth-first search
-4. Break circular dependencies gracefully
-5. Assign sequential build_stage numbers
+3. **Use Tarjan's algorithm to detect strongly connected components (cycles)**
+4. **Create two-stage builds for cycle packages: Stage 1 (initial) and Stage 2 (final)**
+5. **Assign cycle_group and cycle_stage metadata to cycle packages**
+6. Calculate build stages using recursive depth-first search
+7. Assign sequential build_stage numbers
 
 ### Version Comparison Algorithm
 1. Split epoch from version string
@@ -314,10 +323,14 @@ Makepkg configuration with build settings (MAKEFLAGS, etc.)
 
 ### Dependency Resolution
 1. Parse PKGBUILD using bash sourcing for variable expansion
-2. Extract depends, makedepends, checkdepends arrays
-3. Filter to only include packages in current build list
-4. Build provides mapping for virtual dependencies
-5. Clean up version constraints from dependency names
+2. Extract depends, makedepends, checkdepends arrays from both global and split package functions
+3. Preserve provides information from upstream databases and merge with PKGBUILD provides
+4. Filter to only include packages in current build list
+5. Build provides mapping for virtual dependencies
+6. Clean up version constraints from dependency names
+7. **Use Tarjan's algorithm to detect strongly connected components (cycles)**
+8. **Create two-stage builds for cycle packages (Stage 1 and Stage 2)**
+9. **Implement dependency failure propagation to skip dependent packages when dependencies fail**
 
 ### Chroot Management
 1. Create base chroot with mkarchroot if needed
@@ -340,6 +353,8 @@ Makepkg configuration with build settings (MAKEFLAGS, etc.)
 - Save detailed build logs with timestamps
 - Support repackaging without full rebuild
 - Continue from last successful package
+- **Dependency failure propagation: Skip packages when dependencies fail**
+- **Automatic cache clearing after successful builds to prevent stale packages**
 
 ### Network Issues
 - Retry downloads with wget

@@ -292,7 +292,18 @@ class TestDependencyResolution:
         # Should not hang or crash
         try:
             sorted_packages = sort_by_build_order(packages)
-            assert len(sorted_packages) == 2, "Circular dependency handling failed"
+            # Expect 4 packages: 2 cycle packages × 2 stages each
+            assert len(sorted_packages) == 4, f"Expected 4 packages (2 cycles × 2 stages), got {len(sorted_packages)}"
+            
+            # Verify cycle structure
+            cycle_packages = [pkg for pkg in sorted_packages if pkg.get('cycle_group') is not None]
+            assert len(cycle_packages) == 4, "All packages should be in cycle"
+            
+            # Verify stages
+            stage1_packages = [pkg for pkg in cycle_packages if pkg.get('cycle_stage') == 1]
+            stage2_packages = [pkg for pkg in cycle_packages if pkg.get('cycle_stage') == 2]
+            assert len(stage1_packages) == 2, "Should have 2 stage 1 packages"
+            assert len(stage2_packages) == 2, "Should have 2 stage 2 packages"
         except Exception as e:
             pytest.fail(f"Circular dependency caused crash: {e}")
 
@@ -980,7 +991,8 @@ class TestEdgeCases:
         ]
         
         result = sort_by_build_order(circular_packages)
-        assert len(result) == 3, "Circular dependencies should be handled"
+        # Expect 6 packages: 3 cycle packages × 2 stages each
+        assert len(result) == 6, f"Expected 6 packages (3 cycles × 2 stages), got {len(result)}"
     
     def test_version_comparison_edge_cases(self):
         """Version comparison edge cases should be handled correctly"""
@@ -1369,7 +1381,8 @@ class TestEdgeCases:
         ]
         
         result = sort_by_build_order(circular_packages)
-        assert len(result) == 3, "Circular dependencies should be handled"
+        # Expect 6 packages: 3 cycle packages × 2 stages each
+        assert len(result) == 6, f"Expected 6 packages (3 cycles × 2 stages), got {len(result)}"
     
     def test_version_comparison_edge_cases(self):
         """Version comparison edge cases should be handled correctly"""

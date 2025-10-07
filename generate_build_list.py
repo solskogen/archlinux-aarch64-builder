@@ -383,7 +383,13 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False, provides_map=None):
         # Parse dependencies from existing PKGBUILD
         if pkgbuild_path.exists():
             deps = parse_pkgbuild_deps(pkgbuild_path)
+            # Preserve original provides information from database
+            original_provides = pkg.get('provides', [])
             pkg.update(deps)
+            # Merge provides: keep original + add any new ones from PKGBUILD
+            pkgbuild_provides = deps.get('provides', [])
+            all_provides = list(set(original_provides + pkgbuild_provides))
+            pkg['provides'] = all_provides
     
     # Return combined list with blacklisted packages (unchanged) and fetched packages (with updated deps)
     all_packages = packages_to_fetch + blacklisted_packages
@@ -682,9 +688,51 @@ def preserve_package_order(packages, ordered_names):
     
     return ordered_packages
 
+def find_strongly_connected_components(graph):
+    """
+    Find strongly connected components using Tarjan's algorithm.
+    Returns list of SCCs, each SCC is a list of nodes.
+    """
+    index_counter = [0]
+    stack = []
+    lowlinks = {}
+    index = {}
+    on_stack = {}
+    sccs = []
+    
+    def strongconnect(node):
+        index[node] = index_counter[0]
+        lowlinks[node] = index_counter[0]
+        index_counter[0] += 1
+        stack.append(node)
+        on_stack[node] = True
+        
+        for successor in graph.get(node, []):
+            if successor not in index:
+                strongconnect(successor)
+                lowlinks[node] = min(lowlinks[node], lowlinks[successor])
+            elif on_stack.get(successor, False):
+                lowlinks[node] = min(lowlinks[node], index[successor])
+        
+        if lowlinks[node] == index[node]:
+            component = []
+            while True:
+                w = stack.pop()
+                on_stack[w] = False
+                component.append(w)
+                if w == node:
+                    break
+            sccs.append(component)
+    
+    for node in graph:
+        if node not in index:
+            strongconnect(node)
+    
+    return sccs
+
 def sort_by_build_order(packages):
     """
-    Sort packages by dependency order using simple topological sort.
+    Sort packages by dependency order using topological sort with proper cycle detection.
     """
     from collections import defaultdict, deque
     
@@ -704,6 +752,7 @@ def sort_by_build_order(packages):
     
     # Build dependency graph - only consider packages in our build list
     graph = defaultdict(set)  # pkg -> set of packages that depend on it
+    reverse_graph = defaultdict(set)  # pkg -> set of packages it depends on
     in_degree = defaultdict(int)  # pkg -> number of dependencies
     
     # Initialize in_degree for all packages
@@ -734,70 +783,122 @@ def sort_by_build_order(packages):
             # Only create edge if dependency is also in our build list
             if provider_pkg and provider_pkg in pkg_map and provider_pkg != pkg_name:
                 graph[provider_pkg].add(pkg_name)
+                reverse_graph[pkg_name].add(provider_pkg)
                 in_degree[pkg_name] += 1
     
-    # Topological sort using Kahn's algorithm
+    # Find strongly connected components (cycles)
+    sccs = find_strongly_connected_components(reverse_graph)
+    
+    # Identify actual cycles (SCCs with more than one node or self-loops)
+    cycles = []
+    cycle_map = {}  # pkg_name -> cycle_id
+    
+    for scc in sccs:
+        if len(scc) > 1 or (len(scc) == 1 and scc[0] in reverse_graph.get(scc[0], set())):
+            cycle_id = len(cycles)
+            cycles.append(scc)
+            for pkg_name in scc:
+                cycle_map[pkg_name] = cycle_id
+    
+    # Process cycles first, then regular packages
     result = []
-    queue = deque()
-    
-    # Find all packages with no dependencies
-    for pkg_name in pkg_map:
-        if in_degree[pkg_name] == 0:
-            queue.append((pkg_name, 0))  # (package_name, stage)
-    
     current_stage = 0
+    processed_packages = set()
     
-    while queue:
-        # Process all packages at current stage level
-        next_queue = deque()
-        stage_packages = []
-        
-        # Get all packages that can be built at current stage
-        while queue:
-            pkg_name, stage = queue.popleft()
-            if stage == current_stage:
-                stage_packages.append(pkg_name)
-            else:
-                next_queue.append((pkg_name, stage))
-        
-        # If no packages at current stage, move to next stage
-        if not stage_packages:
-            current_stage += 1
-            queue = next_queue
-            continue
-        
-        # Add packages at current stage to result
-        for pkg_name in stage_packages:
+    # Process all cycles first
+    for cycle_id, cycle_pkgs in enumerate(cycles):
+        # Add first build of cycle packages
+        for pkg_name in cycle_pkgs:
             pkg = pkg_map[pkg_name].copy()
             pkg['build_stage'] = current_stage
-            pkg['cycle_group'] = None
-            pkg['cycle_stage'] = None
+            pkg['cycle_group'] = cycle_id
+            pkg['cycle_stage'] = 1
             result.append(pkg)
-            
-            # Remove this package from graph and update in_degrees
-            for dependent in graph[pkg_name]:
-                in_degree[dependent] -= 1
-                if in_degree[dependent] == 0:
-                    next_queue.append((dependent, current_stage + 1))
+            processed_packages.add(pkg_name)
         
-        # Move to next stage
-        current_stage += 1
-        queue = next_queue
+        # Add second build of cycle packages
+        for pkg_name in cycle_pkgs:
+            pkg = pkg_map[pkg_name].copy()
+            pkg['build_stage'] = current_stage + 1
+            pkg['cycle_group'] = cycle_id
+            pkg['cycle_stage'] = 2
+            result.append(pkg)
+        
+        current_stage += 2
     
-    # Handle any remaining packages (cycles) - put them at the end
-    remaining_packages = []
-    for pkg in packages:
-        if not any(p['name'] == pkg['name'] for p in result):
-            pkg_copy = pkg.copy()
-            pkg_copy['build_stage'] = current_stage
-            pkg_copy['cycle_group'] = 0
-            pkg_copy['cycle_stage'] = 1
-            remaining_packages.append(pkg_copy)
+    # Now process remaining packages with topological sort
+    remaining_packages = [pkg for pkg in packages if pkg['name'] not in processed_packages]
+    if remaining_packages:
+        # Build new graph without cycle packages
+        remaining_graph = defaultdict(set)
+        remaining_in_degree = defaultdict(int)
+        
+        for pkg in remaining_packages:
+            remaining_in_degree[pkg['name']] = 0
+        
+        for pkg in remaining_packages:
+            pkg_name = pkg['name']
+            all_deps = []
+            for dep_type in ['depends', 'makedepends', 'checkdepends']:
+                all_deps.extend(pkg.get(dep_type, []))
+            
+            for dep_str in all_deps:
+                dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+                provider_pkg = None
+                if dep_name in pkg_map:
+                    provider_pkg = dep_name
+                elif dep_name in build_list_provides:
+                    provider_pkg = build_list_provides[dep_name]
+                
+                # Create edge if dependency is in remaining packages OR was in a cycle (already built)
+                if provider_pkg and provider_pkg in pkg_map and provider_pkg != pkg_name:
+                    if provider_pkg in processed_packages:
+                        # Dependency was in a cycle, already satisfied
+                        continue
+                    elif any(p['name'] == provider_pkg for p in remaining_packages):
+                        # Dependency is in remaining packages
+                        remaining_graph[provider_pkg].add(pkg_name)
+                        remaining_in_degree[pkg_name] += 1
+        
+        # Topological sort for remaining packages
+        queue = deque()
+        for pkg in remaining_packages:
+            if remaining_in_degree[pkg['name']] == 0:
+                queue.append((pkg['name'], current_stage))
+        
+        while queue:
+            next_queue = deque()
+            stage_packages = []
+            
+            while queue:
+                pkg_name, stage = queue.popleft()
+                if stage == current_stage:
+                    stage_packages.append(pkg_name)
+                else:
+                    next_queue.append((pkg_name, stage))
+            
+            if not stage_packages:
+                current_stage += 1
+                queue = next_queue
+                continue
+            
+            for pkg_name in stage_packages:
+                pkg = pkg_map[pkg_name].copy()
+                pkg['build_stage'] = current_stage
+                pkg['cycle_group'] = None
+                pkg['cycle_stage'] = None
+                result.append(pkg)
+                
+                for dependent in remaining_graph[pkg_name]:
+                    remaining_in_degree[dependent] -= 1
+                    if remaining_in_degree[dependent] == 0:
+                        next_queue.append((dependent, current_stage + 1))
+            
+            current_stage += 1
+            queue = next_queue
     
-    result.extend(remaining_packages)
-    
-    # Sort by build stage
-    return sorted(result, key=lambda x: (x['build_stage'], x['name']))
+    # Sort by build stage, then by cycle stage, then by name
+    return sorted(result, key=lambda x: (x['build_stage'], x.get('cycle_stage') or 0, x['name']))
 
 if __name__ == "__main__":
     # Clean up state from previous builds

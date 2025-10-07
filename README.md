@@ -42,9 +42,11 @@ The target architecture is automatically detected from `chroot-config/makepkg.co
 - **Clean Chroot Builds**: Uses `makechrootpkg` with isolated build environments
 - **Cross-Architecture**: Builds x86_64 packages on target architecture using `--ignorearch`
 - **Test Dependencies**: Automatically handles `checkdepends` using temporary chroot copies when `!check` is used
-- **Dependency Management**: Builds packages in topological dependency order
+- **Dependency Management**: Builds packages in topological dependency order with advanced cycle detection
+- **Circular Dependency Handling**: Uses Tarjan's algorithm to detect and resolve dependency cycles with two-stage builds
+- **Dependency Failure Propagation**: Automatically skips packages when their dependencies fail to prevent linking against outdated versions
 - **S3 Integration**: Uploads built packages to hosted staging repository
-- **Configurable Cache**: Custom pacman cache directory for build optimization
+- **Configurable Cache**: Custom pacman cache directory for build optimization with automatic cleanup
 - **Bootstrap Mode**: Clears cache after uploads to force using newly uploaded packages
 - **State Repository**: Uses Arch Linux state repository for fast package information
 - **Repository Consistency**: Detects and reports packages that exist in both core and extra (error condition)
@@ -463,10 +465,12 @@ The `repo_analyze.py` script provides comprehensive analysis:
 
 ## Build Order
 
-Packages are sorted using topological sort to ensure:
+Packages are sorted using topological sort with advanced cycle detection to ensure:
 - Dependencies are built before dependent packages
 - Packages providing virtual dependencies come first
-- Circular dependencies are handled gracefully
+- **Circular dependencies are detected using Tarjan's algorithm**
+- **Cycles are resolved with two-stage builds (Stage 1 and Stage 2)**
+- **Packages depending on cycle members wait until the cycle is fully resolved**
 - Safe sequential building without conflicts
 
 ## No-Cache Mode
@@ -887,12 +891,14 @@ The `build_packages.py` script:
 - Uploads to correct testing repository:
   - Core packages → `core-testing`
   - Extra packages → `extra-testing`
+- **Clears built packages from cache after successful upload** to prevent stale/corrupted cache issues
 - Preserves PKGBUILDs in `./pkgbuilds/` after successful builds
 - Saves failed packages to `failed_packages.json` for retry
 - Bootstrap mode: Clears pacman cache after each successful upload to force using newly uploaded packages
 - Automatic log rotation: Keeps only the 3 most recent build logs per package with timestamps
 - Imports GPG keys from `keys/pgp/` directory if present
 - Signal handling: Properly cleans up temporary chroot copies on interruption
+- **Dependency failure propagation**: Skips packages when their dependencies fail to prevent linking against outdated versions
 
 ## Build Order
 

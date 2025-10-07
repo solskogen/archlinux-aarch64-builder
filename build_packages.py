@@ -325,6 +325,10 @@ echo "CHECKDEPENDS_END"
             target_repo = f"{pkg_data.get('repo', 'extra')}-testing"
             uploaded_count = upload_packages(pkg_dir, target_repo, self.dry_run)
             print(f"Successfully uploaded {uploaded_count} packages to {target_repo}")
+            
+            # Clear built packages from cache to prevent stale/corrupted cache issues
+            if not self.dry_run:
+                self._clear_cycle_packages_from_cache(pkg_name, pkg_dir)
         
         print(f"Successfully built {pkg_name}")
         self._update_last_successful(pkg_name)
@@ -365,6 +369,36 @@ echo "CHECKDEPENDS_END"
             except Exception as e:
                 print(f"Warning: Failed to clear cache: {e}")
 
+    def _should_skip_due_to_failed_dependencies(self, pkg, failed_packages, provides_map):
+        """Check if package should be skipped due to failed dependencies"""
+        if not failed_packages:
+            return False, []
+        
+        failed_names = {fp['name'] for fp in failed_packages}
+        
+        # Check all dependencies
+        all_deps = []
+        for dep_type in ['depends', 'makedepends', 'checkdepends']:
+            all_deps.extend(pkg.get(dep_type, []))
+        
+        failed_deps = []
+        for dep_str in all_deps:
+            # Extract package name (remove version constraints)
+            dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+            
+            # Check direct dependency
+            if dep_name in failed_names:
+                failed_deps.append(dep_name)
+                continue
+            
+            # Check provides relationships
+            if dep_name in provides_map:
+                provider = provides_map[dep_name]
+                if provider in failed_names:
+                    failed_deps.append(f"{dep_name} (provided by {provider})")
+        
+        return len(failed_deps) > 0, failed_deps
+
     def build_packages(self, packages_file, blacklist_file=None, continue_build=False):
         """Build all packages from JSON file"""
         # Load packages
@@ -383,6 +417,15 @@ echo "CHECKDEPENDS_END"
                 packages, filtered_count = filter_blacklisted_packages(packages, blacklist)
                 if filtered_count > 0:
                     print(f"Filtered out {filtered_count} blacklisted packages")
+        
+        # Build provides mapping for dependency checking
+        provides_map = {}
+        for pkg in packages:
+            pkg_name = pkg['name']
+            provides_map[pkg_name] = pkg_name  # Self-reference
+            for provide in pkg.get('provides', []):
+                provide_name = provide.split('=')[0].strip()
+                provides_map[provide_name] = pkg_name
         
         # Filter out packages with skip=1
         packages = [pkg for pkg in packages if not pkg.get('skip', 0) == PACKAGE_SKIP_FLAG]
@@ -440,6 +483,18 @@ echo "CHECKDEPENDS_END"
         current_cycle_group = None
         cycle_stage_1_success = {}  # Track which packages succeeded in stage 1 of each cycle
         
+        # When continuing, populate cycle_stage_1_success with packages that were already built
+        if continue_build:
+            last_successful_index = self._find_last_successful_package(packages)
+            if last_successful_index is not None:
+                for pkg in packages[:last_successful_index + 1]:
+                    cycle_group = pkg.get('cycle_group')
+                    cycle_stage = pkg.get('cycle_stage')
+                    if cycle_group is not None and cycle_stage == 1:
+                        if cycle_group not in cycle_stage_1_success:
+                            cycle_stage_1_success[cycle_group] = set()
+                        cycle_stage_1_success[cycle_group].add(pkg['name'])
+        
         # Build cycle info map for display
         cycle_info = {}
         for pkg in packages:
@@ -468,15 +523,16 @@ echo "CHECKDEPENDS_END"
                         failed_packages.append(pkg)
                         continue
                     
-                    # Clear cache before stage 2 of cycle
-                    if current_cycle_group != cycle_group:
-                        print(f"\nClearing cache before {cycle_desc} Stage 2...")
-                        self._clear_cache()
-                        current_cycle_group = cycle_group
-                    
                     print(f"\n[{i}/{len(packages)}] Building {pkg_name} ({cycle_desc}, Stage 2/2)")
             else:
                 print(f"\n[{i}/{len(packages)}] Building {pkg_name}")
+            
+            # Check if package should be skipped due to failed dependencies
+            should_skip, failed_deps = self._should_skip_due_to_failed_dependencies(pkg, failed_packages, provides_map)
+            if should_skip:
+                print(f"Skipping {pkg_name} - depends on failed packages: {', '.join(failed_deps)}")
+                failed_packages.append(pkg)
+                continue
             
             try:
                 if self.build_package(pkg_name, pkg):
@@ -521,6 +577,53 @@ echo "CHECKDEPENDS_END"
             print("Failed packages:")
             for pkg in failed_packages:
                 print(f"  - {pkg['name']}")
+
+    def _get_package_names_from_pkgbuild(self, pkg_dir):
+        """Extract all package names that will be built from PKGBUILD"""
+        try:
+            pkgbuild_path = pkg_dir / "PKGBUILD"
+            if not pkgbuild_path.exists():
+                return []
+            
+            import shlex
+            temp_script = f"""#!/bin/bash
+cd {shlex.quote(str(pkg_dir))}
+source PKGBUILD 2>/dev/null || exit 1
+printf '%s\\n' "${{pkgname[@]}}"
+"""
+            
+            result = subprocess.run(['bash', '-c', temp_script], 
+                                  capture_output=True, text=True, timeout=10)
+            if result.returncode == 0:
+                return [line.strip() for line in result.stdout.split('\n') if line.strip()]
+            else:
+                return []
+        except Exception as e:
+            print(f"Warning: Failed to extract package names from PKGBUILD: {e}")
+            return []
+
+    def _clear_cycle_packages_from_cache(self, pkg_name, pkg_dir):
+        """Clear cycle packages from pacman cache after first build"""
+        try:
+            package_names = self._get_package_names_from_pkgbuild(pkg_dir)
+            if not package_names:
+                return
+            
+            print(f"Clearing cycle packages from cache: {', '.join(package_names)}")
+            
+            # Remove all versions of these packages from cache
+            for pkg in package_names:
+                cache_pattern = self.cache_dir / f"{pkg}-*.pkg.tar.*"
+                import glob
+                for cache_file in glob.glob(str(cache_pattern)):
+                    try:
+                        Path(cache_file).unlink()
+                        print(f"  Removed: {Path(cache_file).name}")
+                    except Exception as e:
+                        print(f"  Warning: Failed to remove {cache_file}: {e}")
+                        
+        except Exception as e:
+            print(f"Warning: Failed to clear cycle packages from cache: {e}")
 
     def build_package(self, pkg_name, pkg_data):
         """Build a single package in a clean chroot environment"""
