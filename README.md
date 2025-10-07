@@ -193,6 +193,13 @@ This messaging system ensures users know exactly what operations are being perfo
 ./build_packages.py --preserve-chroot
 ```
 
+#### Stop on failure and preserve chroot for debugging
+```bash
+./build_packages.py --stop-on-failure
+```
+
+**Note**: By default, temporary chroots are cleaned up after successful builds but preserved after failed builds for debugging. Use `--preserve-chroot` to always keep chroots, or `--stop-on-failure` to stop building on the first failure.
+
 #### Build with custom chroot path
 ```bash
 ./build_packages.py --chroot /custom/chroot/path
@@ -404,7 +411,7 @@ mkdir -p pkgbuilds/my-package
 | `--continue` | Continue from last successful package |
 | `--repackage` | Repackage the next package to build (requires --continue) |
 | `--preserve-chroot` | Preserve chroot even on successful builds |
-| `--stop-on-failure` | Stop building on first package failure |
+| `--stop-on-failure` | Stop building on first package failure and preserve chroot on failure |
 | `--chroot DIR` | Custom chroot directory path |
 
 ### repo_analyze.py

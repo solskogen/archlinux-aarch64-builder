@@ -915,7 +915,7 @@ if __name__ == "__main__":
             # Fetch PKGBUILDs and write results
             if newer_packages:
                 print("Processing PKGBUILDs for dependency information...")
-                newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, provides_map)
+                newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, {})
             
             if args.preserve_order:
                 newer_packages = preserve_package_order(newer_packages, list(args.use_aur_for_packages))

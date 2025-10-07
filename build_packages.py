@@ -588,9 +588,10 @@ echo "CHECKDEPENDS_END"
         """Clean up temporary chroot"""
         if temp_copy_path in self.temp_copies:
             should_cleanup = True
-            if self.preserve_chroot or (self.stop_on_failure and build_failed):
+            if self.preserve_chroot or build_failed or (self.stop_on_failure and build_failed):
                 should_cleanup = False
-                print(f"Preserving temporary chroot: {temp_copy_path}")
+                reason = "preserve-chroot flag" if self.preserve_chroot else "build failed"
+                print(f"Preserving temporary chroot: {temp_copy_path} ({reason})")
             
             if should_cleanup:
                 try:
