@@ -578,8 +578,8 @@ echo "CHECKDEPENDS_END"
             for pkg in failed_packages:
                 print(f"  - {pkg['name']}")
 
-    def _get_package_names_from_pkgbuild(self, pkg_dir):
-        """Extract all package names that will be built from PKGBUILD"""
+    def _get_package_filenames_from_pkgbuild(self, pkg_dir):
+        """Extract exact package filenames that will be built from PKGBUILD"""
         try:
             pkgbuild_path = pkg_dir / "PKGBUILD"
             if not pkgbuild_path.exists():
@@ -589,7 +589,14 @@ echo "CHECKDEPENDS_END"
             temp_script = f"""#!/bin/bash
 cd {shlex.quote(str(pkg_dir))}
 source PKGBUILD 2>/dev/null || exit 1
-printf '%s\\n' "${{pkgname[@]}}"
+for pkg in "${{pkgname[@]}}"; do
+    fullver="$pkgver-$pkgrel"
+    if [[ -n $epoch ]]; then
+        fullver="$epoch:$fullver"
+    fi
+    echo "$pkg-$fullver-$CARCH.pkg.tar.zst"
+    echo "$pkg-$fullver-$CARCH.pkg.tar.zst.sig"
+done
 """
             
             result = subprocess.run(['bash', '-c', temp_script], 
@@ -599,28 +606,27 @@ printf '%s\\n' "${{pkgname[@]}}"
             else:
                 return []
         except Exception as e:
-            print(f"Warning: Failed to extract package names from PKGBUILD: {e}")
+            print(f"Warning: Failed to extract package filenames from PKGBUILD: {e}")
             return []
 
     def _clear_cycle_packages_from_cache(self, pkg_name, pkg_dir):
         """Clear cycle packages from pacman cache after first build"""
         try:
-            package_names = self._get_package_names_from_pkgbuild(pkg_dir)
-            if not package_names:
+            package_filenames = self._get_package_filenames_from_pkgbuild(pkg_dir)
+            if not package_filenames:
                 return
             
-            print(f"Clearing cycle packages from cache: {', '.join(package_names)}")
+            print(f"Clearing cycle packages from cache: {pkg_name}")
             
-            # Remove all versions of these packages from cache
-            for pkg in package_names:
-                cache_pattern = self.cache_dir / f"{pkg}-*.pkg.tar.*"
-                import glob
-                for cache_file in glob.glob(str(cache_pattern)):
+            # Remove exact package files from cache
+            for filename in package_filenames:
+                cache_file = self.cache_dir / filename
+                if cache_file.exists():
                     try:
-                        Path(cache_file).unlink()
-                        print(f"  Removed: {Path(cache_file).name}")
+                        cache_file.unlink()
+                        print(f"  Removed: {filename}")
                     except Exception as e:
-                        print(f"  Warning: Failed to remove {cache_file}: {e}")
+                        print(f"  Warning: Failed to remove {filename}: {e}")
                         
         except Exception as e:
             print(f"Warning: Failed to clear cycle packages from cache: {e}")

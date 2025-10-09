@@ -58,69 +58,6 @@ def is_bootstrap_package(pkg_name):
 
 
 
-def get_provides_mapping():
-    """
-    Get basename to provides mapping from upstream x86_64 databases.
-    
-    Downloads and parses official Arch Linux databases to build a mapping
-    of package names to what they provide. This is used for dependency
-    resolution when packages depend on virtual packages.
-    
-    Returns:
-        dict: Mapping of provided names to providing package basenames
-    """
-    import urllib.request
-    import tarfile
-    import tempfile
-    
-    mirror_url = X86_64_MIRROR
-    provides_map = {}
-    
-    for repo in ['core', 'extra']:
-        db_url = f"{mirror_url}/{repo}/os/x86_64/{repo}.db"
-        
-        try:
-            with tempfile.NamedTemporaryFile() as tmp_file:
-                urllib.request.urlretrieve(db_url, tmp_file.name)
-                
-                with tarfile.open(tmp_file.name, 'r:gz') as tar:
-                    for member in tar.getmembers():
-                        if member.name.endswith('/desc'):
-                            desc_content = tar.extractfile(member).read().decode('utf-8')
-                            
-                            # Parse desc file
-                            sections = desc_content.strip().split('\n\n')
-                            pkg_name = ''
-                            pkg_base = ''
-                            pkg_provides = []
-                            
-                            for section in sections:
-                                lines = section.strip().split('\n')
-                                if not lines:
-                                    continue
-                                    
-                                section_name = lines[0].strip('%')
-                                section_content = lines[1:]
-                                
-                                if section_name == 'NAME' and section_content:
-                                    pkg_name = section_content[0]
-                                elif section_name == 'BASE' and section_content:
-                                    pkg_base = section_content[0]
-                                elif section_name == 'PROVIDES':
-                                    pkg_provides = section_content
-                            
-                            # Use base if available, otherwise use name
-                            basename = pkg_base or pkg_name
-                            if basename:
-                                provides_map[basename] = basename  # Package provides itself
-                                for provide in pkg_provides:
-                                    provide_name = provide.split('=')[0]
-                                    provides_map[provide_name] = basename
-        except Exception as e:
-            print(f"Warning: failed to download {repo}.db: {e}")
-    
-    return provides_map
-
 def write_results(packages, args):
     """Write results to packages_to_build.json"""
     print("Writing results to packages_to_build.json...")
@@ -187,7 +124,7 @@ def write_results(packages, args):
 
 
 
-def fetch_pkgbuild_deps(packages_to_build, no_update=False, provides_map=None):
+def fetch_pkgbuild_deps(packages_to_build, no_update=False):
     """
     Fetch PKGBUILDs for packages and extract complete dependency information.
     
@@ -380,23 +317,16 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False, provides_map=None):
             # Repository exists and is up to date
             print(f"[{i}/{total}] Processing {name} (PKGBUILD already up to date: {current_version or target_version})...")
         
-        # Parse dependencies from existing PKGBUILD
+        # Parse dependencies from existing PKGBUILD (skip provides - use database)
         if pkgbuild_path.exists():
             deps = parse_pkgbuild_deps(pkgbuild_path)
-            # Preserve original provides information from database
+            # Keep original provides from database, only update dependencies
             original_provides = pkg.get('provides', [])
             pkg.update(deps)
-            # Merge provides: keep original + add any new ones from PKGBUILD
-            pkgbuild_provides = deps.get('provides', [])
-            all_provides = list(set(original_provides + pkgbuild_provides))
-            pkg['provides'] = all_provides
+            pkg['provides'] = original_provides
     
     # Return combined list with blacklisted packages (unchanged) and fetched packages (with updated deps)
     all_packages = packages_to_fetch + blacklisted_packages
-    
-    # Get provides mapping from upstream x86_64 databases (passed as parameter)
-    if provides_map is None:
-        provides_map = get_provides_mapping()
     
     # Create build list for dependency ordering (filtered dependencies)
     build_list_names = {pkg['name'] for pkg in all_packages}
@@ -429,8 +359,7 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False, provides_map=None):
                     dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
                     if (dep_name in build_list_names or 
                         dep_name in build_list_basenames or
-                        dep_name in build_list_provides or
-                        (dep_name in provides_map and provides_map[dep_name] in build_list_basenames)):
+                        dep_name in build_list_provides):
                         filtered_deps.append(dep)
                 pkg[dep_type] = filtered_deps
     
@@ -975,7 +904,7 @@ if __name__ == "__main__":
             })
         
         # Parse PKGBUILDs for dependencies
-        newer_packages = fetch_pkgbuild_deps(newer_packages, True, provides_map)
+        newer_packages = fetch_pkgbuild_deps(newer_packages, True)
         if args.preserve_order:
             newer_packages = preserve_package_order(newer_packages, args.packages)
         else:
@@ -1141,7 +1070,6 @@ if __name__ == "__main__":
     
     # Load provides mapping once (doesn't change)
     print("Loading provides mapping from upstream databases...")
-    provides_map = get_provides_mapping()
     
     # Stage 1: Find outdated packages using .db files (fast comparison)
     newer_packages, skipped_packages, blacklisted_missing, bin_package_warnings = compare_versions(x86_packages, target_packages, args.packages, blacklist, args.missing_packages, args.use_aur_for_packages, args.use_latest, full_x86_packages)
@@ -1185,7 +1113,7 @@ if __name__ == "__main__":
     # Stage 2: Parse PKGBUILDs for complete dependency info and find missing deps
     if newer_packages and not args.missing_packages:
         print("Processing PKGBUILDs for complete dependency information...")
-        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, provides_map)
+        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update)
         
         if full_x86_packages:
             print("Checking for missing dependencies (including checkdepends)...")
@@ -1251,7 +1179,7 @@ if __name__ == "__main__":
                     # Create list of only the newly added packages
                     new_packages = [pkg for pkg in newer_packages if pkg['name'] in added_deps]
                     print("Processing PKGBUILDs for missing dependencies...")
-                    new_packages_with_deps = fetch_pkgbuild_deps(new_packages, args.no_update, provides_map)
+                    new_packages_with_deps = fetch_pkgbuild_deps(new_packages, args.no_update)
                     
                     # Update the newer_packages list with the processed new packages
                     for updated_pkg in new_packages_with_deps:
@@ -1285,14 +1213,13 @@ if __name__ == "__main__":
                                     dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
                                     if (dep_name in build_list_names or 
                                         dep_name in build_list_basenames or
-                                        dep_name in build_list_provides or
-                                        (dep_name in provides_map and provides_map[dep_name] in build_list_basenames)):
+                                        dep_name in build_list_provides):
                                         filtered_deps.append(dep)
                                 pkg[dep_type] = filtered_deps
     elif newer_packages:
         # For missing packages mode, still need PKGBUILD parsing
         print("Processing PKGBUILDs for dependency information...")
-        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, provides_map)
+        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update)
     
     # Report results
     if args.missing_packages and blacklisted_missing:

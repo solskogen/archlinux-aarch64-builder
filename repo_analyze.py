@@ -189,13 +189,14 @@ def main():
                 
                 target_only.append(f"{basename}: {target_data['version']} ({target_data['repo']}) (file: {filename}){version_info}")
             else:
-                # Multiple packages or different names
-                pkg_names_str = ', '.join(pkg_names)
+                # Multiple packages - list each package individually
                 arch = target_data.get('arch', target_arch)
                 if isinstance(arch, set):
                     arch = list(arch)[0] if arch else target_arch
-                filename = f"{basename}-{target_data['version']}-{arch}.pkg.tar.zst"
-                target_only.append(f"{basename} [{pkg_names_str}]: {target_data['version']} ({target_data['repo']}) (file: {filename})")
+                
+                for pkg_name in pkg_names:
+                    filename = f"{pkg_name}-{target_data['version']}-{arch}.pkg.tar.zst"
+                    target_only.append(f"{pkg_name}: {target_data['version']} ({target_data['repo']}) (file: {filename})")
     
     # Check for missing 'any' packages in AArch64
     for basename, x86_data in x86_bases.items():

@@ -205,15 +205,18 @@ def compare_arch_versions(version1: str, version2: str) -> int:
 
 def parse_pkgbuild_deps(pkgbuild_path):
     """
-    Extract dependencies from PKGBUILD file using bash sourcing.
+    Extract build dependencies from PKGBUILD file.
+    
+    Uses bash sourcing to handle variable expansion and array parsing.
+    Provides information comes from database files, not PKGBUILDs.
     
     Args:
         pkgbuild_path: Path to PKGBUILD file
         
     Returns:
-        dict: Dictionary with depends, makedepends, checkdepends, provides lists
+        dict: Dictionary with depends, makedepends, checkdepends lists
     """
-    deps = {'depends': [], 'makedepends': [], 'checkdepends': [], 'provides': []}
+    deps = {'depends': [], 'makedepends': [], 'checkdepends': []}
     
     try:
         pkg_dir = pkgbuild_path.parent
@@ -232,26 +235,6 @@ echo "MAKEDEPENDS_END"
 echo "CHECKDEPENDS_START"
 printf '%s\\n' "${{checkdepends[@]}}"
 echo "CHECKDEPENDS_END"
-echo "PROVIDES_START"
-printf '%s\\n' "${{provides[@]}}"
-echo "PROVIDES_END"
-
-# Extract provides from split package functions
-for pkg in "${{pkgname[@]}}"; do
-    if declare -f "package_$pkg" >/dev/null 2>&1; then
-        echo "SPLIT_PROVIDES_START:$pkg"
-        # Create a temporary function that sets provides and prints it
-        eval "
-        temp_package_$pkg() {{
-            local provides=()
-            $(declare -f "package_$pkg" | sed '1d;$d')
-            printf '%s\\n' \\"\\${{provides[@]}}\\"
-        }}
-        "
-        "temp_package_$pkg" 2>/dev/null || true
-        echo "SPLIT_PROVIDES_END:$pkg"
-    fi
-done
 """
         
         result = subprocess.run(['bash', '-c', temp_script], 
@@ -259,7 +242,6 @@ done
         if result.returncode == 0:
             output = result.stdout
             current_section = None
-            current_split_pkg = None
             
             for line in output.split('\n'):
                 line = line.strip()
@@ -275,22 +257,8 @@ done
                     current_section = "checkdepends"
                 elif line == "CHECKDEPENDS_END":
                     current_section = None
-                elif line == "PROVIDES_START":
-                    current_section = "provides"
-                elif line == "PROVIDES_END":
-                    current_section = None
-                elif line.startswith("SPLIT_PROVIDES_START:"):
-                    current_split_pkg = line.split(":", 1)[1]
-                    current_section = "split_provides"
-                elif line.startswith("SPLIT_PROVIDES_END:"):
-                    current_split_pkg = None
-                    current_section = None
                 elif line and current_section:
-                    if current_section == "split_provides":
-                        # Add split package provides to main provides list
-                        deps["provides"].append(line)
-                    else:
-                        deps[current_section].append(line)
+                    deps[current_section].append(line)
         else:
             print(f"Warning: Failed to parse PKGBUILD with bash: {result.stderr}")
         
