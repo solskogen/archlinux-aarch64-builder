@@ -199,10 +199,6 @@ def is_version_newer(current_version: str, target_version: str) -> bool:
     """Return True if target_version is newer than current_version"""
     return ArchVersionComparator.is_newer(current_version, target_version)
 
-def compare_arch_versions(version1: str, version2: str) -> int:
-    """Compare two Arch Linux version strings using proper semantics"""
-    return ArchVersionComparator.compare(version1, version2)
-
 def parse_pkgbuild_deps(pkgbuild_path):
     """
     Extract build dependencies from PKGBUILD file.
@@ -261,27 +257,6 @@ echo "CHECKDEPENDS_END"
                     deps[current_section].append(line)
         else:
             print(f"Warning: Failed to parse PKGBUILD with bash: {result.stderr}")
-        
-        # Also parse dependencies from package() function by reading the file directly
-        try:
-            with open(pkgbuild_path, 'r') as f:
-                content = f.read()
-                
-            # Look for depends= inside package() function
-            import re
-            package_func_match = re.search(r'package\(\)\s*\{(.*?)\n\}', content, re.DOTALL)
-            if package_func_match:
-                package_content = package_func_match.group(1)
-                depends_match = re.search(r"depends=\([^)]+\)", package_content)
-                if depends_match:
-                    depends_line = depends_match.group(0)
-                    # Extract dependencies from the line
-                    deps_in_parens = re.findall(r"'([^']+)'", depends_line)
-                    for dep in deps_in_parens:
-                        if dep not in deps['depends']:
-                            deps['depends'].append(dep)
-        except Exception as e:
-            pass  # Ignore errors in text parsing
             
     except subprocess.TimeoutExpired:
         print("Warning: PKGBUILD parsing timed out")
@@ -407,6 +382,7 @@ def load_x86_64_packages(download=True, repos=None):
     
     return load_database_packages(urls, '_x86_64', download)
 
+# Compatibility alias for existing code
 def load_target_arch_packages(download=True, urls=None):
     """Load target architecture packages from configured repositories"""
     target_arch = get_target_architecture()
@@ -432,11 +408,6 @@ def load_target_arch_packages(download=True, urls=None):
         print(f"Downloading {target_arch} databases...")
     
     return load_database_packages(urls, f'_{target_arch}', download)
-
-# Compatibility alias for existing code
-def load_aarch64_packages(download=True, urls=None):
-    """Compatibility alias - use load_target_arch_packages instead"""
-    return load_target_arch_packages(download, urls)
 
 def load_blacklist(blacklist_file):
     """
@@ -528,30 +499,6 @@ class BuildUtils:
         for cmd in commands:
             print(f"  {cmd}")
 
-    def setup_chroot_environment(self, chroot_path, cache_path):
-        """Setup chroot environment with consistent configuration."""
-        if self.dry_run:
-            self.format_dry_run("Would setup chroot environment", [
-                f"mkdir -p {chroot_path}",
-                f"mkdir -p {cache_path}",
-                "mkarchroot setup"
-            ])
-            return
-        
-        # Create directories
-        chroot_path.mkdir(parents=True, exist_ok=True)
-        cache_path.mkdir(parents=True, exist_ok=True)
-        
-        # Setup chroot if it doesn't exist
-        chroot_root = chroot_path / "root"
-        if not chroot_root.exists():
-            print("Setting up chroot environment...")
-            self.run_command([
-                "mkarchroot", "-C", "chroot-config/pacman.conf", 
-                "-M", "chroot-config/makepkg.conf", str(chroot_root), "base-devel"
-            ])
-            print("Chroot environment created successfully")
-
     def clear_cache(self, cache_path, description="cache"):
         """Clear cache directory with consistent handling."""
         if self.dry_run:
@@ -567,41 +514,7 @@ class BuildUtils:
         except Exception as e:
             print(f"Warning: Failed to clear {description}: {e}")
             return 0
-        self.logs_dir = Path(LOGS_DIR)
-    
-    def run_command(self, cmd, cwd=None, capture_output=False):
-        """
-        Unified command runner with consistent error handling and dry-run support.
-        
-        Executes commands with proper error handling. In dry-run mode, shows
-        what would be executed without actually running commands.
-        
-        Args:
-            cmd: Command list to execute
-            cwd: Working directory for command
-            capture_output: Whether to capture stdout/stderr
-            
-        Returns:
-            CompletedProcess: Result of command execution
-        """
-        if self.dry_run:
-            print(f"[DRY RUN] Would run: {' '.join(cmd)}")
-            if cwd:
-                print(f"[DRY RUN] In directory: {cwd}")
-            # Return realistic output for git stash to make dry-run logic work
-            if cmd[0] == "git" and len(cmd) > 1 and cmd[1] == "stash":
-                return subprocess.CompletedProcess(cmd, 0, "No local changes to save", "")
-            return subprocess.CompletedProcess(cmd, 0, "", "")
-        return subprocess.run(cmd, cwd=cwd, capture_output=capture_output, text=True, check=True)
-    
-    def format_dry_run(self, action, details=None):
-        """Format dry-run output consistently"""
-        if self.dry_run:
-            print(f"[DRY RUN] {action}")
-            if details:
-                for detail in details:
-                    print(f"[DRY RUN]   {detail}")
-    
+
     def cleanup_old_logs(self, package_name, keep_count=None):
         """
         Keep only the most recent N log files for a package.

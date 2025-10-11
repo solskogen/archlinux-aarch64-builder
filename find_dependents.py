@@ -6,13 +6,17 @@ from pathlib import Path
 
 from utils import parse_database_file
 
-def find_dependents(target_package, packages):
+def find_dependents(target_package, packages, check_depends=True, check_makedepends=True):
     """Find all packages that depend on the target package"""
     dependents = set()
     
     for pkg_name, pkg_data in packages.items():
-        # Check depends and makedepends
-        all_deps = pkg_data.get('depends', []) + pkg_data.get('makedepends', [])
+        # Check depends and makedepends based on options
+        all_deps = []
+        if check_depends:
+            all_deps.extend(pkg_data.get('depends', []))
+        if check_makedepends:
+            all_deps.extend(pkg_data.get('makedepends', []))
         
         for dep in all_deps:
             # Strip version constraints (>=, =, <, etc.)
@@ -27,7 +31,18 @@ def find_dependents(target_package, packages):
 def main():
     parser = argparse.ArgumentParser(description='Find packages that depend on a given package')
     parser.add_argument('package', help='Package name to find dependents for')
+    parser.add_argument('--depends-only', action='store_true', help='Only check runtime dependencies (depends)')
+    parser.add_argument('--makedepends-only', action='store_true', help='Only check build dependencies (makedepends)')
     args = parser.parse_args()
+    
+    # Validate mutually exclusive options
+    if args.depends_only and args.makedepends_only:
+        print("Error: --depends-only and --makedepends-only are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
+    
+    # Determine what to check
+    check_depends = not args.makedepends_only
+    check_makedepends = not args.depends_only
     
     # Parse AArch64 packages
     packages = {}
@@ -52,12 +67,13 @@ def main():
         sys.exit(1)
     
     # Find dependents
-    dependents = find_dependents(args.package, packages)
+    dependents = find_dependents(args.package, packages, check_depends, check_makedepends)
     
     if dependents:
         print(' '.join(dependents))
     else:
-        print(f"No packages depend on {args.package}", file=sys.stderr)
+        dep_type = "runtime dependencies" if args.depends_only else "build dependencies" if args.makedepends_only else "dependencies"
+        print(f"No packages have {dep_type} on {args.package}", file=sys.stderr)
 
 if __name__ == "__main__":
     main()

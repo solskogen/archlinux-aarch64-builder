@@ -32,6 +32,7 @@ import configparser
 import subprocess
 import re
 import shutil
+import tarfile
 from pathlib import Path
 from packaging import version
 from utils import (
@@ -39,8 +40,8 @@ from utils import (
     validate_package_name, safe_path_join, is_version_newer,
     PACKAGE_SKIP_FLAG, parse_pkgbuild_deps, parse_database_file, X86_64_MIRROR,
     PKGBUILDS_DIR, SEPARATOR_WIDTH, get_target_architecture,
-    should_skip_package, compare_bin_package_versions, extract_packages, find_missing_dependencies,
-    load_packages_with_any, config, load_packages_unified, safe_command_execution
+    compare_bin_package_versions, find_missing_dependencies,
+    load_packages_with_any, config, load_packages_unified
 )
 
 # ============================================================
@@ -175,24 +176,20 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
         current_version = None
         if pkgbuild_path.exists():
             try:
-                with open(pkgbuild_path, 'r') as f:
-                    content = f.read()
-                    # Extract pkgver, pkgrel, and epoch - only if they don't contain complex variables
-                    pkgver_match = re.search(r'^pkgver=(.+)$', content, re.MULTILINE)
-                    pkgrel_match = re.search(r'^pkgrel=(.+)$', content, re.MULTILINE)
-                    epoch_match = re.search(r'^epoch=(.+)$', content, re.MULTILINE)
-                    
-                    if pkgver_match and pkgrel_match:
-                        pkgver = pkgver_match.group(1).strip('\'"')
-                        pkgrel = pkgrel_match.group(1).strip('\'"')
-                        epoch = epoch_match.group(1).strip('\'"') if epoch_match else None
-                        
-                        # Only use if no complex variable substitution
-                        if not ('${' in pkgver or '$(' in pkgver):
-                            if epoch:
-                                current_version = f"{epoch}:{pkgver}-{pkgrel}"
-                            else:
-                                current_version = f"{pkgver}-{pkgrel}"
+                import shlex
+                temp_script = f"""#!/bin/bash
+cd {shlex.quote(str(pkgbuild_path.parent))}
+source PKGBUILD 2>/dev/null || exit 1
+fullver="$pkgver-$pkgrel"
+if [[ -n $epoch ]]; then
+    fullver="$epoch:$fullver"
+fi
+echo "$fullver"
+"""
+                result = subprocess.run(['bash', '-c', temp_script], 
+                                      capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    current_version = result.stdout.strip()
             except Exception:
                 pass  # If we can't read version, treat as if PKGBUILD doesn't exist
         
@@ -257,22 +254,20 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False):
                     
                     # Re-read version after git pull for --use-latest
                     try:
-                        with open(pkgbuild_path, 'r') as f:
-                            content = f.read()
-                            pkgver_match = re.search(r'^pkgver=(.+)$', content, re.MULTILINE)
-                            pkgrel_match = re.search(r'^pkgrel=(.+)$', content, re.MULTILINE)
-                            epoch_match = re.search(r'^epoch=(.+)$', content, re.MULTILINE)
-                            
-                            if pkgver_match and pkgrel_match:
-                                pkgver = pkgver_match.group(1).strip('\'"')
-                                pkgrel = pkgrel_match.group(1).strip('\'"')
-                                epoch = epoch_match.group(1).strip('\'"') if epoch_match else None
-                                
-                                if not ('${' in pkgver or '$(' in pkgver):
-                                    if epoch:
-                                        pkg['version'] = f"{epoch}:{pkgver}-{pkgrel}"
-                                    else:
-                                        pkg['version'] = f"{pkgver}-{pkgrel}"
+                        import shlex
+                        temp_script = f"""#!/bin/bash
+cd {shlex.quote(str(pkgbuild_path.parent))}
+source PKGBUILD 2>/dev/null || exit 1
+fullver="$pkgver-$pkgrel"
+if [[ -n $epoch ]]; then
+    fullver="$epoch:$fullver"
+fi
+echo "$fullver"
+"""
+                        result = subprocess.run(['bash', '-c', temp_script], 
+                                              capture_output=True, text=True, timeout=10)
+                        if result.returncode == 0:
+                            pkg['version'] = result.stdout.strip()
                     except Exception:
                         pass  # Keep original version if parsing fails
                 else:
@@ -520,7 +515,7 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
                         bin_package_warnings.append(f"WARNING: {bin_pkg['name']} (provides {basename}={provided_version}) is outdated compared to x86_64 {basename} ({x86_data['version']})")
                     elif comparison == 1:
                         bin_package_warnings.append(f"INFO: {bin_pkg['name']} (provides {basename}={provided_version}) is newer than x86_64 {basename} ({x86_data['version']})")
-                should_include = False  # Don't build -bin packages
+                # For --packages mode, still include the package even if -bin exists
                 target_version = f"provided by {bin_pkg['name']}"
             else:
                 target_version = "not found"
@@ -845,6 +840,8 @@ if __name__ == "__main__":
                         help='Build packages from local PKGBUILDs only (use with --packages)')
     parser.add_argument('--packages', nargs='+',
                         help='Force rebuild specific packages by name')
+    parser.add_argument('--force', action='store_true',
+                        help='Force rebuild ARCH=any packages (use with --packages)')
     parser.add_argument('--preserve-order', action='store_true',
                         help='Preserve exact order specified in --packages (skip dependency sorting)')
     parser.add_argument('--blacklist', default='blacklist.txt',
@@ -960,8 +957,18 @@ if __name__ == "__main__":
     x86_packages = {}
     if args.packages and not args.aur:
         print(f"Looking up versions for {len(args.packages)} specified packages...")
-        # Load packages using unified function
-        all_x86_packages, target_packages = load_packages_unified(download=not args.no_update)
+        # Load x86_64 packages and target packages for dependency checking
+        # Include ARCH=any packages if --force is used
+        if args.force:
+            from utils import load_packages_with_any, X86_64_MIRROR
+            any_urls = [
+                f"{X86_64_MIRROR}/core/os/x86_64/core.db",
+                f"{X86_64_MIRROR}/extra/os/x86_64/extra.db"
+            ]
+            all_x86_packages = load_packages_with_any(any_urls, '_x86_64', download=not args.no_update, include_any=True)
+        else:
+            all_x86_packages = load_x86_64_packages(download=not args.no_update)
+        target_packages = load_target_arch_packages(download=not args.no_update)
         
         # Filter to only requested packages for comparison, but keep full list for dependency resolution
         filtered_x86_packages = {}
@@ -1003,8 +1010,6 @@ if __name__ == "__main__":
                                             if ('NAME' in data and data['NAME'][0] == pkg_name) or \
                                                ('BASE' in data and data['BASE'][0] == pkg_name):
                                                 if data.get('ARCH', [''])[0] == 'any':
-                                                    print(f"WARNING: Package {pkg_name} is ARCH=any and doesn't need rebuilding for AArch64")
-                                                    print(f"         ARCH=any packages work on all architectures without modification")
                                                     is_arch_any = True
                                                 arch_any_found = True
                                                 break
@@ -1017,7 +1022,13 @@ if __name__ == "__main__":
                         print(f"ERROR: Package {pkg_name} not found in x86_64 repositories")
                         sys.exit(1)
                     elif is_arch_any:
-                        continue  # Skip ARCH=any packages
+                        if not args.force:
+                            print(f"WARNING: Package {pkg_name} is ARCH=any and doesn't need rebuilding - skipping")
+                            print(f"         Use --force to build anyway")
+                            continue  # Skip ARCH=any packages
+                        else:
+                            print(f"WARNING: Forcing rebuild of ARCH=any package {pkg_name}")
+                            # Package should already be in all_x86_packages since we loaded with include_any=True
         x86_packages = filtered_x86_packages
         # Store full package list for dependency resolution
         full_x86_packages = all_x86_packages
