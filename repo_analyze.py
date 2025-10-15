@@ -73,6 +73,43 @@ def main():
     any_outdated = []
     any_missing = []
     missing_pkgbase = []
+    package_name_mismatches = []
+    
+    # Check for package name mismatches (same basename, different package names)
+    for basename in x86_bases:
+        if basename in target_bases:
+            # Collect package names for this basename from both architectures
+            x86_pkg_names = set()
+            target_pkg_names = set()
+            
+            for pkg_name, pkg_data in x86_packages.items():
+                if pkg_data['basename'] == basename:
+                    x86_pkg_names.add(pkg_name)
+            
+            for pkg_name, pkg_data in target_packages.items():
+                if pkg_data['basename'] == basename:
+                    target_pkg_names.add(pkg_name)
+            
+            # Find packages that exist in one arch but not the other
+            x86_only = x86_pkg_names - target_pkg_names
+            target_only_names = target_pkg_names - x86_pkg_names
+            
+            if x86_only or target_only_names:
+                parts = []
+                if x86_only:
+                    parts.append(f"x86_64 has {', '.join(sorted(x86_only))}")
+                if target_only_names:
+                    # Add filenames for target-only packages
+                    target_only_with_files = []
+                    for pkg_name in sorted(target_only_names):
+                        if pkg_name in target_packages:
+                            pkg_data = target_packages[pkg_name]
+                            filename = pkg_data.get('filename', f"{pkg_name}-{pkg_data.get('version', 'unknown')}-{target_arch}.pkg.tar.zst")
+                            target_only_with_files.append(f"{pkg_name} ({filename})")
+                        else:
+                            target_only_with_files.append(pkg_name)
+                    parts.append(f"{target_arch} has {', '.join(target_only_with_files)}")
+                package_name_mismatches.append(f"{basename}: {', '.join(parts)}")
     
     # Check for packages in multiple repositories (same architecture)
     for basename, repos in target_repo_count.items():
@@ -88,6 +125,20 @@ def main():
                 if fnmatch.fnmatch(basename, pattern):
                     is_blacklisted = True
                     break
+            
+            # Check if any dependencies are blacklisted
+            if not is_blacklisted:
+                x86_data = x86_bases[basename]
+                all_deps = x86_data.get('depends', []) + x86_data.get('makedepends', [])
+                for dep in all_deps:
+                    dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
+                    for pattern in blacklist:
+                        if fnmatch.fnmatch(dep_name, pattern):
+                            is_blacklisted = True
+                            break
+                    if is_blacklisted:
+                        break
+            
             if not is_blacklisted:
                 missing_pkgbase.append(basename)
     
@@ -112,7 +163,8 @@ def main():
             
             # Check if ARM newer
             try:
-                if version.parse(target_data['version']) > version.parse(x86_data['version']):
+                from utils import is_version_newer
+                if is_version_newer(x86_data['version'], target_data['version']):
                     target_newer.append(f"{basename}: {target_arch} {target_data['version']} > x86_64 {x86_data['version']}")
             except:
                 pass
@@ -216,6 +268,11 @@ def main():
     # If no specific options, show all except missing-pkgbase (default behavior)
     show_all = not any([args.outdated_any, args.missing_any, args.repo_issues, args.target_newer, args.target_only])
     
+    if show_all and package_name_mismatches:
+        print(f"\nPackage Name Mismatches ({len(package_name_mismatches)}):")
+        for mismatch in sorted(package_name_mismatches):
+            print(f"  {mismatch}")
+    
     if show_all or args.outdated_any:
         if any_outdated:
             print(f"\nOutdated 'any' Packages in AArch64 ({len(any_outdated)}):")
@@ -261,7 +318,7 @@ def main():
         else:
             print(f"\n{target_arch} Newer Versions: None found")
     
-    if show_all and not repo_issues and not target_newer and not target_only and not any_outdated and not any_missing:
+    if show_all and not repo_issues and not target_newer and not target_only and not any_outdated and not any_missing and not package_name_mismatches:
         print("No issues found")
 
 if __name__ == "__main__":

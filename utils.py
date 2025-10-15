@@ -680,66 +680,6 @@ def load_packages_unified(download=True, include_any=False, use_existing=False, 
     
     return x86_packages, target_packages
 
-def git_clone_package(basename, use_aur=False, target_dir=None):
-    """Clone package repository with consistent error handling."""
-    if target_dir is None:
-        target_dir = PKGBUILDS_DIR
-    
-    try:
-        if use_aur:
-            url = f"https://aur.archlinux.org/{basename}.git"
-        else:
-            # Convert ++ to plusplus for GitLab URLs
-            gitlab_name = basename.replace('++', 'plusplus')
-            url = f"https://gitlab.archlinux.org/archlinux/packaging/packages/{gitlab_name}.git"
-        
-        safe_command_execution(
-            ["git", "clone", url, basename], 
-            f"Clone {basename}", 
-            cwd=target_dir
-        )
-        return True
-    except Exception:
-        return False
-
-def git_checkout_version(pkg_dir, version, basename):
-    """Checkout specific version with fallback to latest."""
-    git_version_tag = version.replace(':', '-')
-    tag_formats = [
-        f"v{git_version_tag}",
-        git_version_tag,
-        f"{basename}-{git_version_tag}",
-        f"release-{git_version_tag}"
-    ]
-    
-    # Fetch tags first
-    safe_command_execution(["git", "fetch", "--tags"], "Fetch tags", cwd=pkg_dir)
-    
-    # Try different tag formats
-    for tag_format in tag_formats:
-        try:
-            safe_command_execution(
-                ["git", "checkout", tag_format], 
-                f"Checkout {tag_format}", 
-                cwd=pkg_dir, 
-                exit_on_error=False
-            )
-            return True
-        except:
-            continue
-    
-    # Fallback to latest
-    print(f"Warning: Could not find tag for {basename} version {version}, using latest commit")
-    safe_command_execution(["git", "fetch", "origin"], "Fetch origin", cwd=pkg_dir)
-    safe_command_execution(["git", "reset", "--hard", "origin/main"], "Reset to main", cwd=pkg_dir)
-    return False
-
-def git_update_to_latest(pkg_dir):
-    """Update repository to latest commit."""
-    safe_command_execution(["git", "reset", "--hard"], "Reset repository", cwd=pkg_dir)
-    safe_command_execution(["git", "fetch", "origin"], "Fetch origin", cwd=pkg_dir)
-    safe_command_execution(["git", "reset", "--hard", "origin/main"], "Reset to main", cwd=pkg_dir)
-
 def handle_command_error(e, operation_name, exit_on_error=True):
     """Consistent error handling for subprocess commands."""
     error_msg = f"ERROR: {operation_name} failed: {e}"
@@ -771,20 +711,6 @@ def safe_command_execution(cmd, operation_name, cwd=None, exit_on_error=True, **
         return handle_command_error(e, operation_name, exit_on_error)
     except Exception as e:
         return handle_command_error(e, operation_name, exit_on_error)
-
-def load_config():
-    """Load configuration with consistent error handling."""
-    import configparser
-    config = configparser.ConfigParser()
-    
-    try:
-        config.read('config.ini')
-        return {
-            'build': dict(config['build']) if 'build' in config else {},
-            'repositories': dict(config['repositories']) if 'repositories' in config else {}
-        }
-    except Exception:
-        return {'build': {}, 'repositories': {}}
 
 def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None, include_any=False):
     """Load both x86_64 and target architecture packages in parallel"""

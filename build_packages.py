@@ -36,7 +36,7 @@ class PackageBuilder:
     Manages chroot environments, dependency installation, package building,
     and cleanup operations. Supports dry-run mode and graceful interruption.
     """
-    def __init__(self, dry_run=False, chroot_path=None, cache_dir=None, no_cache=False, no_upload=False, stop_on_failure=False, preserve_chroot=False):
+    def __init__(self, dry_run=False, chroot_path=None, cache_dir=None, no_cache=False, no_upload=False, stop_on_failure=False, preserve_chroot=False, cleanup_on_failure=False):
         """
         Initialize the package builder.
         
@@ -48,6 +48,7 @@ class PackageBuilder:
             no_upload: Build but don't upload packages
             stop_on_failure: Stop on first build failure
             preserve_chroot: Preserve chroot even on successful builds
+            cleanup_on_failure: Delete temporary chroots even on build failure
         """
         self.build_utils = BuildUtils(dry_run)
         self.dry_run = dry_run
@@ -55,6 +56,7 @@ class PackageBuilder:
         self.no_cache = no_cache
         self.stop_on_failure = stop_on_failure
         self.preserve_chroot = preserve_chroot
+        self.cleanup_on_failure = cleanup_on_failure
         self.chroot_path = Path(chroot_path) if chroot_path else Path(BUILD_ROOT)
         self.cache_dir = Path(cache_dir) if cache_dir else Path(CACHE_PATH)
         self.logs_dir = Path("logs")
@@ -114,7 +116,7 @@ class PackageBuilder:
             print("Run setup_chroot() first or create with mkarchroot")
             return False
         
-        pkg_dir = safe_path_join(Path("pkgbuilds"), pkg_name)
+        pkg_dir = safe_path_join(Path("pkgbuilds"), pkg_data.get('basename', pkg_name))
         if not pkg_dir.exists():
             print(f"ERROR: Package directory {pkg_dir} not found")
             return False
@@ -585,10 +587,14 @@ echo "CHECKDEPENDS_END"
             if not pkgbuild_path.exists():
                 return []
             
+            from utils import get_target_architecture
+            target_arch = get_target_architecture()
+            
             import shlex
             temp_script = f"""#!/bin/bash
 cd {shlex.quote(str(pkg_dir))}
 source PKGBUILD 2>/dev/null || exit 1
+CARCH="{target_arch}"
 for pkg in "${{pkgname[@]}}"; do
     fullver="$pkgver-$pkgrel"
     if [[ -n $epoch ]]; then
@@ -639,7 +645,7 @@ done
             print(f"[DRY RUN] Would build {pkg_name}")
             print(f"{'='*SEPARATOR_WIDTH}")
             
-            pkg_dir = safe_path_join(Path("pkgbuilds"), pkg_name)
+            pkg_dir = safe_path_join(Path("pkgbuilds"), pkg_data.get('basename', pkg_name))
             if not pkg_dir.exists():
                 print(f"[DRY RUN] ERROR: Package directory {pkg_dir} does not exist")
                 return False
@@ -661,7 +667,7 @@ done
         if not self._validate_build_inputs(pkg_name, pkg_data):
             return False
         
-        pkg_dir = safe_path_join(Path("pkgbuilds"), pkg_name)
+        pkg_dir = safe_path_join(Path("pkgbuilds"), pkg_data.get('basename', pkg_name))
         
         # Setup temp chroot
         try:
@@ -697,9 +703,12 @@ done
         """Clean up temporary chroot"""
         if temp_copy_path in self.temp_copies:
             should_cleanup = True
-            if self.preserve_chroot or build_failed or (self.stop_on_failure and build_failed):
+            if self.preserve_chroot or (build_failed and not self.cleanup_on_failure):
                 should_cleanup = False
-                reason = "preserve-chroot flag" if self.preserve_chroot else "build failed"
+                if self.preserve_chroot:
+                    reason = "preserve-chroot flag"
+                else:
+                    reason = "build failed"
                 print(f"Preserving temporary chroot: {temp_copy_path} ({reason})")
             
             if should_cleanup:
@@ -791,6 +800,8 @@ def main():
                         help='Continue from last successful package')
     parser.add_argument('--preserve-chroot', action='store_true',
                         help='Preserve chroot even on successful builds')
+    parser.add_argument('--cleanup-on-failure', action='store_true',
+                        help='Delete temporary chroots even on build failure')
     parser.add_argument('--stop-on-failure', action='store_true',
                         help='Stop building on first package failure')
     parser.add_argument('--chroot',
@@ -810,7 +821,8 @@ def main():
         no_cache=args.no_cache,
         no_upload=args.no_upload,
         stop_on_failure=args.stop_on_failure,
-        preserve_chroot=args.preserve_chroot
+        preserve_chroot=args.preserve_chroot,
+        cleanup_on_failure=args.cleanup_on_failure
     )
     
     builder.build_packages(

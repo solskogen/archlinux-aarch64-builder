@@ -670,9 +670,21 @@ def sort_by_build_order(packages):
         basename = pkg.get('basename', pkg_name)
         build_list_provides[pkg_name] = pkg_name
         build_list_provides[basename] = basename
+        
+        # Add explicit provides
         for provide in pkg.get('provides', []):
             provide_name = provide.split('=')[0]
             build_list_provides[provide_name] = pkg_name
+    
+    # Add common split package patterns for packages in build list
+    # This handles cases like linux providing linux-headers, linux-docs, etc.
+    basenames_in_build = {pkg.get('basename', pkg['name']) for pkg in packages}
+    for basename in basenames_in_build:
+        # Common split package suffixes
+        for suffix in ['-headers', '-docs', '-devel', '-dev']:
+            split_name = basename + suffix
+            if split_name not in build_list_provides:
+                build_list_provides[split_name] = basename
     
     # Build dependency graph - only consider packages in our build list
     graph = defaultdict(set)  # pkg -> set of packages that depend on it
@@ -1164,7 +1176,7 @@ if __name__ == "__main__":
                         
                         is_blacklisted = False
                         for pattern in blacklist:
-                            if fnmatch.fnmatch(basename, pattern):
+                            if fnmatch.fnmatch(dep_name, pattern):
                                 is_blacklisted = True
                                 break
                         
@@ -1214,6 +1226,14 @@ if __name__ == "__main__":
                         for provide in pkg.get('provides', []):
                             provide_name = provide.split('=')[0]
                             build_list_provides[provide_name] = basename
+                    
+                    # Add common split package patterns for packages in build list
+                    basenames_in_build = {pkg.get('basename', pkg['name']) for pkg in newer_packages}
+                    for basename in basenames_in_build:
+                        for suffix in ['-headers', '-docs', '-devel', '-dev']:
+                            split_name = basename + suffix
+                            if split_name not in build_list_provides:
+                                build_list_provides[split_name] = basename
                     
                     for pkg in newer_packages:
                         # Filter dependencies for build ordering only
