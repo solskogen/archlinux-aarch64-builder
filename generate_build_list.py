@@ -340,6 +340,16 @@ echo "$fullver"
             provide_name = provide.split('=')[0]
             build_list_provides[provide_name] = basename
     
+    # Add common split package patterns for packages in build list
+    # This handles cases like linux providing linux-headers, linux-docs, etc.
+    basenames_in_build = {pkg.get('basename', pkg['name']) for pkg in all_packages}
+    for basename in basenames_in_build:
+        # Common split package suffixes
+        for suffix in ['-headers', '-docs', '-devel', '-dev']:
+            split_name = basename + suffix
+            if split_name not in build_list_provides:
+                build_list_provides[split_name] = basename
+    
     for pkg in all_packages:
         # Keep original dependencies for build system
         pkg['build_depends'] = pkg.get('depends', []).copy()
@@ -1226,6 +1236,14 @@ if __name__ == "__main__":
                         for provide in pkg.get('provides', []):
                             provide_name = provide.split('=')[0]
                             build_list_provides[provide_name] = basename
+                    
+                    # Add common split package patterns for packages in build list
+                    basenames_in_build = {pkg.get('basename', pkg['name']) for pkg in newer_packages}
+                    for basename in basenames_in_build:
+                        for suffix in ['-headers', '-docs', '-devel', '-dev']:
+                            split_name = basename + suffix
+                            if split_name not in build_list_provides:
+                                build_list_provides[split_name] = basename
                     
                     # Add common split package patterns for packages in build list
                     basenames_in_build = {pkg.get('basename', pkg['name']) for pkg in newer_packages}
