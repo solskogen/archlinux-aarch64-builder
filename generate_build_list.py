@@ -305,9 +305,11 @@ echo "$fullver"
                             if pull_error.stderr:
                                 print(f"Git error: {pull_error.stderr.strip()}")
             except subprocess.CalledProcessError as e:
-                print(f"Warning: Failed to update {basename}: {e}")
+                print(f"ERROR: Failed to update {basename}: {e}")
                 if hasattr(e, 'stderr') and e.stderr:
                     print(f"Git error: {e.stderr.strip()}")
+                print(f"Please resolve git conflicts in pkgbuilds/{basename} and run again.")
+                sys.exit(1)
         else:
             # Repository exists and is up to date
             print(f"[{i}/{total}] Processing {name} (PKGBUILD already up to date: {current_version or target_version})...")
