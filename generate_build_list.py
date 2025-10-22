@@ -282,6 +282,11 @@ echo "$fullver"
                     else:
                         print(f"[{i}/{total}] Processing {name} (updating to {target_version})...")
                     subprocess.run(["git", "fetch", "--tags"], cwd=pkg_repo_dir, check=True, capture_output=True)
+                    
+                    # Stash changes before checkout
+                    stash_result = subprocess.run(["git", "stash"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
+                    has_changes = "No local changes to save" not in stash_result.stdout
+                    
                     # Try different tag formats - replace : with - for git tags
                     git_version_tag = target_version.replace(':', '-')
                     tag_formats = list(set([git_version_tag, target_version, f"v{git_version_tag}", f"{basename}-{git_version_tag}"]))
@@ -310,6 +315,10 @@ echo "$fullver"
                             print(f"Warning: Failed to pull latest commit for {basename}: {pull_error}")
                             if pull_error.stderr:
                                 print(f"Git error: {pull_error.stderr.strip()}")
+                    
+                    # Restore stashed changes
+                    if has_changes:
+                        subprocess.run(["git", "stash", "pop"], cwd=pkg_repo_dir, check=True, capture_output=True)
             except subprocess.CalledProcessError as e:
                 print(f"ERROR: Failed to update {basename}: {e}")
                 if hasattr(e, 'stderr') and e.stderr:
