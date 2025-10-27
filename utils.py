@@ -515,6 +515,39 @@ class BuildUtils:
             print(f"Warning: Failed to clear {description}: {e}")
             return 0
 
+    def clear_packages_from_cache(self, cache_path, pkg_names):
+        """
+        Clear specific packages from cache directory.
+        
+        Args:
+            cache_path: Path to cache directory
+            pkg_names: List of package names to clear (e.g., ['gcc', 'gcc-libs'])
+        """
+        if self.dry_run:
+            self.format_dry_run(f"Would clear packages from cache", [f"Remove {', '.join(pkg_names)} from {cache_path}"])
+            return 0
+        
+        try:
+            cache_files = list(cache_path.glob("*.pkg.tar.*"))
+            removed_count = 0
+            
+            for cache_file in cache_files:
+                # Check if this cache file matches any of the package names
+                for pkg_name in pkg_names:
+                    if cache_file.name.startswith(f"{pkg_name}-"):
+                        try:
+                            cache_file.unlink()
+                            print(f"  Removed: {cache_file.name}")
+                            removed_count += 1
+                            break
+                        except Exception as e:
+                            print(f"  Warning: Failed to remove {cache_file.name}: {e}")
+            
+            return removed_count
+        except Exception as e:
+            print(f"Warning: Failed to clear packages from cache: {e}")
+            return 0
+
     def cleanup_old_logs(self, package_name, keep_count=None):
         """
         Keep only the most recent N log files for a package.
@@ -626,6 +659,7 @@ def extract_packages(db_file, repo_name):
 def find_missing_dependencies(packages, x86_packages, target_packages):
     """Find dependencies that exist in x86_64 but missing from target architecture"""
     missing_deps = set()
+    processed = set()
     
     # Build provides mapping for target architecture packages
     target_provides = {}
@@ -635,18 +669,41 @@ def find_missing_dependencies(packages, x86_packages, target_packages):
             provide_name = provide.split('=')[0]
             target_provides[provide_name] = pkg
     
-    for pkg in packages:
-        # Use build dependencies (complete, unfiltered) for missing dependency detection
-        all_deps = pkg.get('build_depends', pkg.get('depends', [])) + pkg.get('build_makedepends', pkg.get('makedepends', []))
-        if 'build_checkdepends' in pkg:
-            all_deps += pkg['build_checkdepends']
-        elif 'checkdepends' in pkg:
-            all_deps += pkg['checkdepends']
+    def check_dependencies_recursive(pkg_list):
+        """Recursively check dependencies and add missing ones"""
+        new_missing = set()
+        
+        for pkg in pkg_list:
+            # Use build dependencies (complete, unfiltered) for missing dependency detection
+            all_deps = pkg.get('build_depends', pkg.get('depends', [])) + pkg.get('build_makedepends', pkg.get('makedepends', []))
+            if 'build_checkdepends' in pkg:
+                all_deps += pkg['build_checkdepends']
+            elif 'checkdepends' in pkg:
+                all_deps += pkg['checkdepends']
+                
+            for dep in all_deps:
+                dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
+                if (dep_name in x86_packages and 
+                    dep_name not in target_packages and 
+                    dep_name not in target_provides and
+                    dep_name not in processed):
+                    
+                    missing_deps.add(dep_name)
+                    new_missing.add(dep_name)
+                    processed.add(dep_name)
+        
+        # Recursively check dependencies of newly found missing packages
+        if new_missing:
+            missing_pkg_data = []
+            for dep_name in new_missing:
+                if dep_name in x86_packages:
+                    missing_pkg_data.append(x86_packages[dep_name])
             
-        for dep in all_deps:
-            dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
-            if dep_name in x86_packages and dep_name not in target_packages and dep_name not in target_provides:
-                missing_deps.add(dep_name)
+            if missing_pkg_data:
+                check_dependencies_recursive(missing_pkg_data)
+    
+    # Start with the initial packages
+    check_dependencies_recursive(packages)
     
     return missing_deps
 

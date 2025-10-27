@@ -252,11 +252,38 @@ echo "$fullver"
                     stash_result = subprocess.run(["git", "stash"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
                     has_changes = "No local changes to save" not in stash_result.stdout
                     
-                    subprocess.run(["git", "checkout", "main"], cwd=pkg_repo_dir, check=True, capture_output=True)
+                    # Get the default branch dynamically
+                    default_branch_result = subprocess.run(["git", "symbolic-ref", "refs/remotes/origin/HEAD"], 
+                                                          cwd=pkg_repo_dir, capture_output=True, text=True)
+                    if default_branch_result.returncode == 0:
+                        default_branch = default_branch_result.stdout.strip().split('/')[-1]
+                    else:
+                        # Fallback: get current branch
+                        current_branch_result = subprocess.run(["git", "branch", "--show-current"], 
+                                                             cwd=pkg_repo_dir, capture_output=True, text=True)
+                        default_branch = current_branch_result.stdout.strip() or "main"
+                    
+                    subprocess.run(["git", "checkout", default_branch], cwd=pkg_repo_dir, check=True, capture_output=True)
                     subprocess.run(["git", "pull"], cwd=pkg_repo_dir, check=True, capture_output=True)
                     
                     if has_changes:
-                        subprocess.run(["git", "stash", "pop"], cwd=pkg_repo_dir, check=True, capture_output=True)
+                        try:
+                            subprocess.run(["git", "stash", "pop"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
+                        except subprocess.CalledProcessError as e:
+                            print(f"ERROR: Failed to restore stashed changes for {basename}")
+                            if e.stderr:
+                                print(f"Git error: {e.stderr.strip()}")
+                            # Check for merge conflicts
+                            status_result = subprocess.run(["git", "status", "--porcelain"], cwd=pkg_repo_dir, capture_output=True, text=True)
+                            if status_result.stdout:
+                                print("Git status shows conflicts:")
+                                for line in status_result.stdout.strip().split('\n'):
+                                    if line.startswith('UU') or line.startswith('AA') or line.startswith('DD'):
+                                        print(f"  Conflict: {line}")
+                                    elif line.strip():
+                                        print(f"  {line}")
+                            print(f"Please resolve conflicts in pkgbuilds/{basename} and run again.")
+                            sys.exit(1)
                     
                     # Re-read version after git pull for --use-latest
                     try:
@@ -318,7 +345,23 @@ echo "$fullver"
                     
                     # Restore stashed changes
                     if has_changes:
-                        subprocess.run(["git", "stash", "pop"], cwd=pkg_repo_dir, check=True, capture_output=True)
+                        try:
+                            subprocess.run(["git", "stash", "pop"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
+                        except subprocess.CalledProcessError as e:
+                            print(f"ERROR: Failed to restore stashed changes for {basename}")
+                            if e.stderr:
+                                print(f"Git error: {e.stderr.strip()}")
+                            # Check for merge conflicts
+                            status_result = subprocess.run(["git", "status", "--porcelain"], cwd=pkg_repo_dir, capture_output=True, text=True)
+                            if status_result.stdout:
+                                print("Git status shows conflicts:")
+                                for line in status_result.stdout.strip().split('\n'):
+                                    if line.startswith('UU') or line.startswith('AA') or line.startswith('DD'):
+                                        print(f"  Conflict: {line}")
+                                    elif line.strip():
+                                        print(f"  {line}")
+                            print(f"Please resolve conflicts in pkgbuilds/{basename} and run again.")
+                            sys.exit(1)
             except subprocess.CalledProcessError as e:
                 print(f"ERROR: Failed to update {basename}: {e}")
                 if hasattr(e, 'stderr') and e.stderr:
@@ -981,7 +1024,7 @@ if __name__ == "__main__":
             # Fetch PKGBUILDs and write results
             if newer_packages:
                 print("Processing PKGBUILDs for dependency information...")
-                newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, {})
+                newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update)
             
             if args.preserve_order:
                 newer_packages = preserve_package_order(newer_packages, list(args.use_aur_for_packages))
@@ -1203,7 +1246,7 @@ if __name__ == "__main__":
                         
                         is_blacklisted = False
                         for pattern in blacklist:
-                            if fnmatch.fnmatch(dep_name, pattern):
+                            if fnmatch.fnmatch(dep_name, pattern) or fnmatch.fnmatch(basename, pattern):
                                 is_blacklisted = True
                                 break
                         

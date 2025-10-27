@@ -129,9 +129,13 @@ class BootstrapBuilder(BuildUtils):
         try:
             self.run_command([
                 "arch-nspawn", str(self.chroot_path / "root"),
-                "pacman", "-S", "--noconfirm"
+                "pacman", "-Sy", "--noconfirm"
             ] + all_toolchain)
         except subprocess.CalledProcessError:
+            # Clear cache on pacman failure to remove any corrupted packages
+            print("Pacman failed, clearing toolchain packages from cache...")
+            removed_count = self.clear_packages_from_cache(self.cache_path, all_toolchain)
+            print(f"Cleared {removed_count} toolchain packages from cache after pacman failure")
             # Ignore failures - some packages might not exist yet
             pass
         

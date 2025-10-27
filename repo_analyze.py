@@ -5,10 +5,46 @@ from pathlib import Path
 from packaging import version
 import tarfile
 import fnmatch
+from multiprocessing import Pool, cpu_count
+from functools import partial
 
 
 
 from utils import load_blacklist, parse_database_file, X86_64_MIRROR, get_target_architecture, load_target_arch_packages, load_packages_with_any, config, load_all_packages_parallel
+
+def build_provides_chunk(packages_chunk):
+    """Build provides mapping for a chunk of packages"""
+    provides = {}
+    for pkg_name, pkg_data in packages_chunk:
+        for provide in pkg_data.get('provides', []):
+            provide_name = provide.split('=')[0].split('<')[0].split('>')[0]
+            provides[provide_name] = pkg_name
+    return provides
+
+def build_provides_parallel(packages):
+    """Build provides mapping using multiple cores"""
+    if len(packages) < 1000:  # Use single thread for small datasets
+        provides = {}
+        for pkg_name, pkg_data in packages.items():
+            for provide in pkg_data.get('provides', []):
+                provide_name = provide.split('=')[0].split('<')[0].split('>')[0]
+                provides[provide_name] = pkg_name
+        return provides
+    
+    # Split packages into chunks for parallel processing
+    items = list(packages.items())
+    chunk_size = max(100, len(items) // cpu_count())
+    chunks = [items[i:i + chunk_size] for i in range(0, len(items), chunk_size)]
+    
+    with Pool() as pool:
+        results = pool.map(build_provides_chunk, chunks)
+    
+    # Merge results
+    provides = {}
+    for result in results:
+        provides.update(result)
+    
+    return provides
 
 def main():
     target_arch = get_target_architecture()
@@ -38,17 +74,26 @@ def main():
     print("Loading packages...")
     x86_packages, target_packages = load_all_packages_parallel(download=not args.use_existing_db, include_any=True)
     
-    # Group by basename
+    # Group by basename (optimized)
+    print("Grouping packages by basename...")
     x86_bases = {}
+    x86_by_basename = {}  # basename -> [pkg_names]
     for pkg_name, pkg_data in x86_packages.items():
         basename = pkg_data['basename']
         x86_bases[basename] = pkg_data
+        if basename not in x86_by_basename:
+            x86_by_basename[basename] = []
+        x86_by_basename[basename].append(pkg_name)
     
     target_bases = {}
+    target_by_basename = {}  # basename -> [pkg_names]
     target_repo_count = {}
     for pkg_name, pkg_data in target_packages.items():
         basename = pkg_data['basename']
         target_bases[basename] = pkg_data
+        if basename not in target_by_basename:
+            target_by_basename[basename] = []
+        target_by_basename[basename].append(pkg_name)
         # Track which repos each basename appears in
         if basename not in target_repo_count:
             target_repo_count[basename] = set()
@@ -59,13 +104,25 @@ def main():
         if len(repos) > 1:
             target_duplicates.append(f"{basename}: present in {', '.join(sorted(repos))}")
     
-    # Build provides lookup for x86_64
+    # Build provides lookup for x86_64 (with progress)
+    print(f"Building x86_64 provides mapping ({len(x86_packages)} packages)...")
     x86_provides = {}
-    for pkg_name, pkg_data in x86_packages.items():
+    for i, (pkg_name, pkg_data) in enumerate(x86_packages.items()):
+        if i % 2000 == 0 and i > 0:
+            print(f"  Processed {i}/{len(x86_packages)} x86_64 packages...")
         for provide in pkg_data.get('provides', []):
-            # Strip version info from provides (e.g., "electron31=1.0" -> "electron31")
             provide_name = provide.split('=')[0].split('<')[0].split('>')[0]
             x86_provides[provide_name] = pkg_name
+    
+    # Build provides lookup for target architecture (with progress)
+    print(f"Building {target_arch} provides mapping ({len(target_packages)} packages)...")
+    target_provides = {}
+    for i, (pkg_name, pkg_data) in enumerate(target_packages.items()):
+        if i % 2000 == 0 and i > 0:
+            print(f"  Processed {i}/{len(target_packages)} {target_arch} packages...")
+        for provide in pkg_data.get('provides', []):
+            provide_name = provide.split('=')[0].split('<')[0].split('>')[0]
+            target_provides[provide_name] = pkg_name
     
     repo_issues = []
     target_newer = []
@@ -75,33 +132,41 @@ def main():
     missing_pkgbase = []
     package_name_mismatches = []
     
-    # Check for package name mismatches (same basename, different package names)
-    for basename in x86_bases:
+    # Check for package name mismatches (optimized)
+    print(f"Checking package name mismatches ({len(x86_bases)} basenames)...")
+    for i, basename in enumerate(x86_bases):
+        if i % 2000 == 0 and i > 0:
+            print(f"  Processed {i}/{len(x86_bases)} basenames...")
         if basename in target_bases:
-            # Collect package names for this basename from both architectures
-            x86_pkg_names = set()
-            target_pkg_names = set()
-            
-            for pkg_name, pkg_data in x86_packages.items():
-                if pkg_data['basename'] == basename:
-                    x86_pkg_names.add(pkg_name)
-            
-            for pkg_name, pkg_data in target_packages.items():
-                if pkg_data['basename'] == basename:
-                    target_pkg_names.add(pkg_name)
+            # Use pre-grouped package names (O(1) lookup instead of O(n) iteration)
+            x86_pkg_names = set(x86_by_basename[basename])
+            target_pkg_names = set(target_by_basename[basename])
             
             # Find packages that exist in one arch but not the other
             x86_only = x86_pkg_names - target_pkg_names
             target_only_names = target_pkg_names - x86_pkg_names
             
-            if x86_only or target_only_names:
+            # Filter out packages that are provided by other packages
+            x86_only_filtered = set()
+            for pkg_name in x86_only:
+                # Check if this package is provided by any target package
+                if pkg_name not in target_provides:
+                    x86_only_filtered.add(pkg_name)
+            
+            target_only_filtered = set()
+            for pkg_name in target_only_names:
+                # Check if this package is provided by any x86_64 package
+                if pkg_name not in x86_provides:
+                    target_only_filtered.add(pkg_name)
+            
+            if x86_only_filtered or target_only_filtered:
                 parts = []
-                if x86_only:
-                    parts.append(f"x86_64 has {', '.join(sorted(x86_only))}")
-                if target_only_names:
+                if x86_only_filtered:
+                    parts.append(f"x86_64 has {', '.join(sorted(x86_only_filtered))}")
+                if target_only_filtered:
                     # Add filenames for target-only packages
                     target_only_with_files = []
-                    for pkg_name in sorted(target_only_names):
+                    for pkg_name in sorted(target_only_filtered):
                         if pkg_name in target_packages:
                             pkg_data = target_packages[pkg_name]
                             filename = pkg_data.get('filename', f"{pkg_name}-{pkg_data.get('version', 'unknown')}-{target_arch}.pkg.tar.zst")
@@ -117,7 +182,10 @@ def main():
             repo_issues.append(f"{basename}: present in {', '.join(sorted(repos))} on {target_arch}")
     
     # Find missing pkgbase in target architecture
-    for basename in x86_bases:
+    print(f"Finding missing pkgbase ({len(x86_bases)} to check)...")
+    for i, basename in enumerate(x86_bases):
+        if i % 2000 == 0 and i > 0:
+            print(f"  Processed {i}/{len(x86_bases)} basenames...")
         if basename not in target_bases:
             # Check if basename matches any blacklist pattern
             is_blacklisted = False
@@ -143,19 +211,22 @@ def main():
                 missing_pkgbase.append(basename)
     
     # Check AArch64 packages
-    for basename, target_data in target_bases.items():
+    print(f"Checking {target_arch} packages ({len(target_bases)} basenames)...")
+    for i, (basename, target_data) in enumerate(target_bases.items()):
+        if i % 2000 == 0 and i > 0:
+            print(f"  Processed {i}/{len(target_bases)} basenames...")
         if basename in x86_bases:
             x86_data = x86_bases[basename]
             
-            # Check for outdated any packages - check all individual packages for this basename
-            for pkg_name, pkg_data in target_packages.items():
-                if pkg_data['basename'] == basename:
-                    if pkg_data.get('arch') == 'any' or pkg_data.get('filename', '').endswith('any.pkg.tar.zst'):
-                        try:
-                            if version.parse(pkg_data['version']) < version.parse(x86_data['version']):
-                                any_outdated.append(f"{pkg_name}: {target_arch}={pkg_data['version']}, x86_64={x86_data['version']}")
-                        except:
-                            pass
+            # Check for outdated any packages - use pre-grouped data
+            for pkg_name in target_by_basename[basename]:
+                pkg_data = target_packages[pkg_name]
+                if pkg_data.get('arch') == 'any' or pkg_data.get('filename', '').endswith('any.pkg.tar.zst'):
+                    try:
+                        if version.parse(pkg_data['version']) < version.parse(x86_data['version']):
+                            any_outdated.append(f"{pkg_name}: {target_arch}={pkg_data['version']}, x86_64={x86_data['version']}")
+                    except:
+                        pass
             
             # Check repo mismatch
             if target_data['repo'] != x86_data['repo']:
