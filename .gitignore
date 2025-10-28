@@ -1,11 +1,2 @@
-*.json
-chroot-config/
-*.db
-logs/
-pkgbuilds/
-old.pkgbuilds/
-__pycache__/
-state/
-blacklist.txt
-TEST_SUMMARY.md
-last_successful.txt
+# Ignore everything
+*

@@ -201,11 +201,10 @@ class PackageBuilder:
         except subprocess.CalledProcessError as e:
             print(f"Warning: Failed to update package database: {e}")
         
-        # Parse and install dependencies
+        # Parse and install only checkdepends (makechrootpkg handles depends/makedepends)
         depends, makedepends, checkdepends = self._parse_pkgbuild_deps(pkg_dir)
-        all_deps = depends + makedepends + checkdepends
-        if all_deps:
-            print(f"Installing dependencies: {' '.join(all_deps)}")
+        if checkdepends:
+            print(f"Installing checkdepends: {' '.join(checkdepends)}")
             try:
                 env = os.environ.copy()
                 env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
@@ -214,7 +213,7 @@ class PackageBuilder:
                     "-c", str(self.cache_dir),
                     str(temp_copy_path),
                     "pacman", "-S", "--noconfirm"
-                ] + all_deps, check=True, env=env)
+                ] + checkdepends, check=True, env=env)
             except KeyboardInterrupt:
                 sys.exit(1)
 
