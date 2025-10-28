@@ -1551,13 +1551,13 @@ if __name__ == "__main__":
         
         if outdated_toolchain:
             print(f"\n{'='*60}")
-            print(f"⚠️  WARNING: Bootstrap toolchain packages are outdated!")
+            print(f"⚠️  WARNING: Bootstrap toolchain packages will be rebuilt!")
             print(f"{'='*60}")
-            print(f"The following toolchain packages need updates:")
+            print(f"The following toolchain packages are in the build list:")
             for pkg_name in sorted(set(outdated_toolchain)):
                 print(f"  - {pkg_name}")
-            print(f"\nConsider running a bootstrap build:")
-            print(f"  ./build_packages.py --bootstrap-toolchain")
+            print(f"\nConsider running a bootstrap build instead:")
+            print(f"  ./bootstrap_toolchain.py")
             print(f"{'='*60}")
     
     print("Complete!")
