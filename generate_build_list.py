@@ -435,18 +435,16 @@ echo "$fullver"
     build_list_names = {pkg['name'] for pkg in all_packages}
     build_list_basenames = {pkg.get('basename', pkg['name']) for pkg in all_packages}
     
-    # Build provides mapping from packages in the build list
+    # Build provides mapping from ALL packages (x86_64 + target)
     build_list_provides = {}
-    for pkg in all_packages:
-        pkg_name = pkg['name']
-        basename = pkg.get('basename', pkg_name)
-        # Package provides itself
-        build_list_provides[pkg_name] = basename
-        build_list_provides[basename] = basename
-        # Add explicit provides
-        for provide in pkg.get('provides', []):
-            provide_name = provide.split('=')[0]
-            build_list_provides[provide_name] = basename
+    for pkg_dict in [full_x86_packages, target_packages]:
+        for pkg_name, pkg_data in pkg_dict.items():
+            basename = pkg_data.get('basename', pkg_name)
+            build_list_provides[pkg_name] = basename
+            build_list_provides[basename] = basename
+            for provide in pkg_data.get('provides', []):
+                provide_name = provide.split('=')[0]
+                build_list_provides[provide_name] = basename
     
     # Add common split package patterns for packages in build list
     # This handles cases like linux providing linux-headers, linux-docs, etc.
@@ -781,18 +779,16 @@ def sort_by_build_order(packages):
     # Create package name to package mapping
     pkg_map = {pkg['name']: pkg for pkg in packages}
     
-    # Build provides mapping from packages in the build list
-    build_list_provides = {}
-    for pkg in packages:
-        pkg_name = pkg['name']
-        basename = pkg.get('basename', pkg_name)
-        build_list_provides[pkg_name] = pkg_name
-        build_list_provides[basename] = basename
-        
-        # Add explicit provides
-        for provide in pkg.get('provides', []):
-            provide_name = provide.split('=')[0]
-            build_list_provides[provide_name] = pkg_name
+    # Build provides mapping from ALL packages (x86_64 + target) for dependency resolution
+    all_provides = {}
+    for pkg_dict in [x86_packages, target_packages]:
+        for pkg_name, pkg_data in pkg_dict.items():
+            basename = pkg_data.get('basename', pkg_name)
+            all_provides[pkg_name] = pkg_name
+            all_provides[basename] = basename
+            for provide in pkg_data.get('provides', []):
+                provide_name = provide.split('=')[0].strip()
+                all_provides[provide_name] = pkg_name
     
     # Add common split package patterns for packages in build list
     # This handles cases like linux providing linux-headers, linux-docs, etc.
@@ -834,10 +830,16 @@ def sort_by_build_order(packages):
             elif dep_name in build_list_provides:
                 provider_pkg = build_list_provides[dep_name]
             
-            # Only create edge if dependency is also in our build list
+            # Only create edge if dependency is also in our build list OR exists in the ecosystem
             if provider_pkg and provider_pkg in pkg_map and provider_pkg != pkg_name:
                 graph[provider_pkg].add(pkg_name)
                 reverse_graph[pkg_name].add(provider_pkg)
+                in_degree[pkg_name] += 1
+            elif dep_name in all_provides and all_provides[dep_name] in pkg_map and all_provides[dep_name] != pkg_name:
+                # Dependency exists in ecosystem and provider is in build list
+                actual_provider = all_provides[dep_name]
+                graph[actual_provider].add(pkg_name)
+                reverse_graph[pkg_name].add(actual_provider)
                 in_degree[pkg_name] += 1
     
     # Find strongly connected components (cycles)
@@ -952,7 +954,27 @@ def sort_by_build_order(packages):
             queue = next_queue
     
     # Sort by build stage, then by cycle stage, then by name
-    return sorted(result, key=lambda x: (x['build_stage'], x.get('cycle_stage') or 0, x['name']))
+    sorted_result = sorted(result, key=lambda x: (x['build_stage'], x.get('cycle_stage') or 0, x['name']))
+    
+    # Ensure all input packages are included in the result
+    result_names = {pkg['name'] for pkg in sorted_result}
+    missing_packages = []
+    for pkg in packages:
+        if pkg['name'] not in result_names:
+            # Add missing packages to stage 0 (no dependencies)
+            pkg_copy = pkg.copy()
+            pkg_copy['build_stage'] = 0
+            pkg_copy['cycle_group'] = None
+            pkg_copy['cycle_stage'] = None
+            missing_packages.append(pkg_copy)
+    
+    if missing_packages:
+        # Insert missing packages at the beginning (stage 0)
+        sorted_result = missing_packages + sorted_result
+        # Re-sort to maintain proper ordering
+        sorted_result = sorted(sorted_result, key=lambda x: (x['build_stage'], x.get('cycle_stage') or 0, x['name']))
+    
+    return sorted_result
 
 if __name__ == "__main__":
     # Clean up state from previous builds
@@ -980,6 +1002,8 @@ if __name__ == "__main__":
                         help=f'Generate list of all packages present in x86_64 but missing from {target_arch}')
     parser.add_argument('--rebuild-repo', choices=['core', 'extra'],
                         help='Rebuild all packages from specified repository regardless of version')
+    parser.add_argument('--include-testing', action='store_true',
+                        help='Include target architecture testing repositories (core-testing, extra-testing) when comparing versions')
     
     # Mutually exclusive group for git update options
     git_group = parser.add_mutually_exclusive_group()
@@ -1098,7 +1122,7 @@ if __name__ == "__main__":
             all_x86_packages = load_packages_with_any(any_urls, '_x86_64', download=not args.no_update, include_any=True)
         else:
             all_x86_packages = load_x86_64_packages(download=not args.no_update)
-        target_packages = load_target_arch_packages(download=not args.no_update)
+        target_packages = load_target_arch_packages(download=not args.no_update, include_testing=args.include_testing)
         
         # Filter to only requested packages for comparison, but keep full list for dependency resolution
         filtered_x86_packages = {}
@@ -1165,7 +1189,7 @@ if __name__ == "__main__":
     elif not args.aur:
         # Load packages using unified function
         repo_filter = [args.rebuild_repo] if args.rebuild_repo else None
-        x86_packages, target_packages = load_packages_unified(download=not args.no_update, x86_repos=repo_filter, target_repos=repo_filter)
+        x86_packages, target_packages = load_packages_unified(download=not args.no_update, x86_repos=repo_filter, target_repos=repo_filter, include_testing=args.include_testing)
         
         # Use same list for dependency resolution
         full_x86_packages = x86_packages
@@ -1262,6 +1286,11 @@ if __name__ == "__main__":
             if missing_deps:
                 print(f"Found {len(missing_deps)} missing dependencies: {', '.join(sorted(missing_deps))}")
                 
+                print(f"DEBUG: Before adding missing deps: {len(newer_packages)} packages")
+                debug_names = [pkg['name'] for pkg in newer_packages if pkg['name'] in ['nix', 'p2pool', 'zed']]
+                if debug_names:
+                    print(f"DEBUG: Target packages present: {debug_names}")
+                
                 # Track reasons for each missing dependency
                 dep_reasons = {}
                 for pkg in newer_packages:
@@ -1314,6 +1343,13 @@ if __name__ == "__main__":
                                 'added_reason': reason,
                             })
                 
+                print(f"DEBUG: After adding missing deps: {len(newer_packages)} packages")
+                debug_names = [pkg['name'] for pkg in newer_packages if pkg['name'] in ['nix', 'p2pool', 'zed']]
+                if debug_names:
+                    print(f"DEBUG: Target packages present: {debug_names}")
+                else:
+                    print("DEBUG: Target packages LOST during missing dependency processing")
+                
                 # Parse PKGBUILDs only for newly added dependencies
                 added_deps = [dep_name for dep_name in missing_deps if dep_name in full_x86_packages]
                 if added_deps:
@@ -1331,19 +1367,26 @@ if __name__ == "__main__":
                     
                     # Re-filter dependencies for all packages now that we have the complete list
                     print("Re-filtering dependencies with complete package list...")
+                    print(f"DEBUG: Before re-filtering: {len(newer_packages)} packages")
+                    debug_names = [pkg['name'] for pkg in newer_packages if pkg['name'] in ['nix', 'p2pool', 'zed']]
+                    if debug_names:
+                        print(f"DEBUG: Target packages present: {debug_names}")
+                    
                     build_list_names = {pkg['name'] for pkg in newer_packages}
                     build_list_basenames = {pkg.get('basename', pkg['name']) for pkg in newer_packages}
                     
-                    # Build provides mapping from packages in the build list
+                    # Build provides mapping from ALL packages (x86_64 + target)
                     build_list_provides = {}
-                    for pkg in newer_packages:
-                        pkg_name = pkg['name']
-                        basename = pkg.get('basename', pkg_name)
-                        build_list_provides[pkg_name] = basename
-                        build_list_provides[basename] = basename
-                        for provide in pkg.get('provides', []):
-                            provide_name = provide.split('=')[0]
-                            build_list_provides[provide_name] = basename
+                    for pkg_dict in [full_x86_packages, target_packages]:
+                        for pkg_name, pkg_data in pkg_dict.items():
+                            basename = pkg_data.get('basename', pkg_name)
+                            build_list_provides[pkg_name] = basename
+                            build_list_provides[basename] = basename
+                            for provide in pkg_data.get('provides', []):
+                                provide_name = provide.split('=')[0]
+                                build_list_provides[provide_name] = basename
+                    
+                    print(f"DEBUG: libcurl.so maps to: {build_list_provides.get('libcurl.so', 'NOT FOUND')}")
                     
                     # Add common split package patterns for packages in build list
                     basenames_in_build = {pkg.get('basename', pkg['name']) for pkg in newer_packages}
@@ -1372,7 +1415,16 @@ if __name__ == "__main__":
                                         dep_name in build_list_basenames or
                                         dep_name in build_list_provides):
                                         filtered_deps.append(dep)
+                                    elif pkg['name'] in ['nix', 'p2pool', 'zed'] and dep_name == 'libcurl.so':
+                                        print(f"DEBUG: {pkg['name']} dependency {dep_name} NOT FOUND in provides mapping")
                                 pkg[dep_type] = filtered_deps
+                    
+                    print(f"DEBUG: After re-filtering: {len(newer_packages)} packages")
+                    debug_names = [pkg['name'] for pkg in newer_packages if pkg['name'] in ['nix', 'p2pool', 'zed']]
+                    if debug_names:
+                        print(f"DEBUG: Target packages present: {debug_names}")
+                    else:
+                        print("DEBUG: Target packages LOST during re-filtering")
     elif newer_packages:
         # For missing packages mode, still need PKGBUILD parsing
         print("Processing PKGBUILDs for dependency information...")
@@ -1516,7 +1568,17 @@ if __name__ == "__main__":
         sorted_packages = preserve_package_order(newer_packages, args.packages)
     else:
         print("Sorting by build order...")
+        input_names = {pkg['name'] for pkg in newer_packages}
         sorted_packages = sort_by_build_order(newer_packages)
+        output_names = {pkg['name'] for pkg in sorted_packages}
+        
+        # Report filtered packages with basic info
+        if len(sorted_packages) != len(newer_packages):
+            filtered_count = len(newer_packages) - len(sorted_packages)
+            filtered_out = sorted(input_names - output_names)
+            print(f"WARNING: {filtered_count} packages filtered out during dependency resolution:")
+            print(f"  {', '.join(filtered_out)}")
+            print("  (These packages have dependencies not available in the current build set)")
     
     write_results(sorted_packages, args)
     
@@ -1551,13 +1613,13 @@ if __name__ == "__main__":
         
         if outdated_toolchain:
             print(f"\n{'='*60}")
-            print(f"⚠️  WARNING: Bootstrap toolchain packages will be rebuilt!")
+            print(f"⚠️  WARNING: Bootstrap toolchain packages are outdated!")
             print(f"{'='*60}")
-            print(f"The following toolchain packages are in the build list:")
+            print(f"The following toolchain packages need updates:")
             for pkg_name in sorted(set(outdated_toolchain)):
                 print(f"  - {pkg_name}")
-            print(f"\nConsider running a bootstrap build instead:")
-            print(f"  ./bootstrap_toolchain.py")
+            print(f"\nConsider running a bootstrap build:")
+            print(f"  ./build_packages.py --bootstrap-toolchain")
             print(f"{'='*60}")
     
     print("Complete!")

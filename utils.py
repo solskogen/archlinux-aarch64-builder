@@ -332,6 +332,10 @@ def load_database_packages(urls, arch_suffix, download=True):
                 print(f"Using existing {db_filename}")
             
             repo_name = url.split('/')[-4]  # Extract 'core' or 'extra' from URL
+            # Handle testing repos
+            if repo_name.endswith('-testing'):
+                repo_name = repo_name.replace('-testing', '')
+            
             print(f"Parsing {db_filename}...")
             repo_packages = parse_database_file(db_filename)
             
@@ -355,7 +359,16 @@ def load_database_packages(urls, arch_suffix, download=True):
         
         for future in concurrent.futures.as_completed(future_to_url):
             repo_packages = future.result()
-            packages.update(repo_packages)
+            
+            # For target arch with testing: merge by overwriting with newer versions
+            for name, pkg in repo_packages.items():
+                if name not in packages:
+                    packages[name] = pkg
+                else:
+                    # Keep newer version
+                    existing = packages[name]
+                    if is_version_newer(existing['version'], pkg['version']):
+                        packages[name] = pkg
     
     return packages
 
@@ -382,8 +395,7 @@ def load_x86_64_packages(download=True, repos=None):
     
     return load_database_packages(urls, '_x86_64', download)
 
-# Compatibility alias for existing code
-def load_target_arch_packages(download=True, urls=None):
+def load_target_arch_packages(download=True, urls=None, include_testing=False):
     """Load target architecture packages from configured repositories"""
     target_arch = get_target_architecture()
     
@@ -395,6 +407,11 @@ def load_target_arch_packages(download=True, urls=None):
                 f"{base_url}/core/os/{target_arch}/core.db",
                 f"{base_url}/extra/os/{target_arch}/extra.db"
             ]
+            if include_testing:
+                urls.extend([
+                    f"{base_url}/core-testing/os/{target_arch}/core-testing.db",
+                    f"{base_url}/extra-testing/os/{target_arch}/extra-testing.db"
+                ])
         except configparser.NoOptionError as e:
             print(f"ERROR: Missing configuration in config.ini: {e}")
             print("Please add the following to your config.ini:")
@@ -657,7 +674,7 @@ def extract_packages(db_file, repo_name):
     return packages
 
 def find_missing_dependencies(packages, x86_packages, target_packages):
-    """Find dependencies that exist in x86_64 but missing from target architecture"""
+    """Find dependencies that exist in x86_64 but are completely missing from target architecture"""
     missing_deps = set()
     processed = set()
     
@@ -665,7 +682,9 @@ def find_missing_dependencies(packages, x86_packages, target_packages):
     target_provides = {}
     for name, pkg in target_packages.items():
         target_provides[name] = pkg
-        for provide in pkg['provides']:
+        basename = pkg.get('basename', name)
+        target_provides[basename] = pkg
+        for provide in pkg.get('provides', []):
             provide_name = provide.split('=')[0]
             target_provides[provide_name] = pkg
     
@@ -684,7 +703,6 @@ def find_missing_dependencies(packages, x86_packages, target_packages):
             for dep in all_deps:
                 dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
                 if (dep_name in x86_packages and 
-                    dep_name not in target_packages and 
                     dep_name not in target_provides and
                     dep_name not in processed):
                     
@@ -707,7 +725,7 @@ def find_missing_dependencies(packages, x86_packages, target_packages):
     
     return missing_deps
 
-def load_packages_unified(download=True, include_any=False, use_existing=False, x86_repos=None, target_repos=None):
+def load_packages_unified(download=True, include_any=False, use_existing=False, x86_repos=None, target_repos=None, include_testing=False):
     """
     Unified package loading function for all scripts.
     
@@ -717,6 +735,7 @@ def load_packages_unified(download=True, include_any=False, use_existing=False, 
         use_existing: Use existing database files without downloading
         x86_repos: Filter x86_64 repos (for compatibility)
         target_repos: Filter target repos (for compatibility)
+        include_testing: Include testing repositories for target architecture
         
     Returns:
         tuple: (x86_64_packages, target_packages)
@@ -732,7 +751,7 @@ def load_packages_unified(download=True, include_any=False, use_existing=False, 
     # Load packages using existing parallel function
     x86_packages, target_packages = load_all_packages_parallel(
         download=download, include_any=include_any, 
-        x86_repos=x86_repos, target_repos=target_repos
+        x86_repos=x86_repos, target_repos=target_repos, include_testing=include_testing
     )
     
     return x86_packages, target_packages
@@ -769,7 +788,7 @@ def safe_command_execution(cmd, operation_name, cwd=None, exit_on_error=True, **
     except Exception as e:
         return handle_command_error(e, operation_name, exit_on_error)
 
-def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None, include_any=False):
+def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None, include_any=False, include_testing=False):
     """Load both x86_64 and target architecture packages in parallel"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
@@ -787,6 +806,11 @@ def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None,
             f"{base_url}/core/os/{target_arch}/core.db",
             f"{base_url}/extra/os/{target_arch}/extra.db"
         ]
+        if include_testing:
+            target_urls.extend([
+                f"{base_url}/core-testing/os/{target_arch}/core-testing.db",
+                f"{base_url}/extra-testing/os/{target_arch}/extra-testing.db"
+            ])
     except configparser.NoOptionError as e:
         print(f"ERROR: Missing configuration in config.ini: {e}")
         print("Please add the following to your config.ini:")
@@ -803,16 +827,18 @@ def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None,
     
     if target_repos:
         if 'core' in target_repos and 'extra' not in target_repos:
-            target_urls = [target_urls[0]]
+            target_urls = [url for url in target_urls if '/core/' in url or '/core-testing/' in url]
         elif 'extra' in target_repos and 'core' not in target_repos:
-            target_urls = [target_urls[1]]
+            target_urls = [url for url in target_urls if '/extra/' in url or '/extra-testing/' in url]
     
     def load_arch_packages(urls, arch_suffix, arch_name):
-        packages = load_packages_with_any(urls, arch_suffix, download=download, include_any=include_any)
+        packages = load_database_packages(urls, arch_suffix, download)
+        
         # Count unique pkgbase
         pkgbase_count = len(set(pkg.get('basename', pkg['name']) for pkg in packages.values()))
         any_note = "" if include_any else " (excluding ARCH=any)"
-        print(f"Loaded {len(packages)} {arch_name} packages ({pkgbase_count} pkgbase){any_note}")
+        testing_note = " (including testing)" if include_testing and arch_name != 'x86_64' else ""
+        print(f"Loaded {len(packages)} {arch_name} packages ({pkgbase_count} pkgbase){any_note}{testing_note}")
         return packages
     
     with ThreadPoolExecutor(max_workers=2) as executor:

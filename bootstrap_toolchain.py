@@ -161,6 +161,7 @@ class BootstrapBuilder(BuildUtils):
                 "-d", str(self.cache_path),  # Use custom cache directory
                 "-c",  # Clean chroot
                 "-u",  # Update chroot before building
+                "-t", "/tmp:size=128G",
                 "--", "--ignorearch",
             ], cwd=pkg_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, errors='replace', env=env)
             
