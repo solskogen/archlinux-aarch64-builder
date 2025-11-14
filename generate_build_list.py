@@ -467,7 +467,10 @@ echo "$fullver"
             if dep_type in pkg:
                 filtered_deps = []
                 for dep in pkg[dep_type]:
-                    dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
+                    dep_name = dep.split('=')[0].split('>')[0].split('<')[0].strip()
+                    # Skip self-dependencies
+                    if dep_name == pkg['name']:
+                        continue
                     if (dep_name in build_list_names or 
                         dep_name in build_list_basenames or
                         dep_name in build_list_provides):
@@ -770,7 +773,7 @@ def find_strongly_connected_components(graph):
     
     return sccs
 
-def sort_by_build_order(packages):
+def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=None):
     """
     Sort packages by dependency order using topological sort with proper cycle detection.
     """
@@ -781,14 +784,15 @@ def sort_by_build_order(packages):
     
     # Build provides mapping from ALL packages (x86_64 + target) for dependency resolution
     all_provides = {}
-    for pkg_dict in [x86_packages, target_packages]:
-        for pkg_name, pkg_data in pkg_dict.items():
-            basename = pkg_data.get('basename', pkg_name)
-            all_provides[pkg_name] = pkg_name
-            all_provides[basename] = basename
-            for provide in pkg_data.get('provides', []):
-                provide_name = provide.split('=')[0].strip()
-                all_provides[provide_name] = pkg_name
+    if all_x86_packages and all_target_packages:
+        for pkg_dict in [all_x86_packages, all_target_packages]:
+            for pkg_name, pkg_data in pkg_dict.items():
+                basename = pkg_data.get('basename', pkg_name)
+                all_provides[pkg_name] = pkg_name
+                all_provides[basename] = basename
+                for provide in pkg_data.get('provides', []):
+                    provide_name = provide.split('=')[0].strip()
+                    all_provides[provide_name] = pkg_name
     
     # Add common split package patterns for packages in build list
     # This handles cases like linux providing linux-headers, linux-docs, etc.
@@ -797,8 +801,8 @@ def sort_by_build_order(packages):
         # Common split package suffixes
         for suffix in ['-headers', '-docs', '-devel', '-dev']:
             split_name = basename + suffix
-            if split_name not in build_list_provides:
-                build_list_provides[split_name] = basename
+            if split_name not in all_provides:
+                all_provides[split_name] = basename
     
     # Build dependency graph - only consider packages in our build list
     graph = defaultdict(set)  # pkg -> set of packages that depend on it
@@ -827,20 +831,20 @@ def sort_by_build_order(packages):
             provider_pkg = None
             if dep_name in pkg_map:
                 provider_pkg = dep_name
-            elif dep_name in build_list_provides:
-                provider_pkg = build_list_provides[dep_name]
+            elif dep_name in all_provides:
+                provider_pkg = all_provides[dep_name]
             
-            # Only create edge if dependency is also in our build list OR exists in the ecosystem
+            # Create edge if dependency provider is in our build list
             if provider_pkg and provider_pkg in pkg_map and provider_pkg != pkg_name:
                 graph[provider_pkg].add(pkg_name)
                 reverse_graph[pkg_name].add(provider_pkg)
                 in_degree[pkg_name] += 1
-            elif dep_name in all_provides and all_provides[dep_name] in pkg_map and all_provides[dep_name] != pkg_name:
-                # Dependency exists in ecosystem and provider is in build list
+            elif dep_name in all_provides:
                 actual_provider = all_provides[dep_name]
-                graph[actual_provider].add(pkg_name)
-                reverse_graph[pkg_name].add(actual_provider)
-                in_degree[pkg_name] += 1
+                if actual_provider in pkg_map and actual_provider != pkg_name:
+                    graph[actual_provider].add(pkg_name)
+                    reverse_graph[pkg_name].add(actual_provider)
+                    in_degree[pkg_name] += 1
     
     # Find strongly connected components (cycles)
     sccs = find_strongly_connected_components(reverse_graph)
@@ -898,13 +902,19 @@ def sort_by_build_order(packages):
             for dep_type in ['depends', 'makedepends', 'checkdepends']:
                 all_deps.extend(pkg.get(dep_type, []))
             
+            # Remove duplicates to avoid counting the same dependency multiple times
+            seen_deps = set()
             for dep_str in all_deps:
                 dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+                if dep_name in seen_deps or dep_name == pkg_name:  # Skip duplicates and self-deps
+                    continue
+                seen_deps.add(dep_name)
+                
                 provider_pkg = None
                 if dep_name in pkg_map:
                     provider_pkg = dep_name
-                elif dep_name in build_list_provides:
-                    provider_pkg = build_list_provides[dep_name]
+                elif dep_name in all_provides:
+                    provider_pkg = all_provides[dep_name]
                 
                 # Create edge if dependency is in remaining packages OR was in a cycle (already built)
                 if provider_pkg and provider_pkg in pkg_map and provider_pkg != pkg_name:
@@ -1059,7 +1069,7 @@ if __name__ == "__main__":
         if args.preserve_order:
             newer_packages = preserve_package_order(newer_packages, args.packages)
         else:
-            newer_packages = sort_by_build_order(newer_packages)
+            newer_packages = sort_by_build_order(newer_packages, full_x86_packages, target_packages)
         write_results(newer_packages, args)
         sys.exit(0)
     
@@ -1101,7 +1111,7 @@ if __name__ == "__main__":
             if args.preserve_order:
                 newer_packages = preserve_package_order(newer_packages, list(args.use_aur_for_packages))
             else:
-                newer_packages = sort_by_build_order(newer_packages)
+                newer_packages = sort_by_build_order(newer_packages, full_x86_packages, target_packages)
             write_results(newer_packages, args)
             sys.exit(0)
     else:
@@ -1410,7 +1420,10 @@ if __name__ == "__main__":
                             if dep_type in pkg:
                                 filtered_deps = []
                                 for dep in pkg.get(f'build_{dep_type}', pkg.get(dep_type, [])):
-                                    dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
+                                    dep_name = dep.split('=')[0].split('>')[0].split('<')[0].strip()
+                                    # Skip self-dependencies
+                                    if dep_name == pkg['name']:
+                                        continue
                                     if (dep_name in build_list_names or 
                                         dep_name in build_list_basenames or
                                         dep_name in build_list_provides):
@@ -1459,6 +1472,33 @@ if __name__ == "__main__":
                 # Remove version constraints from dependency names
                 dep_name = dep.split('>=')[0].split('<=')[0].split('=')[0].split('<')[0].split('>')[0]
                 if dep_name in skipped_names:
+                    # Check if pkgbase exists and is up-to-date in target or is provided
+                    if dep_name in x86_packages:
+                        x86_pkg = x86_packages[dep_name]
+                        x86_basename = x86_pkg.get('basename', dep_name)
+                        
+                        # Check if provided by another package
+                        is_provided = False
+                        for target_name, target_pkg in target_packages.items():
+                            provides_list = target_pkg.get('provides', [])
+                            for provide in provides_list:
+                                provide_name = provide.split('=')[0]
+                                if provide_name == dep_name:
+                                    is_provided = True
+                                    break
+                            if is_provided:
+                                break
+                        
+                        # Skip if pkgbase exists in target and is up-to-date or newer
+                        pkgbase_uptodate = False
+                        if x86_basename in target_packages:
+                            target_pkg = target_packages[x86_basename]
+                            if not is_version_newer(target_pkg['version'], x86_pkg['version']):
+                                pkgbase_uptodate = True
+                        
+                        if is_provided or pkgbase_uptodate:
+                            continue
+                    
                     # Find the original skipped entry
                     for skipped in skipped_packages:
                         if skipped.startswith(dep_name + ' ('):
@@ -1569,7 +1609,7 @@ if __name__ == "__main__":
     else:
         print("Sorting by build order...")
         input_names = {pkg['name'] for pkg in newer_packages}
-        sorted_packages = sort_by_build_order(newer_packages)
+        sorted_packages = sort_by_build_order(newer_packages, full_x86_packages, target_packages)
         output_names = {pkg['name'] for pkg in sorted_packages}
         
         # Report filtered packages with basic info
