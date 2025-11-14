@@ -222,6 +222,8 @@ def parse_pkgbuild_deps(pkgbuild_path):
         temp_script = f"""#!/bin/bash
 cd {shlex.quote(str(pkg_dir))}
 source PKGBUILD 2>/dev/null || exit 1
+
+# Extract global dependencies first
 echo "DEPENDS_START"
 printf '%s\\n' "${{depends[@]}}"
 echo "DEPENDS_END"
@@ -231,6 +233,24 @@ echo "MAKEDEPENDS_END"
 echo "CHECKDEPENDS_START"
 printf '%s\\n' "${{checkdepends[@]}}"
 echo "CHECKDEPENDS_END"
+
+# Check for package functions (both package() and package_*())
+for func in $(declare -F | grep -E 'package(_.*)?$' | awk '{{print $3}}'); do
+    if [[ "$func" =~ ^package(_.*)?$ ]]; then
+        tmpfile=$(mktemp)
+        echo 'pkgdir="/tmp/mock_pkgdir"' > "$tmpfile"
+        echo 'srcdir="/tmp/mock_srcdir"' >> "$tmpfile"
+        declare -f "$func" >> "$tmpfile"
+        echo "$func 2>/dev/null || true" >> "$tmpfile"
+        echo 'echo "PACKAGE_DEPENDS_START"' >> "$tmpfile"
+        echo 'printf "%s\\n" "${{depends[@]}}"' >> "$tmpfile"
+        echo 'echo "PACKAGE_DEPENDS_END"' >> "$tmpfile"
+        
+        # Source the PKGBUILD again and run the package function
+        bash -c "source PKGBUILD 2>/dev/null && source '$tmpfile'" 2>/dev/null || true
+        rm -f "$tmpfile"
+    fi
+done
 """
         
         result = subprocess.run(['bash', '-c', temp_script], 
@@ -253,8 +273,13 @@ echo "CHECKDEPENDS_END"
                     current_section = "checkdepends"
                 elif line == "CHECKDEPENDS_END":
                     current_section = None
+                elif line == "PACKAGE_DEPENDS_START":
+                    current_section = "depends"  # Merge package() depends with global depends
+                elif line == "PACKAGE_DEPENDS_END":
+                    current_section = None
                 elif line and current_section:
-                    deps[current_section].append(line)
+                    if line not in deps[current_section]:  # Avoid duplicates
+                        deps[current_section].append(line)
         else:
             print(f"Warning: Failed to parse PKGBUILD with bash: {result.stderr}")
             
@@ -705,6 +730,16 @@ def find_missing_dependencies(packages, x86_packages, target_packages):
                 if (dep_name in x86_packages and 
                     dep_name not in target_provides and
                     dep_name not in processed):
+                    
+                    # Check if the pkgbase exists and is up-to-date in target
+                    x86_pkg = x86_packages[dep_name]
+                    x86_basename = x86_pkg.get('basename', dep_name)
+                    
+                    # Skip if pkgbase exists in target and is up-to-date or newer
+                    if x86_basename in target_provides:
+                        target_pkg = target_provides[x86_basename]
+                        if not is_version_newer(target_pkg['version'], x86_pkg['version']):
+                            continue
                     
                     missing_deps.add(dep_name)
                     new_missing.add(dep_name)
