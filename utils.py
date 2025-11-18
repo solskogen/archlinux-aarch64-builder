@@ -397,12 +397,18 @@ def load_database_packages(urls, arch_suffix, download=True):
     
     return packages
 
-def load_x86_64_packages(download=True, repos=None):
+def load_x86_64_packages(download=True, repos=None, include_testing=False):
     """Load x86_64 packages from official repositories"""
     urls = [
         f"{X86_64_MIRROR}/core/os/x86_64/core.db",
         f"{X86_64_MIRROR}/extra/os/x86_64/extra.db"
     ]
+    
+    if include_testing:
+        urls.extend([
+            f"{X86_64_MIRROR}/core-testing/os/x86_64/core-testing.db",
+            f"{X86_64_MIRROR}/extra-testing/os/x86_64/extra-testing.db"
+        ])
     
     # Filter to specific repos if requested
     if repos:
@@ -760,7 +766,7 @@ def find_missing_dependencies(packages, x86_packages, target_packages):
     
     return missing_deps
 
-def load_packages_unified(download=True, include_any=False, use_existing=False, x86_repos=None, target_repos=None, include_testing=False):
+def load_packages_unified(download=True, include_any=False, use_existing=False, x86_repos=None, target_repos=None, include_testing=False, x86_testing=False):
     """
     Unified package loading function for all scripts.
     
@@ -771,6 +777,7 @@ def load_packages_unified(download=True, include_any=False, use_existing=False, 
         x86_repos: Filter x86_64 repos (for compatibility)
         target_repos: Filter target repos (for compatibility)
         include_testing: Include testing repositories for target architecture
+        x86_testing: Include testing repositories for x86_64 architecture
         
     Returns:
         tuple: (x86_64_packages, target_packages)
@@ -786,7 +793,8 @@ def load_packages_unified(download=True, include_any=False, use_existing=False, 
     # Load packages using existing parallel function
     x86_packages, target_packages = load_all_packages_parallel(
         download=download, include_any=include_any, 
-        x86_repos=x86_repos, target_repos=target_repos, include_testing=include_testing
+        x86_repos=x86_repos, target_repos=target_repos, 
+        include_testing=include_testing, x86_testing=x86_testing
     )
     
     return x86_packages, target_packages
@@ -823,7 +831,7 @@ def safe_command_execution(cmd, operation_name, cwd=None, exit_on_error=True, **
     except Exception as e:
         return handle_command_error(e, operation_name, exit_on_error)
 
-def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None, include_any=False, include_testing=False):
+def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None, include_any=False, include_testing=False, x86_testing=False):
     """Load both x86_64 and target architecture packages in parallel"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
@@ -834,6 +842,11 @@ def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None,
         f"{X86_64_MIRROR}/core/os/x86_64/core.db",
         f"{X86_64_MIRROR}/extra/os/x86_64/extra.db"
     ]
+    if x86_testing:
+        x86_urls.extend([
+            f"{X86_64_MIRROR}/core-testing/os/x86_64/core-testing.db",
+            f"{X86_64_MIRROR}/extra-testing/os/x86_64/extra-testing.db"
+        ])
     target_urls = []
     try:
         base_url = config.get('build', 'target_base_url')
@@ -872,7 +885,11 @@ def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None,
         # Count unique pkgbase
         pkgbase_count = len(set(pkg.get('basename', pkg['name']) for pkg in packages.values()))
         any_note = "" if include_any else " (excluding ARCH=any)"
-        testing_note = " (including testing)" if include_testing and arch_name != 'x86_64' else ""
+        testing_note = ""
+        if arch_name == 'x86_64' and x86_testing:
+            testing_note = " (including testing)"
+        elif arch_name != 'x86_64' and include_testing:
+            testing_note = " (including testing)"
         print(f"Loaded {len(packages)} {arch_name} packages ({pkgbase_count} pkgbase){any_note}{testing_note}")
         return packages
     

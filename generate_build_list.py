@@ -1012,8 +1012,10 @@ if __name__ == "__main__":
                         help=f'Generate list of all packages present in x86_64 but missing from {target_arch}')
     parser.add_argument('--rebuild-repo', choices=['core', 'extra'],
                         help='Rebuild all packages from specified repository regardless of version')
-    parser.add_argument('--include-testing', action='store_true',
-                        help='Include target architecture testing repositories (core-testing, extra-testing) when comparing versions')
+    parser.add_argument('--target-testing', action='store_true',
+                        help='Also include target testing repos for comparison')
+    parser.add_argument('--upstream-testing', action='store_true',
+                        help='Also include upstream testing repos for comparison')
     
     # Mutually exclusive group for git update options
     git_group = parser.add_mutually_exclusive_group()
@@ -1131,8 +1133,8 @@ if __name__ == "__main__":
             ]
             all_x86_packages = load_packages_with_any(any_urls, '_x86_64', download=not args.no_update, include_any=True)
         else:
-            all_x86_packages = load_x86_64_packages(download=not args.no_update)
-        target_packages = load_target_arch_packages(download=not args.no_update, include_testing=args.include_testing)
+            all_x86_packages = load_x86_64_packages(download=not args.no_update, include_testing=args.upstream_testing)
+        target_packages = load_target_arch_packages(download=not args.no_update, include_testing=args.target_testing)
         
         # Filter to only requested packages for comparison, but keep full list for dependency resolution
         filtered_x86_packages = {}
@@ -1199,7 +1201,7 @@ if __name__ == "__main__":
     elif not args.aur:
         # Load packages using unified function
         repo_filter = [args.rebuild_repo] if args.rebuild_repo else None
-        x86_packages, target_packages = load_packages_unified(download=not args.no_update, x86_repos=repo_filter, target_repos=repo_filter, include_testing=args.include_testing)
+        x86_packages, target_packages = load_packages_unified(download=not args.no_update, x86_repos=repo_filter, target_repos=repo_filter, include_testing=args.target_testing, x86_testing=args.upstream_testing)
         
         # Use same list for dependency resolution
         full_x86_packages = x86_packages
