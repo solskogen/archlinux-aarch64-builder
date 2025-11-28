@@ -247,7 +247,8 @@ echo "CHECKDEPENDS_END"
 """
         
         result = subprocess.run(['bash', '-c', temp_script], 
-                              capture_output=True, text=True, timeout=10)
+                              capture_output=True, text=True, timeout=10, 
+                              errors='replace')
         if result.returncode == 0:
             output = result.stdout
             current_section = None
@@ -972,7 +973,17 @@ def upload_packages(pkg_dir, target_repo, dry_run=False):
         
         if not built_packages:
             print(f"ERROR: No packages found to upload in {pkg_dir}")
-            sys.exit(1)
+            # List what files are actually there for debugging
+            all_files = list(pkg_dir.glob("*"))
+            if all_files:
+                print(f"Files found in {pkg_dir}:")
+                for f in all_files[:10]:  # Show first 10 files
+                    print(f"  {f.name}")
+                if len(all_files) > 10:
+                    print(f"  ... and {len(all_files) - 10} more files")
+            else:
+                print(f"Directory {pkg_dir} is empty")
+            return 0
         
         for pkg in built_packages:
             try:

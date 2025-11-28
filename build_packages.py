@@ -185,7 +185,7 @@ class PackageBuilder:
             subprocess.run([
                 "sudo", "rsync", "-a", "--delete", "-q", "-W", "-x", 
                 f"{root_chroot}/", str(temp_copy_path) + "/"
-            ], check=True, capture_output=True, text=True)
+            ], check=True, capture_output=True, text=True, errors='replace')
             print("Rsync completed successfully")
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Rsync failed: {e}")
@@ -240,7 +240,8 @@ echo "CHECKDEPENDS_END"
         
         try:
             result = subprocess.run(['bash', '-c', temp_script], 
-                                  capture_output=True, text=True, timeout=GIT_COMMAND_TIMEOUT)
+                                  capture_output=True, text=True, timeout=GIT_COMMAND_TIMEOUT,
+                                  errors='replace')
             if result.returncode == 0:
                 current_section = None
                 for line in result.stdout.split('\n'):
@@ -273,7 +274,7 @@ echo "CHECKDEPENDS_END"
         
         return depends, makedepends, checkdepends
 
-    def _execute_build(self, pkg_name, pkg_data, temp_copy_path, pkg_dir):
+    def _execute_build(self, pkg_name, pkg_data, temp_copy_path, pkg_dir, log_file):
         """Execute the actual package build"""
         env = os.environ.copy()
         env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
@@ -285,11 +286,6 @@ echo "CHECKDEPENDS_END"
         ]
         
         print(f"Running: {' '.join(cmd)}")
-        
-        # Create log file
-        timestamp = subprocess.run(['date', '+%Y%m%d-%H%M%S'], capture_output=True, text=True).stdout.strip()
-        log_file = self.logs_dir / f"{pkg_name}-{timestamp}-build.log"
-        self.build_utils.cleanup_old_logs(pkg_name)
         
         # Get formatted start time
         start_time = subprocess.run(['date', '+%a %b %d %H:%M:%S %Y'], capture_output=True, text=True).stdout.strip()
@@ -304,7 +300,7 @@ echo "CHECKDEPENDS_END"
                 
                 process = subprocess.Popen(cmd, cwd=pkg_dir, env=env, 
                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
-                                         text=True, bufsize=1)
+                                         text=True, bufsize=1, errors='replace')
                 
                 # Stream output to both console and log file
                 while True:
@@ -326,6 +322,10 @@ echo "CHECKDEPENDS_END"
                     
         except subprocess.CalledProcessError:
             error_msg = BuildError.format_build_failure(pkg_name, log_file, "Package compilation failed")
+            print(error_msg)
+            return False
+        except Exception as e:
+            error_msg = BuildError.format_build_failure(pkg_name, log_file, f"Build setup failed: {e}")
             print(error_msg)
             return False
         except KeyboardInterrupt:
@@ -629,7 +629,8 @@ done
 """
             
             result = subprocess.run(['bash', '-c', temp_script], 
-                                  capture_output=True, text=True, timeout=10)
+                                  capture_output=True, text=True, timeout=10, 
+                                  errors='replace')
             if result.returncode == 0:
                 return [line.strip() for line in result.stdout.split('\n') if line.strip()]
             else:
@@ -700,16 +701,22 @@ done
             return False
         
         build_success = False
+        
+        # Create log file early so we can reference it in all error cases
+        timestamp = subprocess.run(['date', '+%Y%m%d-%H%M%S'], capture_output=True, text=True).stdout.strip()
+        log_file = self.logs_dir / f"{pkg_name}-{timestamp}-build.log"
+        self.build_utils.cleanup_old_logs(pkg_name)
+        
         try:
             # Prepare build environment
             self._prepare_build_environment(temp_copy_path, pkg_name, pkg_dir)
             
             # Execute build
-            build_success = self._execute_build(pkg_name, pkg_data, temp_copy_path, pkg_dir)
+            build_success = self._execute_build(pkg_name, pkg_data, temp_copy_path, pkg_dir, log_file)
             return build_success
             
         except Exception as e:
-            error_msg = BuildError.format_setup_failure(pkg_name, str(e))
+            error_msg = BuildError.format_setup_failure(pkg_name, str(e), log_file)
             print(error_msg)
             return False
         finally:
@@ -768,10 +775,11 @@ Troubleshooting:
 """
 
     @staticmethod
-    def format_setup_failure(pkg_name: str, error: str) -> str:
+    def format_setup_failure(pkg_name: str, error: str, log_file: Path = None) -> str:
+        log_info = f"\nLog file: {log_file}" if log_file else ""
         return f"""
 SETUP FAILED: {pkg_name}
-Error: {error}
+Error: {error}{log_info}
 Troubleshooting:
   - Ensure chroot environment is properly initialized
   - Check disk space and permissions
