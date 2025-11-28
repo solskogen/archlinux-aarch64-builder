@@ -129,29 +129,18 @@ class PackageBuilder:
         return True
 
     def _setup_temp_chroot(self, pkg_name):
-        """Create or find temporary chroot for package"""
-        temp_dirs = list(self.chroot_path.glob(f"temp-{pkg_name}-*"))
-        if len(temp_dirs) == 1:
-            temp_copy_path = temp_dirs[0]
-            print(f"Found preserved chroot: {temp_copy_path.name}")
-            return temp_copy_path
-        elif len(temp_dirs) > 1:
-            print(f"ERROR: Multiple preserved chroots found for {pkg_name}:")
-            for temp_dir in temp_dirs:
-                print(f"  {temp_dir.name}")
-            raise RuntimeError("Multiple preserved chroots found")
-        else:
-            import datetime
-            timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        """Create temporary chroot for package"""
+        import datetime
+        timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+        temp_copy_name = f"temp-{pkg_name}-{timestamp}"
+        temp_copy_path = self.chroot_path / temp_copy_name
+        while temp_copy_path.exists():
+            # If timestamp collision, add microseconds
+            timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")[:14]
             temp_copy_name = f"temp-{pkg_name}-{timestamp}"
             temp_copy_path = self.chroot_path / temp_copy_name
-            while temp_copy_path.exists():
-                # If timestamp collision, add microseconds
-                timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")[:14]
-                temp_copy_name = f"temp-{pkg_name}-{timestamp}"
-                temp_copy_path = self.chroot_path / temp_copy_name
-            self.temp_copies.append(temp_copy_path)
-            return temp_copy_path
+        self.temp_copies.append(temp_copy_path)
+        return temp_copy_path
 
     def _prepare_build_environment(self, temp_copy_path, pkg_name, pkg_dir):
         """Setup chroot environment and install dependencies"""
