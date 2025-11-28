@@ -466,10 +466,60 @@ def main():
                        help='Continue from last successful package')
     parser.add_argument('--start-from', metavar='PACKAGE',
                        help='Start from specific package in stage 1 (linux-api-headers, glibc, binutils, gcc, gmp, mpfr, libmpc, libisl)')
-    parser.add_argument('--no-update', action='store_true',
-                       help='Skip git updates for gcc/glibc special repos')
+    parser.add_argument('--one-shot', metavar='PACKAGE', 
+                       choices=['linux-api-headers', 'glibc', 'binutils', 'gcc', 'gmp', 'mpfr', 'libmpc', 'libisl'],
+                       help='Build only the specified package once')
     
     args = parser.parse_args()
+    
+    if args.one_shot:
+        # One-shot mode: build only the specified package
+        builder = BootstrapBuilder(chroot_path=args.chroot, cache_path=args.cache, 
+                                  dry_run=args.dry_run)
+        
+        # Setup environment and clone the specific package
+        builder.setup_environment()
+        
+        # Clone/update the specific package
+        pkg_name = args.one_shot
+        pkg_dir = builder.build_dir / pkg_name
+        
+        if pkg_name in ["gcc", "glibc"]:
+            # Special repos - clone if missing
+            if not pkg_dir.exists():
+                if pkg_name == "gcc":
+                    repo_url = GCC_REPO_URL
+                    branch = GCC_BRANCH
+                else:  # glibc
+                    repo_url = GLIBC_REPO_URL
+                    branch = GLIBC_BRANCH
+                
+                if not builder.dry_run:
+                    try:
+                        builder.run_command(["git", "clone", "-b", branch, repo_url, pkg_name], cwd=builder.build_dir)
+                        print(f"✓ Cloned {pkg_name} from {repo_url} (branch: {branch})")
+                    except subprocess.CalledProcessError as e:
+                        print(f"ERROR: Failed to clone {pkg_name}: {e}")
+                        sys.exit(1)
+        else:
+            # Regular Arch package
+            if not pkg_dir.exists():
+                if not builder.dry_run:
+                    try:
+                        builder.run_command(["pkgctl", "repo", "clone", pkg_name], cwd=builder.build_dir)
+                        print(f"✓ Cloned {pkg_name}")
+                    except subprocess.CalledProcessError as e:
+                        print(f"ERROR: Failed to clone {pkg_name}: {e}")
+                        sys.exit(1)
+        
+        # Build the package
+        success = builder.bootstrap_build_package(pkg_name)
+        if success:
+            print(f"✓ Successfully built {pkg_name}")
+        else:
+            print(f"ERROR: Failed to build {pkg_name}")
+            sys.exit(1)
+        return
     
     builder = BootstrapBuilder(chroot_path=args.chroot, cache_path=args.cache, 
                               dry_run=args.dry_run, continue_build=args.continue_build,

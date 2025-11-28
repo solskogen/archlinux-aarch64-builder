@@ -214,13 +214,24 @@ def parse_pkgbuild_deps(pkgbuild_path):
     """
     deps = {'depends': [], 'makedepends': [], 'checkdepends': []}
     
+    if not pkgbuild_path.exists():
+        return deps
+    
     try:
         pkg_dir = pkgbuild_path.parent
+        
+        # Verify directory exists and has PKGBUILD
+        if not pkg_dir.exists() or not (pkg_dir / "PKGBUILD").exists():
+            return deps
         
         # Create a temporary script to source PKGBUILD and extract dependencies
         import shlex
         temp_script = f"""#!/bin/bash
-cd {shlex.quote(str(pkg_dir))}
+set -e
+cd {shlex.quote(str(pkg_dir))} || exit 1
+if [[ ! -f PKGBUILD ]]; then
+    exit 1
+fi
 source PKGBUILD 2>/dev/null || exit 1
 
 # Extract global dependencies first
@@ -233,24 +244,6 @@ echo "MAKEDEPENDS_END"
 echo "CHECKDEPENDS_START"
 printf '%s\\n' "${{checkdepends[@]}}"
 echo "CHECKDEPENDS_END"
-
-# Check for package functions (both package() and package_*())
-for func in $(declare -F | grep -E 'package(_.*)?$' | awk '{{print $3}}'); do
-    if [[ "$func" =~ ^package(_.*)?$ ]]; then
-        tmpfile=$(mktemp)
-        echo 'pkgdir="/tmp/mock_pkgdir"' > "$tmpfile"
-        echo 'srcdir="/tmp/mock_srcdir"' >> "$tmpfile"
-        declare -f "$func" >> "$tmpfile"
-        echo "$func 2>/dev/null || true" >> "$tmpfile"
-        echo 'echo "PACKAGE_DEPENDS_START"' >> "$tmpfile"
-        echo 'printf "%s\\n" "${{depends[@]}}"' >> "$tmpfile"
-        echo 'echo "PACKAGE_DEPENDS_END"' >> "$tmpfile"
-        
-        # Source the PKGBUILD again and run the package function
-        bash -c "source PKGBUILD 2>/dev/null && source '$tmpfile'" 2>/dev/null || true
-        rm -f "$tmpfile"
-    fi
-done
 """
         
         result = subprocess.run(['bash', '-c', temp_script], 
@@ -336,7 +329,7 @@ def parse_database_file(db_filename, include_any=False):
     
     return packages
 
-def load_database_packages(urls, arch_suffix, download=True):
+def load_database_packages(urls, arch_suffix, download=True, include_any=False):
     """
     Download and parse database files for given URLs in parallel.
     """
@@ -362,7 +355,7 @@ def load_database_packages(urls, arch_suffix, download=True):
                 repo_name = repo_name.replace('-testing', '')
             
             print(f"Parsing {db_filename}...")
-            repo_packages = parse_database_file(db_filename)
+            repo_packages = parse_database_file(db_filename, include_any=include_any)
             
             for name, pkg in repo_packages.items():
                 pkg['repo'] = repo_name
@@ -852,7 +845,8 @@ def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None,
         base_url = config.get('build', 'target_base_url')
         target_urls = [
             f"{base_url}/core/os/{target_arch}/core.db",
-            f"{base_url}/extra/os/{target_arch}/extra.db"
+            f"{base_url}/extra/os/{target_arch}/extra.db",
+            f"{base_url}/forge/os/{target_arch}/forge.db"
         ]
         if include_testing:
             target_urls.extend([
@@ -880,7 +874,7 @@ def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None,
             target_urls = [url for url in target_urls if '/extra/' in url or '/extra-testing/' in url]
     
     def load_arch_packages(urls, arch_suffix, arch_name):
-        packages = load_database_packages(urls, arch_suffix, download)
+        packages = load_database_packages(urls, arch_suffix, download, include_any)
         
         # Count unique pkgbase
         pkgbase_count = len(set(pkg.get('basename', pkg['name']) for pkg in packages.values()))

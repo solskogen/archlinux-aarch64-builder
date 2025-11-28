@@ -104,22 +104,18 @@ def main():
         if len(repos) > 1:
             target_duplicates.append(f"{basename}: present in {', '.join(sorted(repos))}")
     
-    # Build provides lookup for x86_64 (with progress)
+    # Build provides lookup for x86_64
     print(f"Building x86_64 provides mapping ({len(x86_packages)} packages)...")
     x86_provides = {}
     for i, (pkg_name, pkg_data) in enumerate(x86_packages.items()):
-        if i % 2000 == 0 and i > 0:
-            print(f"  Processed {i}/{len(x86_packages)} x86_64 packages...")
         for provide in pkg_data.get('provides', []):
             provide_name = provide.split('=')[0].split('<')[0].split('>')[0]
             x86_provides[provide_name] = pkg_name
     
-    # Build provides lookup for target architecture (with progress)
+    # Build provides lookup for target architecture
     print(f"Building {target_arch} provides mapping ({len(target_packages)} packages)...")
     target_provides = {}
     for i, (pkg_name, pkg_data) in enumerate(target_packages.items()):
-        if i % 2000 == 0 and i > 0:
-            print(f"  Processed {i}/{len(target_packages)} {target_arch} packages...")
         for provide in pkg_data.get('provides', []):
             provide_name = provide.split('=')[0].split('<')[0].split('>')[0]
             target_provides[provide_name] = pkg_name
@@ -135,8 +131,6 @@ def main():
     # Check for package name mismatches (optimized)
     print(f"Checking package name mismatches ({len(x86_bases)} basenames)...")
     for i, basename in enumerate(x86_bases):
-        if i % 2000 == 0 and i > 0:
-            print(f"  Processed {i}/{len(x86_bases)} basenames...")
         if basename in target_bases:
             # Use pre-grouped package names (O(1) lookup instead of O(n) iteration)
             x86_pkg_names = set(x86_by_basename[basename])
@@ -184,8 +178,6 @@ def main():
     # Find missing pkgbase in target architecture
     print(f"Finding missing pkgbase ({len(x86_bases)} to check)...")
     for i, basename in enumerate(x86_bases):
-        if i % 2000 == 0 and i > 0:
-            print(f"  Processed {i}/{len(x86_bases)} basenames...")
         if basename not in target_bases:
             # Check if basename matches any blacklist pattern
             is_blacklisted = False
@@ -213,8 +205,6 @@ def main():
     # Check AArch64 packages
     print(f"Checking {target_arch} packages ({len(target_bases)} basenames)...")
     for i, (basename, target_data) in enumerate(target_bases.items()):
-        if i % 2000 == 0 and i > 0:
-            print(f"  Processed {i}/{len(target_bases)} basenames...")
         if basename in x86_bases:
             x86_data = x86_bases[basename]
             

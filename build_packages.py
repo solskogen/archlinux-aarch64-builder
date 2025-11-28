@@ -291,8 +291,17 @@ echo "CHECKDEPENDS_END"
         log_file = self.logs_dir / f"{pkg_name}-{timestamp}-build.log"
         self.build_utils.cleanup_old_logs(pkg_name)
         
+        # Get formatted start time
+        start_time = subprocess.run(['date', '+%a %b %d %H:%M:%S %Y'], capture_output=True, text=True).stdout.strip()
+        version = pkg_data.get('version', 'unknown')
+        
+        build_success = False
         try:
             with open(log_file, 'w') as f:
+                # Write start header
+                f.write(f"==> Build started: {pkg_name} {version} ({start_time})\n")
+                f.flush()
+                
                 process = subprocess.Popen(cmd, cwd=pkg_dir, env=env, 
                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                                          text=True, bufsize=1)
@@ -312,6 +321,8 @@ echo "CHECKDEPENDS_END"
                 if process.returncode != 0:
                     f.write(f"\nBuild failed with return code: {process.returncode}\n")
                     raise subprocess.CalledProcessError(process.returncode, cmd)
+                
+                build_success = True
                     
         except subprocess.CalledProcessError:
             error_msg = BuildError.format_build_failure(pkg_name, log_file, "Package compilation failed")
@@ -320,10 +331,23 @@ echo "CHECKDEPENDS_END"
         except KeyboardInterrupt:
             print(f"\nBuild interrupted for {pkg_name}")
             sys.exit(1)
+        finally:
+            # Always write end footer
+            end_time = subprocess.run(['date', '+%a %b %d %H:%M:%S %Y'], capture_output=True, text=True).stdout.strip()
+            status = "SUCCESS" if build_success else "FAILED"
+            try:
+                with open(log_file, 'a') as f:
+                    f.write(f"==> Build finished: {pkg_name} {version} ({end_time}) [{status}]\n")
+            except Exception:
+                pass  # Don't fail if we can't write the footer
         
         # Upload packages
         if not self.no_upload:
-            target_repo = f"{pkg_data.get('repo', 'extra')}-testing"
+            repo = pkg_data.get('repo', 'unknown')
+            if repo in ['core', 'extra']:
+                target_repo = f"{repo}-testing"
+            else:
+                target_repo = 'forge'
             uploaded_count = upload_packages(pkg_dir, target_repo, self.dry_run)
             print(f"Successfully uploaded {uploaded_count} packages to {target_repo}")
             

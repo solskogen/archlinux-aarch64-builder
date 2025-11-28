@@ -27,6 +27,7 @@ sudo pacman -S devtools git rsync python-packaging
 1. **`config.ini`** - Main configuration (see [Configuration](#configuration))
 2. **`chroot-config/pacman.conf`** - Pacman configuration for build chroot
 3. **`chroot-config/makepkg.conf`** - Build settings (must contain `CARCH=your_target_arch`)
+4. **`package-overrides.json`** - Optional: Custom git repositories for specific packages
 
 ### System Requirements
 - **Disk Space**: 50GB+ free space for chroot and cache
@@ -78,6 +79,30 @@ target_extra_url = https://example.com/extra/os/aarch64/extra.db
 - `build_root`: Directory for build operations and chroot
 - `upload_bucket`: S3 bucket name for uploading built packages
 - `target_base_url`: Base URL for your target architecture repositories
+
+## Package Overrides
+
+For packages that need custom git repositories or branches, create `package-overrides.json`:
+
+```json
+{
+  "gcc": {
+    "url": "https://gitlab.archlinux.org/solskogen/gcc.git",
+    "branch": "experimental"
+  },
+  "glibc": {
+    "url": "https://gitlab.archlinux.org/solskogen/glibc.git", 
+    "branch": "aarch64"
+  }
+}
+```
+
+This allows you to:
+- Use custom forks of packages with architecture-specific patches
+- Track development branches instead of release tags
+- Override the default Arch Linux GitLab repositories
+
+When overrides are specified, the system will clone from the custom URL and checkout the specified branch instead of using version tags.
 
 ## Common Usage Examples
 
