@@ -591,6 +591,8 @@ echo "CHECKDEPENDS_END"
             print("Failed packages:")
             for pkg in failed_packages:
                 print(f"  - {pkg['name']}")
+            return 1
+        return 0
 
     def _get_package_filenames_from_pkgbuild(self, pkg_dir):
         """Extract exact package filenames that will be built from PKGBUILD"""
@@ -845,11 +847,12 @@ def main():
         cleanup_on_failure=args.cleanup_on_failure
     )
     
-    builder.build_packages(
+    exit_code = builder.build_packages(
         args.json,
         args.blacklist,
         args.continue_build
     )
+    sys.exit(exit_code)
 
 if __name__ == "__main__":
     main()

@@ -430,7 +430,8 @@ def load_target_arch_packages(download=True, urls=None, include_testing=False):
             base_url = config.get('build', 'target_base_url')
             urls = [
                 f"{base_url}/core/os/{target_arch}/core.db",
-                f"{base_url}/extra/os/{target_arch}/extra.db"
+                f"{base_url}/extra/os/{target_arch}/extra.db",
+                f"{base_url}/forge/os/{target_arch}/forge.db"
             ]
             if include_testing:
                 urls.extend([
@@ -727,10 +728,13 @@ def find_missing_dependencies(packages, x86_packages, target_packages):
                 
             for dep in all_deps:
                 dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
-                if (dep_name in x86_packages and 
-                    dep_name not in target_provides and
-                    dep_name not in processed):
-                    
+                
+                # Skip if already processed or provided by target
+                if dep_name in processed or dep_name in target_provides:
+                    continue
+                
+                # Only consider it missing if it exists in x86_64
+                if dep_name in x86_packages:
                     # Check if the pkgbase exists and is up-to-date in target
                     x86_pkg = x86_packages[dep_name]
                     x86_basename = x86_pkg.get('basename', dep_name)
