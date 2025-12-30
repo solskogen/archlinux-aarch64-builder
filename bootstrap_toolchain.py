@@ -35,14 +35,14 @@ REQUIRED_TOOLS = ['makechrootpkg', 'pkgctl', 'repo-upload', 'arch-nspawn']
 class BootstrapBuilder(BuildUtils):
     """Bootstrap toolchain package builder"""
     
-    def __init__(self, chroot_path=BUILD_ROOT, cache_path=CACHE_PATH, dry_run=False, continue_build=False, no_update=False, start_from=None):
+    def __init__(self, chroot_path=BUILD_ROOT, cache_path=CACHE_PATH, dry_run=False, continue_build=False, start_from=None):
         super().__init__(dry_run)
         self.chroot_path = Path(chroot_path)
         self.cache_path = Path(cache_path)
         self.build_dir = Path("pkgbuilds")
         self.continue_build = continue_build
         self.progress_file = Path("bootstrap_progress.txt")
-        self.no_update = no_update
+        self.no_update = False
         self.start_from = start_from
     
     def get_start_index(self, packages):
@@ -141,12 +141,10 @@ class BootstrapBuilder(BuildUtils):
         
         # Clear pacman cache
         try:
-            for item in self.cache_path.iterdir():
-                if item.is_file():
-                    item.unlink()
-                elif item.is_dir():
-                    shutil.rmtree(item)
-        except Exception as e:
+            subprocess.run([
+                "echo", "sudo", "rm", "-rf", f"{self.cache_path}/*"
+            ], shell=True, check=True)
+        except subprocess.CalledProcessError as e:
             print(f"ERROR: Failed to clear cache: {e}")
             sys.exit(1)
         
@@ -523,7 +521,7 @@ def main():
     
     builder = BootstrapBuilder(chroot_path=args.chroot, cache_path=args.cache, 
                               dry_run=args.dry_run, continue_build=args.continue_build,
-                              no_update=args.no_update, start_from=args.start_from)
+                              start_from=args.start_from)
     builder.run_bootstrap()
 
 if __name__ == "__main__":

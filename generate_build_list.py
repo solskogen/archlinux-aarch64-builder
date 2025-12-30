@@ -238,7 +238,7 @@ echo "$fullver"
                     else:
                         # Use git directly for more reliable tag switching
                         # Clone repository (convert ++ to plusplus for GitLab URLs)
-                        clone_url = f"https://gitlab.archlinux.org/archlinux/packaging/packages/{basename.replace('++', 'plusplus')}.git"
+                        clone_url = f"git@gitlab.archlinux.org:archlinux/packaging/packages/{basename.replace('++', 'plusplus')}.git"
                         result = subprocess.run(["git", "clone", clone_url, basename], 
                                              cwd=PKGBUILDS_DIR, check=True, 
                                              capture_output=True, text=True)
