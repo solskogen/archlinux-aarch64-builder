@@ -447,6 +447,9 @@ echo "$fullver"
                 for provide in pkg_data.get('provides', []):
                     provide_name = provide.split('=')[0]
                     build_list_provides[provide_name] = basename
+        
+    else:
+        print("DEBUG: fetch_pkgbuild_deps - full_x86_packages or target_packages is empty")
     
     # Add common split package patterns for packages in build list
     # This handles cases like linux providing linux-headers, linux-docs, etc.
@@ -790,11 +793,11 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
         for pkg_dict in [all_x86_packages, all_target_packages]:
             for pkg_name, pkg_data in pkg_dict.items():
                 basename = pkg_data.get('basename', pkg_name)
-                all_provides[pkg_name] = pkg_name
+                all_provides[pkg_name] = basename  # Map package name to basename
                 all_provides[basename] = basename
                 for provide in pkg_data.get('provides', []):
                     provide_name = provide.split('=')[0].strip()
-                    all_provides[provide_name] = pkg_name
+                    all_provides[provide_name] = basename  # Map provides to basename
     
     # Add common split package patterns for packages in build list
     # This handles cases like linux providing linux-headers, linux-docs, etc.
@@ -1156,11 +1159,16 @@ if __name__ == "__main__":
             })
         
         # Parse PKGBUILDs for dependencies
-        newer_packages = fetch_pkgbuild_deps(newer_packages, True, {}, {})
+        newer_packages = fetch_pkgbuild_deps(newer_packages, True, all_x86_packages, target_packages)
+        
+        # Load packages for dependency resolution
+        all_x86_packages = load_x86_64_packages(download=not args.no_update, include_testing=args.upstream_testing)
+        target_packages = load_target_arch_packages(download=not args.no_update, include_testing=args.target_testing)
+        
         if args.preserve_order:
             newer_packages = preserve_package_order(newer_packages, args.packages)
         else:
-            newer_packages = sort_by_build_order(newer_packages, {}, {})
+            newer_packages = sort_by_build_order(newer_packages, all_x86_packages, target_packages)
         write_results(newer_packages, args)
         sys.exit(0)
     
@@ -1197,12 +1205,12 @@ if __name__ == "__main__":
             # Fetch PKGBUILDs and write results
             if newer_packages:
                 print("Processing PKGBUILDs for dependency information...")
-                newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, {}, {})
+                newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, all_x86_packages, target_packages)
             
             if args.preserve_order:
                 newer_packages = preserve_package_order(newer_packages, list(args.use_aur_for_packages))
             else:
-                newer_packages = sort_by_build_order(newer_packages, {}, {})
+                newer_packages = sort_by_build_order(newer_packages, all_x86_packages, target_packages)
             write_results(newer_packages, args)
             sys.exit(0)
     else:
@@ -1382,7 +1390,7 @@ if __name__ == "__main__":
     # Stage 2: Parse PKGBUILDs for complete dependency info and find missing deps
     if newer_packages and not args.missing_packages:
         print("Processing PKGBUILDs for complete dependency information...")
-        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update)
+        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, full_x86_packages, target_packages)
         
         if full_x86_packages:
             print("Checking for missing dependencies (including checkdepends)...")
@@ -1448,7 +1456,7 @@ if __name__ == "__main__":
                     # Create list of only the newly added packages
                     new_packages = [pkg for pkg in newer_packages if pkg['name'] in added_deps]
                     print("Processing PKGBUILDs for missing dependencies...")
-                    new_packages_with_deps = fetch_pkgbuild_deps(new_packages, args.no_update)
+                    new_packages_with_deps = fetch_pkgbuild_deps(new_packages, args.no_update, full_x86_packages, target_packages)
                     
                     # Update the newer_packages list with the processed new packages
                     for updated_pkg in new_packages_with_deps:
@@ -1515,7 +1523,7 @@ if __name__ == "__main__":
     elif newer_packages:
         # For missing packages mode, still need PKGBUILD parsing
         print("Processing PKGBUILDs for dependency information...")
-        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update)
+        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, full_x86_packages, target_packages)
     
     # Report results
     if args.missing_packages and blacklisted_missing:
