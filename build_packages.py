@@ -342,7 +342,7 @@ echo "CHECKDEPENDS_END"
             
             # Clear built packages from cache to prevent stale/corrupted cache issues
             if not self.dry_run:
-                self._clear_cycle_packages_from_cache(pkg_name, pkg_dir)
+                self._clear_packages_from_cache(pkg_name, pkg_dir)
         
         print(f"Successfully built {pkg_name}")
         self._update_last_successful(pkg_name)
@@ -630,14 +630,14 @@ done
             print(f"Warning: Failed to extract package filenames from PKGBUILD: {e}")
             return []
 
-    def _clear_cycle_packages_from_cache(self, pkg_name, pkg_dir):
-        """Clear cycle packages from pacman cache after first build"""
+    def _clear_packages_from_cache(self, pkg_name, pkg_dir):
+        """Clear packages from pacman cache after successful upload"""
         try:
             package_filenames = self._get_package_filenames_from_pkgbuild(pkg_dir)
             if not package_filenames:
                 return
             
-            print(f"Clearing cycle packages from cache: {pkg_name}")
+            print(f"Clearing packages from cache: {pkg_name}")
             
             # Remove exact package files from cache
             for filename in package_filenames:
@@ -650,7 +650,7 @@ done
                         print(f"  Warning: Failed to remove {filename}: {e}")
                         
         except Exception as e:
-            print(f"Warning: Failed to clear cycle packages from cache: {e}")
+            print(f"Warning: Failed to clear packages from cache: {e}")
 
     def build_package(self, pkg_name, pkg_data):
         """Build a single package in a clean chroot environment"""
