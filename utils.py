@@ -143,8 +143,32 @@ class ArchVersionComparator:
                 return 1
             return 0
         except Exception:
-            # Fallback to string comparison
-            return -1 if ver1 < ver2 else (1 if ver1 > ver2 else 0)
+            # Fallback: split on dots and compare numerically where possible
+            try:
+                parts1 = ver1.split('.')
+                parts2 = ver2.split('.')
+                
+                # Compare each part numerically if possible
+                for i in range(max(len(parts1), len(parts2))):
+                    p1 = parts1[i] if i < len(parts1) else '0'
+                    p2 = parts2[i] if i < len(parts2) else '0'
+                    
+                    # Try numeric comparison first
+                    try:
+                        n1 = int(p1.split('-')[0].split('u')[0])
+                        n2 = int(p2.split('-')[0].split('u')[0])
+                        if n1 != n2:
+                            return -1 if n1 < n2 else 1
+                    except ValueError:
+                        # Fall back to string comparison for this part
+                        if p1 != p2:
+                            return -1 if p1 < p2 else 1
+                
+                # If all parts are equal, fall back to full string comparison
+                return -1 if ver1 < ver2 else (1 if ver1 > ver2 else 0)
+            except Exception:
+                # Final fallback to string comparison
+                return -1 if ver1 < ver2 else (1 if ver1 > ver2 else 0)
     
     @staticmethod
     def is_newer(current_version: str, target_version: str) -> bool:
@@ -653,7 +677,7 @@ class BuildUtils:
                 "-M", "chroot-config/makepkg.conf",
                 "-c", str(cache_path),
                 str(chroot_path / "root"),
-                "base-devel"
+                "base", "base-devel"
             ])
         else:
             print("Using existing chroot...")

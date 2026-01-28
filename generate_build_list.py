@@ -448,8 +448,6 @@ echo "$fullver"
                     provide_name = provide.split('=')[0]
                     build_list_provides[provide_name] = basename
         
-    else:
-        print("DEBUG: fetch_pkgbuild_deps - full_x86_packages or target_packages is empty")
     
     # Add common split package patterns for packages in build list
     # This handles cases like linux providing linux-headers, linux-docs, etc.
@@ -850,6 +848,41 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
                 reverse_graph[pkg_name].add(provider_pkg)
                 in_degree[pkg_name] += 1
     
+    # Add transitive dependencies for packages not in build list
+    for pkg in packages:
+        pkg_name = pkg['name']
+        
+        # Check ALL dependency types that are NOT in our build list
+        all_deps = []
+        for dep_type in ['depends', 'makedepends', 'checkdepends']:
+            all_deps.extend(pkg.get(dep_type, []))
+        
+        for dep_str in all_deps:
+            dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+            
+            # Skip if dep is in our build list (already handled)
+            if dep_name in pkg_map:
+                continue
+                
+            # Look up dep in full package databases
+            dep_pkg = None
+            if all_x86_packages and dep_name in all_x86_packages:
+                dep_pkg = all_x86_packages[dep_name]
+            elif all_target_packages and dep_name in all_target_packages:
+                dep_pkg = all_target_packages[dep_name]
+                
+            if dep_pkg:
+                # Check what this dependency depends on
+                for transitive_dep_str in dep_pkg.get('depends', []):
+                    transitive_dep_name = transitive_dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+                    
+                    # If the transitive dependency IS in our build list, create edge
+                    if transitive_dep_name in pkg_map and transitive_dep_name != pkg_name:
+                        # transitive_dep_name must be built before pkg_name
+                        graph[transitive_dep_name].add(pkg_name)
+                        reverse_graph[pkg_name].add(transitive_dep_name)
+                        in_degree[pkg_name] += 1
+    
     # Find strongly connected components (cycles)
     sccs = find_strongly_connected_components(reverse_graph)
     
@@ -862,6 +895,52 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
             cycle_id = len(cycles)
             cycles.append(scc)
             for pkg_name in scc:
+                cycle_map[pkg_name] = cycle_id
+    
+    # Sort cycles by external dependency count (most depended upon first)
+    if cycles:
+        cycle_external_deps = []
+        for cycle_id, cycle_pkgs in enumerate(cycles):
+            external_dep_count = 0
+            cycle_pkg_set = set(cycle_pkgs)
+            
+            # Count how many packages outside this cycle depend on packages in this cycle
+            for pkg in packages:
+                if pkg['name'] in cycle_pkg_set:
+                    continue  # Skip packages in the same cycle
+                
+                # Check if this external package depends on any package in the cycle
+                all_deps = []
+                for dep_type in ['depends', 'makedepends', 'checkdepends']:
+                    all_deps.extend(pkg.get(dep_type, []))
+                
+                for dep_str in all_deps:
+                    dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+                    
+                    # Resolve provides relationships
+                    provider_pkg = None
+                    if dep_name in pkg_map:
+                        provider_pkg = dep_name
+                    elif dep_name in all_provides:
+                        provider_pkg = all_provides[dep_name]
+                    
+                    # If dependency resolves to a package in this cycle, count it
+                    if provider_pkg and provider_pkg in cycle_pkg_set:
+                        external_dep_count += 1
+                        break  # Only count each external package once per cycle
+            
+            cycle_external_deps.append((cycle_id, external_dep_count, cycle_pkgs))
+        
+        # Sort cycles by external dependency count (descending - most depended upon first)
+        cycle_external_deps.sort(key=lambda x: x[1], reverse=True)
+        
+        # Reorder cycles based on priority
+        cycles = [cycle_pkgs for _, _, cycle_pkgs in cycle_external_deps]
+        
+        # Rebuild cycle_map with new ordering
+        cycle_map = {}
+        for cycle_id, cycle_pkgs in enumerate(cycles):
+            for pkg_name in cycle_pkgs:
                 cycle_map[pkg_name] = cycle_id
     
     # Process cycles, but first check for external dependencies
@@ -1205,12 +1284,12 @@ if __name__ == "__main__":
             # Fetch PKGBUILDs and write results
             if newer_packages:
                 print("Processing PKGBUILDs for dependency information...")
-                newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, all_x86_packages, target_packages)
+                newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, {}, {})
             
             if args.preserve_order:
                 newer_packages = preserve_package_order(newer_packages, list(args.use_aur_for_packages))
             else:
-                newer_packages = sort_by_build_order(newer_packages, all_x86_packages, target_packages)
+                newer_packages = sort_by_build_order(newer_packages, {}, {})
             write_results(newer_packages, args)
             sys.exit(0)
     else:
@@ -1219,82 +1298,100 @@ if __name__ == "__main__":
     
     x86_packages = {}
     if args.packages and not args.aur:
-        print(f"Looking up versions for {len(args.packages)} specified packages...")
-        # Load x86_64 packages and target packages for dependency checking
-        # Include ARCH=any packages if --force is used
-        if args.force:
-            from utils import load_packages_with_any, X86_64_MIRROR
-            any_urls = [
-                f"{X86_64_MIRROR}/core/os/x86_64/core.db",
-                f"{X86_64_MIRROR}/extra/os/x86_64/extra.db"
-            ]
-            all_x86_packages = load_packages_with_any(any_urls, '_x86_64', download=not args.no_update, include_any=True)
+        if args.no_update:
+            # Skip all database operations for --no-update --packages mode
+            print(f"Generating build list for {len(args.packages)} specified packages (no database lookup)...")
+            x86_packages = {}
+            target_packages = {}
+            for pkg_name in args.packages:
+                x86_packages[pkg_name] = {
+                    'name': pkg_name,
+                    'basename': pkg_name,
+                    'version': 'unknown',
+                    'depends': [],
+                    'makedepends': [],
+                    'provides': [],
+                    'repo': 'unknown'
+                }
+            # Use same list for dependency resolution
+            full_x86_packages = x86_packages
         else:
-            all_x86_packages = load_x86_64_packages(download=not args.no_update, include_testing=args.upstream_testing)
-        target_packages = load_target_arch_packages(download=not args.no_update, include_testing=args.target_testing)
-        
-        # Filter to only requested packages for comparison, but keep full list for dependency resolution
-        filtered_x86_packages = {}
-        for pkg_name in args.packages:
-            if pkg_name in all_x86_packages:
-                filtered_x86_packages[pkg_name] = all_x86_packages[pkg_name]
+            print(f"Looking up versions for {len(args.packages)} specified packages...")
+            # Load x86_64 packages and target packages for dependency checking
+            # Include ARCH=any packages if --force is used
+            if args.force:
+                from utils import load_packages_with_any, X86_64_MIRROR
+                any_urls = [
+                    f"{X86_64_MIRROR}/core/os/x86_64/core.db",
+                    f"{X86_64_MIRROR}/extra/os/x86_64/extra.db"
+                ]
+                all_x86_packages = load_packages_with_any(any_urls, '_x86_64', download=not args.no_update, include_any=True)
             else:
-                # Check if it's a basename (pkgbase) instead of package name
-                found_by_basename = False
-                for name, pkg_data in all_x86_packages.items():
-                    if pkg_data['basename'] == pkg_name:
-                        filtered_x86_packages[name] = pkg_data
-                        found_by_basename = True
-                        break
-                
-                if not found_by_basename:
-                    # Check if package exists but is ARCH=any (filtered out)
-                    arch_any_found = False
-                    is_arch_any = False
-                    for repo in ['core', 'extra']:
-                        try:
-                            db_filename = f"{repo}_x86_64.db"
-                            if os.path.exists(db_filename):
-                                with tarfile.open(db_filename, 'r:gz') as tar:
-                                    for member in tar.getmembers():
-                                        if member.name.endswith('/desc'):
-                                            desc_content = tar.extractfile(member).read().decode('utf-8')
-                                            lines = desc_content.strip().split('\n')
-                                            data = {}
-                                            current_key = None
-                                            
-                                            for line in lines:
-                                                if line.startswith('%') and line.endswith('%'):
-                                                    current_key = line[1:-1]
-                                                    data[current_key] = []
-                                                elif current_key and line:
-                                                    data[current_key].append(line)
-                                            
-                                            if ('NAME' in data and data['NAME'][0] == pkg_name) or \
-                                               ('BASE' in data and data['BASE'][0] == pkg_name):
-                                                if data.get('ARCH', [''])[0] == 'any':
-                                                    is_arch_any = True
-                                                arch_any_found = True
-                                                break
-                                    if arch_any_found:
-                                        break
-                        except Exception:
-                            continue
+                all_x86_packages = load_x86_64_packages(download=not args.no_update, include_testing=args.upstream_testing)
+            target_packages = load_target_arch_packages(download=not args.no_update, include_testing=args.target_testing)
+            
+            # Filter to only requested packages for comparison, but keep full list for dependency resolution
+            filtered_x86_packages = {}
+            for pkg_name in args.packages:
+                if pkg_name in all_x86_packages:
+                    filtered_x86_packages[pkg_name] = all_x86_packages[pkg_name]
+                else:
+                    # Check if it's a basename (pkgbase) instead of package name
+                    found_by_basename = False
+                    for name, pkg_data in all_x86_packages.items():
+                        if pkg_data['basename'] == pkg_name:
+                            filtered_x86_packages[name] = pkg_data
+                            found_by_basename = True
+                            break
                     
-                    if not arch_any_found:
-                        print(f"ERROR: Package {pkg_name} not found in x86_64 repositories")
-                        sys.exit(1)
-                    elif is_arch_any:
-                        if not args.force:
-                            print(f"WARNING: Package {pkg_name} is ARCH=any and doesn't need rebuilding - skipping")
-                            print(f"         Use --force to build anyway")
-                            continue  # Skip ARCH=any packages
-                        else:
-                            print(f"WARNING: Forcing rebuild of ARCH=any package {pkg_name}")
-                            # Package should already be in all_x86_packages since we loaded with include_any=True
-        x86_packages = filtered_x86_packages
-        # Store full package list for dependency resolution
-        full_x86_packages = all_x86_packages
+                    if not found_by_basename:
+                        # Check if package exists but is ARCH=any (filtered out)
+                        arch_any_found = False
+                        is_arch_any = False
+                        for repo in ['core', 'extra']:
+                            try:
+                                db_filename = f"{repo}_x86_64.db"
+                                if os.path.exists(db_filename):
+                                    with tarfile.open(db_filename, 'r:gz') as tar:
+                                        for member in tar.getmembers():
+                                            if member.name.endswith('/desc'):
+                                                desc_content = tar.extractfile(member).read().decode('utf-8')
+                                                lines = desc_content.strip().split('\n')
+                                                data = {}
+                                                current_key = None
+                                                
+                                                for line in lines:
+                                                    if line.startswith('%') and line.endswith('%'):
+                                                        current_key = line[1:-1]
+                                                        data[current_key] = []
+                                                    elif current_key and line:
+                                                        data[current_key].append(line)
+                                                
+                                                if ('NAME' in data and data['NAME'][0] == pkg_name) or \
+                                                   ('BASE' in data and data['BASE'][0] == pkg_name):
+                                                    if data.get('ARCH', [''])[0] == 'any':
+                                                        is_arch_any = True
+                                                    arch_any_found = True
+                                                    break
+                                        if arch_any_found:
+                                            break
+                            except Exception:
+                                continue
+                        
+                        if not arch_any_found:
+                            print(f"ERROR: Package {pkg_name} not found in x86_64 repositories")
+                            sys.exit(1)
+                        elif is_arch_any:
+                            if not args.force:
+                                print(f"WARNING: Package {pkg_name} is ARCH=any and doesn't need rebuilding - skipping")
+                                print(f"         Use --force to build anyway")
+                                continue  # Skip ARCH=any packages
+                            else:
+                                print(f"WARNING: Forcing rebuild of ARCH=any package {pkg_name}")
+                                # Package should already be in all_x86_packages since we loaded with include_any=True
+            x86_packages = filtered_x86_packages
+            # Store full package list for dependency resolution
+            full_x86_packages = all_x86_packages
     elif not args.aur:
         # Load packages using unified function
         repo_filter = [args.rebuild_repo] if args.rebuild_repo else None
@@ -1451,10 +1548,16 @@ if __name__ == "__main__":
                             })
                 
                 # Parse PKGBUILDs only for newly added dependencies
-                added_deps = [dep_name for dep_name in missing_deps if dep_name in full_x86_packages]
-                if added_deps:
+                added_basenames = []
+                for dep_name in missing_deps:
+                    if dep_name in full_x86_packages:
+                        basename = full_x86_packages[dep_name]['basename']
+                        if basename not in [p['name'] for p in newer_packages[:len(newer_packages) - len(missing_deps)]]:
+                            added_basenames.append(basename)
+                
+                if added_basenames:
                     # Create list of only the newly added packages
-                    new_packages = [pkg for pkg in newer_packages if pkg['name'] in added_deps]
+                    new_packages = [pkg for pkg in newer_packages if pkg['name'] in added_basenames]
                     print("Processing PKGBUILDs for missing dependencies...")
                     new_packages_with_deps = fetch_pkgbuild_deps(new_packages, args.no_update, full_x86_packages, target_packages)
                     

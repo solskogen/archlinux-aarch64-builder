@@ -153,15 +153,32 @@ class BootstrapBuilder(BuildUtils):
             env = os.environ.copy()
             env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
             
-            process = subprocess.Popen([
+            # Check if PKGBUILD arch array contains aarch64
+            use_ignorearch = True
+            try:
+                # Only check the first arch= declaration
+                result = subprocess.run(['bash', '-c', f'cd {pkg_dir} && grep -m1 "^arch=" PKGBUILD'], 
+                                      capture_output=True, text=True, timeout=10)
+                if result.returncode == 0:
+                    arch_line = result.stdout.strip()
+                    if 'aarch64' in arch_line:
+                        use_ignorearch = False
+            except Exception:
+                pass  # Default to using --ignorearch on error
+            
+            cmd = [
                 "makechrootpkg",
                 "-r", str(self.chroot_path),
                 "-d", str(self.cache_path),  # Use custom cache directory
                 "-c",  # Clean chroot
                 "-u",  # Update chroot before building
                 "-t", "/tmp:size=128G",
-                "--", "--ignorearch",
-            ], cwd=pkg_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, errors='replace', env=env)
+                "--"
+            ]
+            if use_ignorearch:
+                cmd.append("--ignorearch")
+            
+            process = subprocess.Popen(cmd, cwd=pkg_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, errors='replace', env=env)
             
             output_lines = []
             for line in process.stdout:
