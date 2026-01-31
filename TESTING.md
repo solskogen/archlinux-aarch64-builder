@@ -117,6 +117,7 @@ mock_packages = {
 ### **✅ Covered Areas**
 - ✓ Input validation (package names, paths)
 - ✓ Version comparison (basic, epoch, git revisions)
+- ✓ Binary package version comparison (-bin packages)
 - ✓ Configuration management
 - ✓ Error handling and edge cases
 - ✓ File operations (JSON, PKGBUILD parsing)
@@ -124,6 +125,9 @@ mock_packages = {
 - ✓ Security (path traversal, injection)
 - ✓ Package filtering and blacklists
 - ✓ Build workflow (dry-run mode)
+- ✓ Dependency resolution and circular dependencies
+- ✓ Architecture detection from makepkg.conf
+- ✓ Smart --ignorearch handling
 
 ### **⚠️ Areas Requiring Manual Testing**
 - Actual package building (requires chroot)

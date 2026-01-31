@@ -133,8 +133,23 @@ When overrides are specified, the system will clone from the custom URL and chec
 ### Build from AUR
 ```bash
 # Build AUR packages for your architecture
-./generate_build_list.py --packages yay paru --aur
+./generate_build_list.py --aur yay paru
 ./build_packages.py
+```
+
+### Analyze Repository Differences
+```bash
+# Show all differences between x86_64 and target architecture
+./repo_analyze.py
+
+# Show only missing packages
+./repo_analyze.py --missing-pkgbase
+
+# Show outdated ARCH=any packages
+./repo_analyze.py --outdated-any
+
+# Show target-only packages (with color coding for -bin packages)
+./repo_analyze.py --target-only
 ```
 
 ### Dry Run (Test Without Building)
@@ -179,7 +194,7 @@ cat config.ini
 | `--packages PKG [PKG ...]` | Force rebuild specific packages by name |
 | `--preserve-order` | Preserve exact order specified in --packages (skip dependency sorting) |
 | `--local` | Build packages from local PKGBUILDs only (use with --packages) |
-| `--aur` | Use AUR as source for packages specified with --packages |
+| `--aur PKG [PKG ...]` | Get specified packages from AUR (implies --packages mode) |
 | `--blacklist FILE` | File containing packages to skip (default: blacklist.txt) |
 | `--missing-packages` | List packages missing from target architecture repository |
 | `--use-latest` | Use latest git commit instead of version tag |
@@ -187,6 +202,7 @@ cat config.ini
 | `--no-update` | Skip git updates, use existing PKGBUILDs |
 | `--target-testing` | Also include target testing repos for comparison |
 | `--upstream-testing` | Also include upstream testing repos for comparison |
+| `--force` | Force rebuild ARCH=any packages (use with --packages) |
 
 #### build_packages.py
 
@@ -200,8 +216,23 @@ cat config.ini
 | `--no-cache` | Clear cache before each package build |
 | `--continue` | Continue from last successful package |
 | `--preserve-chroot` | Preserve chroot even on successful builds |
+| `--cleanup-on-failure` | Delete temporary chroots even on build failure |
 | `--stop-on-failure` | Stop building on first package failure |
 | `--chroot DIR` | Custom chroot directory path |
+| `--parallel-jobs N` | Number of packages to build in parallel within the same stage (default: 1) |
+
+#### repo_analyze.py
+
+| Option | Description |
+|--------|-------------|
+| `--blacklist FILE` | Blacklist file (default: blacklist.txt) |
+| `--use-existing-db` | Use existing database files instead of downloading |
+| `--missing-pkgbase` | Print missing pkgbase names (space delimited) |
+| `--outdated-any` | Show outdated any packages |
+| `--missing-any` | Show missing any packages |
+| `--repo-issues` | Show repository inconsistencies and duplicates |
+| `--target-newer` | Show packages where target architecture is newer |
+| `--target-only` | Show target architecture only packages |
 
 ### Advanced Examples
 
@@ -256,12 +287,17 @@ The build system:
 - **Automated Version Comparison**: Compares x86_64 vs target architecture package versions
 - **Dependency Resolution**: Builds packages in correct dependency order using topological sort
 - **Circular Dependency Handling**: Uses Tarjan's algorithm for two-stage builds of circular dependencies
-- **Clean Chroot Builds**: Isolated build environments for reproducible results
 - **Missing Dependency Detection**: Automatically includes missing dependencies in build list
+- **Architecture Detection**: Automatically detects target architecture from makepkg.conf
+- **Smart --ignorearch Handling**: Only uses --ignorearch when necessary (checks arch array in PKGBUILD)
+- **Clean Chroot Builds**: Isolated build environments for reproducible results
+- **Parallel Building**: Build multiple packages in parallel within the same dependency stage
 - **Multiple Package Sources**: Supports official repos, AUR, and local packages
+- **Binary Package Tracking**: Tracks -bin packages and compares versions with upstream
 - **Progress Tracking**: Clear messages showing current vs target versions
 - **Error Recovery**: Graceful handling of build failures and interruptions
 - **Testing Integration**: Automatic upload to testing repositories with manual promotion workflow
+- **Repository Analysis**: Comprehensive tools for analyzing repository differences and issues
 
 ## Troubleshooting
 

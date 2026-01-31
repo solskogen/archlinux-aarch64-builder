@@ -288,12 +288,12 @@ echo "CHECKDEPENDS_END"
         use_ignorearch = True
         if pkgbuild_path.exists():
             try:
-                # Only check the first arch= declaration
-                result = subprocess.run(['bash', '-c', f'cd {pkg_dir} && grep -m1 "^arch=" PKGBUILD'], 
+                # Source PKGBUILD and check arch array
+                result = subprocess.run(['bash', '-c', f'cd {pkg_dir} && source PKGBUILD && printf "%s\\n" "${{arch[@]}}"'], 
                                       capture_output=True, text=True, timeout=10)
                 if result.returncode == 0:
-                    arch_line = result.stdout.strip()
-                    if 'aarch64' in arch_line:
+                    arch_values = result.stdout.strip().split('\n')
+                    if 'aarch64' in arch_values:
                         use_ignorearch = False
             except Exception:
                 pass  # Default to using --ignorearch on error

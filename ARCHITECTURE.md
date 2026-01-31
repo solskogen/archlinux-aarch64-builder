@@ -29,16 +29,18 @@ The system automatically maintains ports of Arch Linux for multiple architecture
 - Outputs JSON build list with metadata
 
 **Command Line Options**:
-- `--target-urls URL [URL ...]`: Target architecture repository database URLs
 - `--packages PKG [PKG ...]`: Force rebuild specific packages
 - `--preserve-order`: Skip dependency sorting, use exact command line order
 - `--local`: Build from local PKGBUILDs only
-- `--aur`: Get packages from AUR instead of official repos
+- `--aur PKG [PKG ...]`: Get specified packages from AUR (implies --packages mode)
 - `--blacklist FILE`: Skip packages matching patterns in file
 - `--missing-packages`: List packages missing from target architecture
 - `--rebuild-repo {core,extra}`: Rebuild all packages from repository
 - `--no-update`: Skip git updates, use existing PKGBUILDs
 - `--use-latest`: Use latest git commit instead of version tags
+- `--target-testing`: Include target testing repos for comparison
+- `--upstream-testing`: Include upstream testing repos for comparison
+- `--force`: Force rebuild ARCH=any packages (use with --packages)
 - Mutually exclusive: `--no-update` and `--use-latest`
 
 **Git Repository Handling**:
@@ -106,26 +108,36 @@ The system automatically maintains ports of Arch Linux for multiple architecture
 - `--cache DIR`: Custom pacman cache directory
 - `--no-cache`: Clear cache before each build
 - `--continue`: Continue from last successful package
-- `--repackage`: Repackage next package (requires --continue)
 - `--preserve-chroot`: Keep chroot after successful builds
+- `--cleanup-on-failure`: Delete temporary chroots even on build failure
 - `--stop-on-failure`: Stop on first failure
 - `--chroot DIR`: Custom chroot directory
+- `--parallel-jobs N`: Number of packages to build in parallel within the same stage (default: 1)
 
 **Build Process**:
 1. Create temporary chroot copy using `rsync`
 2. Update package database with `arch-nspawn`
 3. Install all dependencies (depends + makedepends + checkdepends)
-4. Build with `makechrootpkg -l temp-{pkg}-{random} --ignorearch`
-5. Upload to `{repo}-testing` repository
-6. Clean up temporary chroot (unless preserving)
-7. Handle interruption signals gracefully
+4. Check if PKGBUILD arch array contains target architecture
+5. Build with `makechrootpkg -l temp-{pkg}-{timestamp}` (with or without --ignorearch)
+6. Upload to `{repo}-testing` repository
+7. Clear built packages from cache to prevent stale/corrupted packages
+8. Clean up temporary chroot (unless preserving)
+9. Handle interruption signals gracefully
+
+**Smart --ignorearch Handling**:
+- Sources PKGBUILD and checks arch array
+- Only uses --ignorearch if target architecture not in arch array
+- Handles multi-line arch arrays correctly
+- Prevents unnecessary --ignorearch usage for native packages
 
 **Chroot Management**:
 - Default chroot: `/scratch/builder`
 - Default cache: `/scratch/builder/pacman-cache`
-- Temporary chroots: `temp-{package}-{7-digit-random}`
+- Temporary chroots: `temp-{package}-{timestamp}`
 - Uses `sudo rsync` for chroot copying
 - Automatic cleanup on SIGINT/SIGTERM
+- Parallel build support with isolated temporary chroots per package
 
 #### `bootstrap_toolchain.py`
 **Purpose**: Build core toolchain packages in staged approach
@@ -157,16 +169,22 @@ The system automatically maintains ports of Arch Linux for multiple architecture
 - Architecture-specific packages (target architecture only)
 - Outdated/missing ARCH=any packages
 - Packages in multiple repositories
+- Binary package version tracking (-bin packages)
+
+**Color Coding**:
+- Green: -bin packages matching x86_64 versions
+- Cyan: -bin packages newer than x86_64
+- Red: -bin packages outdated or aarch64-only packages in core/extra repos
 
 **Command Line Options**:
 - `--blacklist FILE`: Skip blacklisted packages
-- `--missing-pkgbase`: Print missing package base names
+- `--use-existing-db`: Use existing database files instead of downloading
+- `--missing-pkgbase`: Print missing package base names (space delimited)
 - `--outdated-any`: Show outdated any packages
 - `--missing-any`: Show missing any packages  
-- `--repo-mismatches`: Show repository mismatches
+- `--repo-issues`: Show repository inconsistencies and duplicates
 - `--target-newer`: Show packages where target architecture is newer
 - `--target-only`: Show target architecture only packages
-- `--arm-duplicates`: Show packages in both core and extra
 
 #### `find_dependents.py`
 **Purpose**: Find packages that depend on a given package

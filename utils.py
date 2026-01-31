@@ -695,7 +695,7 @@ def compare_bin_package_versions(provided_version, x86_version):
     not the Arch packaging revision (pkgrel). This prevents unnecessary
     rebuilds when only packaging changes.
     
-    Returns: True if provided_version is older than x86_version
+    Returns: -1 if provided_version < x86_version, 0 if equal, 1 if provided_version > x86_version
     """
     # Extract version without pkgrel (everything before the last '-')
     def extract_version_only(version_str):
@@ -706,10 +706,16 @@ def compare_bin_package_versions(provided_version, x86_version):
     try:
         provided_base = extract_version_only(provided_version)
         x86_base = extract_version_only(x86_version)
-        return is_version_newer(provided_base, x86_base)
+        
+        if is_version_newer(provided_base, x86_base):
+            return -1  # provided is older
+        elif is_version_newer(x86_base, provided_base):
+            return 1   # provided is newer
+        else:
+            return 0   # equal
     except Exception:
-        # If version parsing fails, assume we need to rebuild
-        return True
+        # If version parsing fails, assume outdated
+        return -1
 
 def extract_packages(db_file, repo_name):
     """Extract packages from database file with repository information"""

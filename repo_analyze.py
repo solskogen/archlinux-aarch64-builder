@@ -287,20 +287,24 @@ def main():
                         x86_pkgver = get_pkgver(x86_version)
                         
                         if aarch64_pkgver == x86_pkgver:
-                            version_info = f" [matches x86_64 {x86_counterpart}]"
+                            version_info = f" \033[32m[matches x86_64 {x86_counterpart}]\033[0m"
                         else:
                             # Compare versions to determine if newer or older
                             from packaging import version
                             try:
                                 if version.parse(aarch64_pkgver) > version.parse(x86_pkgver):
-                                    version_info = f" [NEWER than x86_64 {x86_counterpart}: {x86_version}]"
+                                    version_info = f" \033[36m[NEWER than x86_64 {x86_counterpart}: {x86_version}]\033[0m"
                                 else:
-                                    version_info = f" [OUTDATED - x86_64 {x86_counterpart}: {x86_version}]"
+                                    version_info = f" \033[31m[OUTDATED - x86_64 {x86_counterpart}: {x86_version}]\033[0m"
                             except:
                                 # Fallback if version parsing fails
                                 version_info = f" [x86_64 {x86_counterpart}: {x86_version}]"
                 
-                target_only.append(f"{basename}: {target_data['version']} ({target_data['repo']}) (file: {filename}){version_info}")
+                # Color code for aarch64-only packages in extra/core repos (should not exist)
+                line = f"{basename}: {target_data['version']} ({target_data['repo']}) (file: {filename}){version_info}"
+                if target_data['repo'] in ['core', 'extra']:
+                    line = f"\033[31m{line}\033[0m"
+                target_only.append(line)
             else:
                 # Multiple packages - list each package individually
                 arch = target_data.get('arch', target_arch)

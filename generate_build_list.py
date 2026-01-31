@@ -1634,12 +1634,6 @@ if __name__ == "__main__":
     elif args.missing_packages:
         print(f"Found {len(newer_packages)} missing packages")
     
-    if bin_package_warnings:
-        print("\n" + "="*SEPARATOR_WIDTH)
-        for warning in bin_package_warnings:
-            print(warning)
-        print("="*SEPARATOR_WIDTH)
-    
     # Check if any skipped packages are dependencies of packages being built
     if skipped_packages and newer_packages:
         # Extract package names from skipped packages (remove reason text)
