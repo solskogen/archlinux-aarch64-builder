@@ -427,7 +427,7 @@ echo "$fullver"
             pkg.update(deps)
             pkg['provides'] = original_provides
         else:
-            print(f"  DEBUG: PKGBUILD does not exist for {pkg['name']} at {pkgbuild_path}")
+            print(f"  PKGBUILD does not exist for {pkg['name']} at {pkgbuild_path}")
     
     # Return combined list with blacklisted packages (unchanged) and fetched packages (with updated deps)
     all_packages = packages_to_fetch + blacklisted_packages
@@ -1086,16 +1086,12 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
                         # Dependency is in remaining packages
                         remaining_graph[provider_pkg].add(pkg_name)
                         remaining_in_degree[pkg_name] += 1
-                        if pkg_name == 'bear':
-                            print(f"DEBUG: bear depends on {provider_pkg} (in_degree now {remaining_in_degree[pkg_name]})")
         
         # Topological sort for remaining packages
         queue = deque()
         for pkg in remaining_packages:
             if remaining_in_degree[pkg['name']] == 0:
                 queue.append((pkg['name'], current_stage))
-            elif pkg['name'] == 'bear':
-                print(f"DEBUG: bear in_degree = {remaining_in_degree[pkg['name']]}, deps = {reverse_graph.get(pkg['name'], set())}")
         
         while queue:
             next_queue = deque()
@@ -1138,7 +1134,6 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
     missing_packages = []
     for pkg in packages:
         if pkg['name'] not in result_names:
-            print(f"DEBUG: Package {pkg['name']} missing from result, adding to missing_packages")
             pkg_copy = pkg.copy()
             pkg_copy['build_stage'] = 0
             pkg_copy['cycle_group'] = None
@@ -1617,12 +1612,6 @@ if __name__ == "__main__":
                                         filtered_deps.append(dep)
                                 pkg[dep_type] = filtered_deps
                     
-                    print(f"DEBUG: After re-filtering: {len(newer_packages)} packages")
-                    debug_names = [pkg['name'] for pkg in newer_packages if pkg['name'] in ['nix', 'p2pool', 'zed']]
-                    if debug_names:
-                        print(f"DEBUG: Target packages present: {debug_names}")
-                    else:
-                        print("DEBUG: Target packages LOST during re-filtering")
     elif newer_packages:
         # For missing packages mode, still need PKGBUILD parsing
         print("Processing PKGBUILDs for dependency information...")

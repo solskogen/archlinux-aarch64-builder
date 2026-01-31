@@ -590,7 +590,7 @@ echo "CHECKDEPENDS_END"
                                     executor.shutdown(wait=False)
                                     break
                         except Exception as e:
-                            print(f"DEBUG: Unexpected exception in parallel build: {e}")
+                            print(f"Unexpected exception in parallel build: {e}")
                             failed_packages.append(pkg)
                             if self.stop_on_failure:
                                 executor.shutdown(wait=False)
@@ -685,7 +685,7 @@ echo "CHECKDEPENDS_END"
         try:
             return self.build_package(pkg_name, pkg)
         except Exception as e:
-            print(f"DEBUG: Unexpected exception building {pkg_name}: {e}")
+            print(f"Unexpected exception building {pkg_name}: {e}")
             return False
 
     def _get_package_filenames_from_pkgbuild(self, pkg_dir):
