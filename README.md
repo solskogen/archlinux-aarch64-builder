@@ -45,6 +45,10 @@ sudo pacman -S devtools git rsync python-packaging
 
 **Testing Repositories**: Where built packages are uploaded first (core-testing, extra-testing) before manual promotion to stable repositories
 
+## How Build Stages Work
+
+The build system uses topological sorting to order packages by their dependencies - packages with no dependencies go in stage 0, packages that only depend on stage 0 packages go in stage 1, and so on. When circular dependencies are detected using Tarjan's algorithm (e.g., package A depends on B, B depends on A), those packages are built twice: first in an early stage to satisfy initial dependencies, then again in a later stage to link against the complete versions. The stage number represents the "depth" in the dependency tree - a package can only be built after all its dependencies from earlier stages are complete. Packages within the same stage can be built in parallel since they don't depend on each other. The system automatically detects these relationships by parsing PKGBUILD files and building a complete dependency graph before assigning stage numbers.
+
 ## Basic Workflow
 
 ```
