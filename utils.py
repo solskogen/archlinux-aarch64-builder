@@ -381,6 +381,7 @@ def load_database_packages(urls, arch_suffix, download=True, include_any=False):
                 elif needs_download:
                     print(f"Downloading {db_filename}...")
                 subprocess.run(["wget", "-q", "-O", db_filename, url], check=True)
+                db_path.touch()  # Update mtime (wget preserves server timestamp)
             elif download:
                 print(f"Using existing {db_filename}")
             
