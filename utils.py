@@ -555,32 +555,11 @@ class BuildUtils:
         return subprocess.run(cmd, cwd=cwd, capture_output=capture_output, 
                             text=True, timeout=timeout, check=True)
 
-    def run_git_command(self, cmd, cwd, timeout=GIT_COMMAND_TIMEOUT):
-        """Execute git command with standard timeout and error handling."""
-        full_cmd = ["git"] + cmd if isinstance(cmd, list) else ["git", cmd]
-        return self.run_command(full_cmd, cwd=cwd, capture_output=True, timeout=timeout)
-
     def format_dry_run(self, description, commands):
         """Format dry run output consistently."""
         print(f"DRY RUN: {description}")
         for cmd in commands:
             print(f"  {cmd}")
-
-    def clear_cache(self, cache_path, description="cache"):
-        """Clear cache directory with consistent handling."""
-        if self.dry_run:
-            self.format_dry_run(f"Would clear {description}", [f"rm -rf {cache_path}/*"])
-            return 0
-        
-        try:
-            cache_files = list(cache_path.glob("*.pkg.tar.*"))
-            for cache_file in cache_files:
-                cache_file.unlink()
-            print(f"Cleared {len(cache_files)} cached packages from {description}")
-            return len(cache_files)
-        except Exception as e:
-            print(f"Warning: Failed to clear {description}: {e}")
-            return 0
 
     def clear_packages_from_cache(self, cache_path, pkg_names):
         """
@@ -681,11 +660,6 @@ class BuildUtils:
             ])
         else:
             print("Using existing chroot...")
-    
-def should_skip_package(pkg_name, blacklist):
-    """Determine if package should be skipped based on blacklist"""
-    import fnmatch
-    return any(fnmatch.fnmatch(pkg_name, pattern) for pattern in blacklist)
 
 def compare_bin_package_versions(provided_version, x86_version):
     """
@@ -716,18 +690,6 @@ def compare_bin_package_versions(provided_version, x86_version):
     except Exception:
         # If version parsing fails, assume outdated
         return -1
-
-def extract_packages(db_file, repo_name):
-    """Extract packages from database file with repository information"""
-    packages = parse_database_file(db_file)
-    for pkg in packages.values():
-        pkg['repo'] = repo_name
-        if pkg['name'] in packages:
-            print(f"ERROR: Package '{pkg['name']}' found in multiple repositories!")
-            print(f"  First: {packages[pkg['name']]['repo']} (version {packages[pkg['name']]['version']})")
-            print(f"  Second: {repo_name} (version {pkg['version']})")
-            exit(1)
-    return packages
 
 def find_missing_dependencies(packages, x86_packages, target_packages):
     """Find dependencies that exist in x86_64 but are completely missing from target architecture"""
@@ -842,13 +804,6 @@ def handle_file_error(e, operation_name, filename, exit_on_error=True):
     if exit_on_error:
         sys.exit(1)
     return False
-
-def safe_file_operation(operation, filename, exit_on_error=True):
-    """Safely execute file operations with consistent error handling."""
-    try:
-        return operation()
-    except Exception as e:
-        return handle_file_error(e, "File operation", filename, exit_on_error)
 
 def safe_command_execution(cmd, operation_name, cwd=None, exit_on_error=True, **kwargs):
     """Safely execute commands with consistent error handling."""

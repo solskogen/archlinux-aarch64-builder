@@ -414,18 +414,6 @@ echo "CHECKDEPENDS_END"
             state_file.write_text('\n'.join(sorted(successful)))
         except Exception as e:
             print(f"Warning: Failed to update last successful package: {e}")
-    
-    def _clear_cache(self):
-        """Clear pacman cache to force using newly uploaded packages"""
-        cache_dir = Path(self.cache_dir)
-        if cache_dir.exists():
-            try:
-                import shutil
-                shutil.rmtree(cache_dir)
-                cache_dir.mkdir(parents=True, exist_ok=True)
-                print(f"Cleared cache directory: {cache_dir}")
-            except Exception as e:
-                print(f"Warning: Failed to clear cache: {e}")
 
     def _should_skip_due_to_failed_dependencies(self, pkg, failed_packages, provides_map):
         """Check if package should be skipped due to failed dependencies"""
