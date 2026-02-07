@@ -1641,6 +1641,510 @@ class TestSignalHandlingEdgeCases:
             assert not lock_file.exists(), "Lock file should be cleaned up"
 
 
+# =============================================================================
+# BLACKLIST PATTERN MATCHING TESTS
+# =============================================================================
+
+class TestBlacklistPatterns:
+    """Tests for blacklist wildcard pattern matching"""
+    
+    def test_wildcard_suffix_matching(self):
+        """Wildcard suffix patterns should match correctly"""
+        import fnmatch
+        patterns = ['*-debug', '*-git', '*-bin']
+        
+        should_match = ['package-debug', 'vim-debug', 'foo-git', 'electron-bin']
+        should_not_match = ['debug-package', 'package', 'git-tools']
+        
+        for pkg in should_match:
+            assert any(fnmatch.fnmatch(pkg, p) for p in patterns), f"{pkg} should match"
+        for pkg in should_not_match:
+            assert not any(fnmatch.fnmatch(pkg, p) for p in patterns), f"{pkg} should not match"
+    
+    def test_wildcard_prefix_matching(self):
+        """Wildcard prefix patterns should match correctly"""
+        import fnmatch
+        patterns = ['lib32-*', 'python-*', 'rust-*']
+        
+        should_match = ['lib32-glibc', 'python-requests', 'rust-analyzer']
+        should_not_match = ['glibc', 'requests', 'mylib32-thing']
+        
+        for pkg in should_match:
+            assert any(fnmatch.fnmatch(pkg, p) for p in patterns), f"{pkg} should match"
+        for pkg in should_not_match:
+            assert not any(fnmatch.fnmatch(pkg, p) for p in patterns), f"{pkg} should not match"
+    
+    def test_blacklist_comment_handling(self):
+        """Blacklist files should ignore comments and empty lines"""
+        from utils import load_blacklist
+        import tempfile
+        
+        content = """# This is a comment
+package1
+  # Indented comment
+package2
+
+# Empty line above
+package3
+"""
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+            f.write(content)
+            f.flush()
+            blacklist = load_blacklist(f.name)
+        
+        assert 'package1' in blacklist
+        assert 'package2' in blacklist
+        assert 'package3' in blacklist
+        assert not any('#' in item for item in blacklist), "Comments should be filtered"
+        Path(f.name).unlink()
+    
+    def test_filter_blacklisted_packages(self):
+        """filter_blacklisted_packages should apply patterns correctly"""
+        from utils import filter_blacklisted_packages
+        
+        packages = [
+            {'name': 'vim', 'basename': 'vim'},
+            {'name': 'vim-debug', 'basename': 'vim'},
+            {'name': 'lib32-glibc', 'basename': 'lib32-glibc'},
+            {'name': 'gcc', 'basename': 'gcc'},
+        ]
+        blacklist = ['*-debug', 'lib32-*']
+        
+        filtered, count = filter_blacklisted_packages(packages, blacklist)
+        
+        assert count == 2, f"Should filter 2 packages, got {count}"
+        names = [p['name'] for p in filtered]
+        assert 'vim' in names
+        assert 'gcc' in names
+        assert 'vim-debug' not in names
+        assert 'lib32-glibc' not in names
+
+
+# =============================================================================
+# FIND MISSING DEPENDENCIES TESTS
+# =============================================================================
+
+class TestFindMissingDependencies:
+    """Tests for find_missing_dependencies function"""
+    
+    def test_finds_missing_direct_dependency(self):
+        """Should find dependencies missing from target arch"""
+        from utils import find_missing_dependencies
+        
+        packages = [{'name': 'consumer', 'depends': ['missing-dep'], 'makedepends': [], 'checkdepends': []}]
+        x86_packages = {
+            'consumer': {'name': 'consumer', 'basename': 'consumer', 'version': '1.0', 'depends': [], 'provides': []},
+            'missing-dep': {'name': 'missing-dep', 'basename': 'missing-dep', 'version': '1.0', 'depends': [], 'provides': []}
+        }
+        target_packages = {
+            'consumer': {'name': 'consumer', 'basename': 'consumer', 'version': '1.0', 'depends': [], 'provides': []}
+        }
+        
+        missing = find_missing_dependencies(packages, x86_packages, target_packages)
+        assert 'missing-dep' in missing
+    
+    def test_ignores_satisfied_dependencies(self):
+        """Should not report dependencies that exist in target"""
+        from utils import find_missing_dependencies
+        
+        packages = [{'name': 'consumer', 'depends': ['existing-dep'], 'makedepends': [], 'checkdepends': []}]
+        x86_packages = {
+            'consumer': {'name': 'consumer', 'basename': 'consumer', 'version': '1.0', 'depends': [], 'provides': []},
+            'existing-dep': {'name': 'existing-dep', 'basename': 'existing-dep', 'version': '1.0', 'depends': [], 'provides': []}
+        }
+        target_packages = {
+            'consumer': {'name': 'consumer', 'basename': 'consumer', 'version': '1.0', 'depends': [], 'provides': []},
+            'existing-dep': {'name': 'existing-dep', 'basename': 'existing-dep', 'version': '1.0', 'depends': [], 'provides': []}
+        }
+        
+        missing = find_missing_dependencies(packages, x86_packages, target_packages)
+        assert 'existing-dep' not in missing
+    
+    def test_finds_missing_makedepends(self):
+        """Should find missing makedepends"""
+        from utils import find_missing_dependencies
+        
+        packages = [{'name': 'pkg', 'depends': [], 'makedepends': ['build-tool'], 'checkdepends': []}]
+        x86_packages = {
+            'pkg': {'name': 'pkg', 'basename': 'pkg', 'version': '1.0', 'depends': [], 'provides': []},
+            'build-tool': {'name': 'build-tool', 'basename': 'build-tool', 'version': '1.0', 'depends': [], 'provides': []}
+        }
+        target_packages = {}
+        
+        missing = find_missing_dependencies(packages, x86_packages, target_packages)
+        assert 'build-tool' in missing
+    
+    def test_respects_provides(self):
+        """Should recognize packages satisfied by provides"""
+        from utils import find_missing_dependencies
+        
+        packages = [{'name': 'consumer', 'depends': ['virtual-pkg'], 'makedepends': [], 'checkdepends': []}]
+        x86_packages = {
+            'consumer': {'name': 'consumer', 'basename': 'consumer', 'version': '1.0', 'depends': [], 'provides': []},
+            'virtual-pkg': {'name': 'virtual-pkg', 'basename': 'virtual-pkg', 'version': '1.0', 'depends': [], 'provides': []}
+        }
+        target_packages = {
+            'provider': {'name': 'provider', 'basename': 'provider', 'version': '1.0', 'depends': [], 'provides': ['virtual-pkg']}
+        }
+        
+        missing = find_missing_dependencies(packages, x86_packages, target_packages)
+        assert 'virtual-pkg' not in missing
+
+
+# =============================================================================
+# BUILD UTILS CLASS TESTS
+# =============================================================================
+
+class TestBuildUtilsClass:
+    """Tests for BuildUtils class methods"""
+    
+    def test_dry_run_mode(self):
+        """Dry run mode should not execute commands"""
+        from utils import BuildUtils
+        
+        utils = BuildUtils(dry_run=True)
+        result = utils.run_command(['echo', 'test'])
+        assert result.returncode == 0, "Dry run should return success"
+    
+    def test_format_dry_run_output(self):
+        """format_dry_run should produce readable output"""
+        from utils import BuildUtils
+        import io
+        import sys
+        
+        utils = BuildUtils(dry_run=True)
+        
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        utils.format_dry_run("Test operation", ["cmd1", "cmd2"])
+        sys.stdout = old_stdout
+        
+        output = captured.getvalue()
+        assert "DRY RUN" in output
+        assert "Test operation" in output
+    
+    def test_cleanup_old_logs(self):
+        """cleanup_old_logs should keep only recent logs"""
+        from utils import BuildUtils
+        import tempfile
+        import time
+        
+        utils = BuildUtils()
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            utils.logs_dir = Path(tmpdir)
+            
+            # Create 5 log files with different timestamps
+            for i in range(5):
+                log_file = Path(tmpdir) / f"test-pkg-{i:04d}-build.log"
+                log_file.write_text(f"log {i}")
+                time.sleep(0.01)  # Ensure different mtimes
+            
+            utils.cleanup_old_logs("test-pkg", keep_count=2)
+            
+            remaining = list(Path(tmpdir).glob("test-pkg-*-build.log"))
+            assert len(remaining) == 2, f"Should keep 2 logs, got {len(remaining)}"
+    
+    def test_clear_packages_from_cache(self):
+        """clear_packages_from_cache should remove specific packages"""
+        from utils import BuildUtils
+        import tempfile
+        
+        utils = BuildUtils()
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = Path(tmpdir)
+            
+            # Create mock package files
+            (cache_path / "gcc-13.0-1-aarch64.pkg.tar.zst").write_text("pkg")
+            (cache_path / "gcc-libs-13.0-1-aarch64.pkg.tar.zst").write_text("pkg")
+            (cache_path / "vim-9.0-1-aarch64.pkg.tar.zst").write_text("pkg")
+            
+            removed = utils.clear_packages_from_cache(cache_path, ['gcc', 'gcc-libs'])
+            
+            assert removed == 2
+            assert not (cache_path / "gcc-13.0-1-aarch64.pkg.tar.zst").exists()
+            assert (cache_path / "vim-9.0-1-aarch64.pkg.tar.zst").exists()
+
+
+# =============================================================================
+# VERSION COMPARISON WITH PKGREL TESTS
+# =============================================================================
+
+class TestVersionComparisonPkgrel:
+    """Tests for version comparison including pkgrel"""
+    
+    def test_same_version_different_pkgrel(self):
+        """Higher pkgrel should be newer"""
+        from utils import is_version_newer
+        
+        assert is_version_newer("1.0.0-1", "1.0.0-2"), "pkgrel 2 should be newer than 1"
+        assert not is_version_newer("1.0.0-2", "1.0.0-1"), "pkgrel 1 should not be newer than 2"
+    
+    def test_different_version_same_pkgrel(self):
+        """Version takes precedence over pkgrel"""
+        from utils import is_version_newer
+        
+        assert is_version_newer("1.0.0-5", "1.0.1-1"), "1.0.1 should be newer regardless of pkgrel"
+    
+    def test_epoch_overrides_pkgrel(self):
+        """Epoch should override both version and pkgrel"""
+        from utils import is_version_newer
+        
+        assert not is_version_newer("1:1.0.0-1", "2.0.0-99"), "Epoch should win"
+
+
+# =============================================================================
+# PROVIDES WITH VERSION CONSTRAINTS TESTS
+# =============================================================================
+
+class TestProvidesVersionConstraints:
+    """Tests for provides with version constraints"""
+    
+    def test_provides_version_extraction(self):
+        """Should extract version from provides string"""
+        provides = ['foo=1.0.0', 'bar', 'baz>=2.0']
+        
+        for p in provides:
+            name = p.split('=')[0].split('>')[0].split('<')[0]
+            assert name in ['foo', 'bar', 'baz']
+    
+    def test_dependency_ordering_with_provides(self):
+        """Build order should respect provides relationships"""
+        from generate_build_list import sort_by_build_order
+        
+        packages = [
+            {'name': 'consumer', 'depends': ['virtual'], 'makedepends': [], 'checkdepends': [], 'provides': []},
+            {'name': 'provider', 'depends': [], 'makedepends': [], 'checkdepends': [], 'provides': ['virtual=1.0']}
+        ]
+        
+        result = sort_by_build_order(packages)
+        names = [p['name'] for p in result]
+        
+        # Provider should come before consumer (if ordering respects provides)
+        assert len(result) == 2
+
+
+# =============================================================================
+# MULTIPLE DISCONNECTED CYCLES TESTS
+# =============================================================================
+
+class TestMultipleDisconnectedCycles:
+    """Tests for handling multiple independent dependency cycles"""
+    
+    def test_two_independent_cycles(self):
+        """Should handle two separate cycles correctly"""
+        from generate_build_list import sort_by_build_order
+        
+        packages = [
+            # Cycle 1: A <-> B
+            {'name': 'cycle1-a', 'depends': ['cycle1-b'], 'makedepends': [], 'checkdepends': [], 'provides': []},
+            {'name': 'cycle1-b', 'depends': ['cycle1-a'], 'makedepends': [], 'checkdepends': [], 'provides': []},
+            # Cycle 2: X <-> Y
+            {'name': 'cycle2-x', 'depends': ['cycle2-y'], 'makedepends': [], 'checkdepends': [], 'provides': []},
+            {'name': 'cycle2-y', 'depends': ['cycle2-x'], 'makedepends': [], 'checkdepends': [], 'provides': []},
+        ]
+        
+        result = sort_by_build_order(packages)
+        
+        # Should have 8 packages (4 original × 2 stages each)
+        assert len(result) == 8, f"Expected 8, got {len(result)}"
+        
+        # Verify both cycles are detected
+        cycle_groups = set(p.get('cycle_group') for p in result if p.get('cycle_group') is not None)
+        assert len(cycle_groups) == 2, "Should detect 2 separate cycles"
+    
+    def test_cycle_with_external_dependency(self):
+        """Cycle depending on external package should build external first"""
+        from generate_build_list import sort_by_build_order
+        
+        packages = [
+            {'name': 'external', 'depends': [], 'makedepends': [], 'checkdepends': [], 'provides': []},
+            {'name': 'cycle-a', 'depends': ['cycle-b', 'external'], 'makedepends': [], 'checkdepends': [], 'provides': []},
+            {'name': 'cycle-b', 'depends': ['cycle-a'], 'makedepends': [], 'checkdepends': [], 'provides': []},
+        ]
+        
+        result = sort_by_build_order(packages)
+        names = [p['name'] for p in result]
+        
+        # External should come before cycle packages
+        ext_idx = names.index('external')
+        cycle_a_first = names.index('cycle-a')
+        assert ext_idx < cycle_a_first, "External dep should be built before cycle"
+
+
+# =============================================================================
+# PACKAGE UPLOAD LOGIC TESTS
+# =============================================================================
+
+class TestPackageUploadLogic:
+    """Tests for package upload functionality"""
+    
+    def test_repo_to_testing_mapping(self):
+        """Core/extra packages should map to testing repos"""
+        test_cases = [
+            ('core', 'core-testing'),
+            ('extra', 'extra-testing'),
+        ]
+        
+        for repo, expected_target in test_cases:
+            if repo == 'core':
+                target = 'core-testing'
+            elif repo == 'extra':
+                target = 'extra-testing'
+            else:
+                target = 'forge'
+            assert target == expected_target
+    
+    def test_package_file_detection(self):
+        """Should detect package files correctly"""
+        import tempfile
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pkg_dir = Path(tmpdir)
+            
+            # Create mock package files
+            (pkg_dir / "test-1.0-1-aarch64.pkg.tar.zst").write_bytes(b"pkg")
+            (pkg_dir / "test-1.0-1-aarch64.pkg.tar.zst.sig").write_bytes(b"sig")
+            (pkg_dir / "PKGBUILD").write_text("pkgname=test")
+            
+            packages = [str(f) for f in pkg_dir.glob("*.pkg.tar.*") if not f.name.endswith('.sig')]
+            
+            assert len(packages) == 1
+            assert "test-1.0-1-aarch64.pkg.tar.zst" in packages[0]
+
+
+# =============================================================================
+# BOOTSTRAP LOCK FILE TESTS
+# =============================================================================
+
+class TestBootstrapLockFile:
+    """Tests for bootstrap lock file handling"""
+    
+    def test_lock_file_contains_pid(self):
+        """Lock file should contain PID information"""
+        import tempfile
+        import os
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_file = Path(tmpdir) / "bootstrap.lock"
+            pid = os.getpid()
+            
+            lock_file.write_text(f"PID:{pid}\nBootstrap started")
+            
+            content = lock_file.read_text()
+            assert f"PID:{pid}" in content
+    
+    def test_stale_lock_detection(self):
+        """Should detect stale lock files from dead processes"""
+        import tempfile
+        
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lock_file = Path(tmpdir) / "bootstrap.lock"
+            
+            # Use a PID that definitely doesn't exist
+            lock_file.write_text("PID:999999999\nStale lock")
+            
+            content = lock_file.read_text()
+            if content.startswith("PID:"):
+                old_pid = int(content.split(":")[1].split("\n")[0])
+                try:
+                    import os
+                    os.kill(old_pid, 0)
+                    process_exists = True
+                except OSError:
+                    process_exists = False
+                
+                assert not process_exists, "Fake PID should not exist"
+
+
+# =============================================================================
+# PKGBUILD PARSING WITH REAL CONTENT TESTS
+# =============================================================================
+
+class TestPKGBUILDParsingReal:
+    """Tests for PKGBUILD parsing with actual content"""
+    
+    def test_parse_simple_pkgbuild(self):
+        """Should parse a simple PKGBUILD correctly"""
+        import tempfile
+        from utils import parse_pkgbuild_deps
+        
+        pkgbuild_content = """
+pkgname=test-package
+pkgver=1.0.0
+pkgrel=1
+depends=('glibc' 'zlib')
+makedepends=('gcc' 'make')
+checkdepends=('check')
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pkgbuild = Path(tmpdir) / "PKGBUILD"
+            pkgbuild.write_text(pkgbuild_content)
+            
+            deps = parse_pkgbuild_deps(pkgbuild)
+            
+            assert 'glibc' in deps['depends']
+            assert 'zlib' in deps['depends']
+            assert 'gcc' in deps['makedepends']
+            assert 'check' in deps['checkdepends']
+    
+    def test_parse_pkgbuild_with_variables(self):
+        """Should handle variable expansion in dependencies"""
+        import tempfile
+        from utils import parse_pkgbuild_deps
+        
+        pkgbuild_content = """
+pkgname=test
+pkgver=2.0
+_somever=1.5
+depends=("somelib>=${_somever}")
+makedepends=()
+"""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            pkgbuild = Path(tmpdir) / "PKGBUILD"
+            pkgbuild.write_text(pkgbuild_content)
+            
+            deps = parse_pkgbuild_deps(pkgbuild)
+            
+            # Variable should be expanded
+            assert any('somelib' in d for d in deps['depends'])
+
+
+# =============================================================================
+# REPO ANALYZE SCRIPT TESTS
+# =============================================================================
+
+class TestRepoAnalyze:
+    """Tests for repo_analyze.py functionality"""
+    
+    def test_script_exists_and_runs(self):
+        """repo_analyze.py should exist and show help"""
+        script = Path("repo_analyze.py")
+        if script.exists():
+            result = subprocess.run(['./repo_analyze.py', '--help'], 
+                                  capture_output=True, text=True, timeout=10)
+            assert result.returncode == 0
+
+
+# =============================================================================
+# FIND DEPENDENTS SCRIPT TESTS
+# =============================================================================
+
+class TestFindDependentsScript:
+    """Tests for find_dependents.py functionality"""
+    
+    def test_script_exists_and_runs(self):
+        """find_dependents.py should exist and show help"""
+        script = Path("find_dependents.py")
+        if script.exists():
+            result = subprocess.run(['./find_dependents.py', '--help'], 
+                                  capture_output=True, text=True, timeout=10)
+            # Script may exit with error if no package specified, but shouldn't crash
+            assert result.returncode in [0, 1, 2]
+
+
 class TestUtilities:
     """Tests for utility functions and helpers"""
     

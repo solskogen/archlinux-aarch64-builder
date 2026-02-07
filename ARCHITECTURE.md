@@ -251,7 +251,7 @@ The system automatically maintains ports of Arch Linux for multiple architecture
 
 **Test Execution**:
 - Works with or without pytest
-- 53 total tests covering all functionality
+- 88 total tests covering all functionality
 - Integration tests verify script imports and help commands
 - Supports both unit tests and integration tests
 

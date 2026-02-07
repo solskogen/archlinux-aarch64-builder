@@ -135,8 +135,8 @@ def load_package_overrides():
         with open(overrides_file, 'r') as f:
             return json.load(f)
     except Exception as e:
-        print(f"Warning: Failed to load package overrides: {e}")
-        return {}
+        print(f"ERROR: Failed to load package overrides from {overrides_file}: {e}")
+        sys.exit(1)
 
 def fetch_pkgbuild_deps(packages_to_build, no_update=False, full_x86_packages=None, target_packages=None):
     """
@@ -236,47 +236,50 @@ echo "$fullver"
                                              cwd=PKGBUILDS_DIR, check=True, 
                                              capture_output=True, text=True)
                     else:
-                        # Use git directly for more reliable tag switching
-                        # Clone repository (convert ++ to plusplus for GitLab URLs)
-                        clone_url = f"git@gitlab.archlinux.org:archlinux/packaging/packages/{basename.replace('++', 'plusplus')}.git"
-                        result = subprocess.run(["git", "clone", clone_url, basename], 
-                                             cwd=PKGBUILDS_DIR, check=True, 
+                        # Use pkgctl repo clone with version switching
+                        pkgctl_cmd = ["pkgctl", "repo", "clone"]
+                        if not pkg.get('force_latest', False):
+                            pkgctl_cmd.extend(["--switch", pkg['version']])
+                        pkgctl_cmd.append(basename)
+                        result = subprocess.run(pkgctl_cmd, cwd=PKGBUILDS_DIR, check=True, 
                                              capture_output=True, text=True)
+                        
+                        # Old git-based approach (commented out)
+                        # clone_url = f"git@gitlab.archlinux.org:archlinux/packaging/packages/{basename.replace('++', 'plusplus')}.git"
+                        # result = subprocess.run(["git", "clone", clone_url, basename], 
+                        #                      cwd=PKGBUILDS_DIR, check=True, 
+                        #                      capture_output=True, text=True)
+                        # if not pkg.get('force_latest', False):
+                        #     version_tag = pkg['version']
+                        #     git_version_tag = version_tag.replace(':', '-')
+                        #     tag_formats = [git_version_tag, version_tag, f"v{git_version_tag}", f"{basename}-{git_version_tag}"]
+                        #     checkout_success = False
+                        #     for tag_format in tag_formats:
+                        #         try:
+                        #             subprocess.run(["git", "checkout", tag_format], 
+                        #                          cwd=f"pkgbuilds/{basename}", check=True, 
+                        #                          capture_output=True, text=True)
+                        #             checkout_success = True
+                        #             break
+                        #         except subprocess.CalledProcessError:
+                        #             continue
+                        #     if not checkout_success:
+                        #         print(f"Warning: Could not find tag for {basename} version {version_tag}, using latest commit")
+                        #         subprocess.run(["git", "fetch", "origin"], cwd=f"pkgbuilds/{basename}", check=True, capture_output=True)
+                        #         subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=f"pkgbuilds/{basename}", check=True, capture_output=True)
                     
-                    if not pkg.get('force_latest', False):
-                        # For override packages, checkout the specified branch instead of version tags
-                        if basename in overrides:
-                            override_branch = overrides[basename].get('branch', 'main')
-                            try:
-                                subprocess.run(["git", "checkout", override_branch], 
-                                             cwd=f"pkgbuilds/{basename}", check=True, 
-                                             capture_output=True, text=True)
-                            except subprocess.CalledProcessError:
-                                print(f"Warning: Could not checkout branch {override_branch} for {basename}, using default")
-                        else:
-                            # Checkout specific version tag for regular packages
-                            version_tag = pkg['version']
-                            git_version_tag = version_tag.replace(':', '-')
-                            tag_formats = [git_version_tag, version_tag, f"v{git_version_tag}", f"{basename}-{git_version_tag}"]
-                            checkout_success = False
-                            for tag_format in tag_formats:
-                                try:
-                                    subprocess.run(["git", "checkout", tag_format], 
-                                                 cwd=f"pkgbuilds/{basename}", check=True, 
-                                                 capture_output=True, text=True)
-                                    checkout_success = True
-                                    break
-                                except subprocess.CalledProcessError:
-                                    continue
-                            
-                            if not checkout_success:
-                                print(f"Warning: Could not find tag for {basename} version {version_tag}, using latest commit")
-                                subprocess.run(["git", "fetch", "origin"], cwd=f"pkgbuilds/{basename}", check=True, capture_output=True)
-                                subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=f"pkgbuilds/{basename}", check=True, capture_output=True)
+                    if not pkg.get('force_latest', False) and basename in overrides:
+                        # For override packages, checkout the specified branch
+                        override_branch = overrides[basename].get('branch', 'main')
+                        try:
+                            subprocess.run(["git", "checkout", override_branch], 
+                                         cwd=f"pkgbuilds/{basename}", check=True, 
+                                         capture_output=True, text=True)
+                        except subprocess.CalledProcessError:
+                            print(f"Warning: Could not checkout branch {override_branch} for {basename}, using default")
             except subprocess.CalledProcessError as e:
                 error_msg = e.stderr.strip() if e.stderr else 'Unknown error'
                 print(f"ERROR: Failed to fetch PKGBUILD for {name} (basename: {basename}): {error_msg}")
-                print(f"  Command: git clone {clone_url if 'clone_url' in locals() else 'unknown'}")
                 print(f"  Working directory: {PKGBUILDS_DIR}")
                 print(f"  Return code: {e.returncode}")
                 if "Username for" in error_msg or "Authentication failed" in error_msg:
@@ -1232,12 +1235,12 @@ if __name__ == "__main__":
                 'build_stage': 0
             })
         
-        # Parse PKGBUILDs for dependencies
-        newer_packages = fetch_pkgbuild_deps(newer_packages, True, all_x86_packages, target_packages)
-        
         # Load packages for dependency resolution
         all_x86_packages = load_x86_64_packages(download=not args.no_update, include_testing=args.upstream_testing)
         target_packages = load_target_arch_packages(download=not args.no_update, include_testing=args.target_testing)
+        
+        # Parse PKGBUILDs for dependencies
+        newer_packages = fetch_pkgbuild_deps(newer_packages, True, all_x86_packages, target_packages)
         
         if args.preserve_order:
             newer_packages = preserve_package_order(newer_packages, args.packages)

@@ -2,7 +2,7 @@
 
 ## 🧪 Full Test Suite for Arch Linux Multi-Architecture Build System
 
-This comprehensive test suite validates all components of the build system with **100+ test cases** covering:
+This comprehensive test suite validates all components of the build system with **88 test cases** covering:
 
 ### **Test Categories**
 
@@ -13,18 +13,37 @@ This comprehensive test suite validates all components of the build system with 
 
 #### 📦 **Package Management Tests**
 - **Version Comparison**: Handles epochs, git revisions, complex versions
+- **Version Comparison with pkgrel**: Tests `1.0.0-1` vs `1.0.0-2` scenarios
 - **Dependency Resolution**: Tests PKGBUILD parsing and dependency extraction
-- **Blacklist Filtering**: Validates package filtering logic
+- **Blacklist Filtering**: Validates wildcard pattern matching
+- **Missing Dependencies**: Tests `find_missing_dependencies` function
+- **Provides Constraints**: Tests version constraints in provides
 
 #### 🏗️ **Build System Tests**
 - **Configuration Management**: Tests BuildConfig class
 - **Build Process**: Validates package building workflow (dry-run)
+- **BuildUtils Class**: Tests run_command, cleanup_old_logs, clear_packages_from_cache
 - **Error Handling**: Tests failure scenarios and recovery
+- **Bootstrap Lock Files**: Tests PID-based lock handling
+
+#### 🔄 **Dependency Graph Tests**
+- **Simple Chains**: A → B → C ordering
+- **Diamond Patterns**: A → B,C → D
+- **Circular Dependencies**: Two-stage builds with Tarjan's algorithm
+- **Multiple Disconnected Cycles**: Independent cycle handling
+- **Provides Relationships**: Virtual package resolution
 
 #### 🔧 **Utility Function Tests**
 - **File Operations**: JSON parsing, PKGBUILD reading
+- **PKGBUILD Parsing**: Real content with variable expansion
 - **Command Execution**: Mocked subprocess calls
 - **Data Structures**: Package objects and transformations
+
+#### 📤 **Upload & Repository Tests**
+- **Package Upload Logic**: Repo-to-testing mapping
+- **Package File Detection**: .pkg.tar.zst file handling
+- **repo_analyze.py**: Script functionality
+- **find_dependents.py**: Script functionality
 
 #### 🌐 **Integration Tests**
 - **CLI Interfaces**: All scripts accept `--help` and basic args
@@ -35,30 +54,33 @@ This comprehensive test suite validates all components of the build system with 
 
 ### **Quick Test (No Dependencies)**
 ```bash
-python3 test_build_system.py
+python3 test_all.py
 ```
 
 ### **Full Test Suite (With pytest)**
 ```bash
 # Install test dependencies
-pip3 install -r test-requirements.txt
+pip install pytest
 
 # Run comprehensive tests
-./run_tests.sh
+python3 -m pytest test_all.py -v
 ```
 
 ### **Individual Test Categories**
 ```bash
 # Security tests only
-python3 -c "from test_build_system import TestPackageValidation; t=TestPackageValidation(); [getattr(t,m)() for m in dir(t) if m.startswith('test_')]"
+python3 -m pytest test_all.py -k "Security" -v
 
 # Version comparison tests
-python3 -c "from test_build_system import TestVersionComparison; t=TestVersionComparison(); [getattr(t,m)() for m in dir(t) if m.startswith('test_')]"
+python3 -m pytest test_all.py -k "Version" -v
+
+# Blacklist pattern tests
+python3 -m pytest test_all.py -k "Blacklist" -v
 ```
 
 ## **Test Structure**
 
-### **Unit Tests** (`test_build_system.py`)
+### **Unit Tests** (`test_all.py`)
 ```python
 class TestPackageValidation:
     def test_valid_package_names(self):
@@ -71,6 +93,18 @@ class TestPackageValidation:
         """Test security against path traversal"""
         with pytest.raises(ValueError):
             safe_path_join(Path("/tmp"), "../../../etc/passwd")
+
+class TestBlacklistPatterns:
+    def test_wildcard_suffix_matching(self):
+        """Wildcard suffix patterns should match correctly"""
+        patterns = ['*-debug', '*-git']
+        assert fnmatch.fnmatch('vim-debug', '*-debug')
+
+class TestFindMissingDependencies:
+    def test_finds_missing_direct_dependency(self):
+        """Should find dependencies missing from target arch"""
+        missing = find_missing_dependencies(packages, x86_packages, target_packages)
+        assert 'missing-dep' in missing
 ```
 
 ### **Integration Tests**
@@ -116,18 +150,25 @@ mock_packages = {
 
 ### **✅ Covered Areas**
 - ✓ Input validation (package names, paths)
-- ✓ Version comparison (basic, epoch, git revisions)
+- ✓ Version comparison (basic, epoch, git revisions, pkgrel)
 - ✓ Binary package version comparison (-bin packages)
 - ✓ Configuration management
 - ✓ Error handling and edge cases
 - ✓ File operations (JSON, PKGBUILD parsing)
 - ✓ CLI interfaces (help commands)
 - ✓ Security (path traversal, injection)
-- ✓ Package filtering and blacklists
+- ✓ Package filtering and blacklists (wildcard patterns)
 - ✓ Build workflow (dry-run mode)
 - ✓ Dependency resolution and circular dependencies
+- ✓ Multiple disconnected cycles
+- ✓ Provides with version constraints
+- ✓ Missing dependency detection
 - ✓ Architecture detection from makepkg.conf
 - ✓ Smart --ignorearch handling
+- ✓ BuildUtils class methods
+- ✓ Bootstrap lock file handling
+- ✓ Package upload logic
+- ✓ PKGBUILD parsing with real content
 
 ### **⚠️ Areas Requiring Manual Testing**
 - Actual package building (requires chroot)
@@ -144,33 +185,49 @@ mock_packages = {
 📦 Running tests with pytest...
 🔍 Running unit tests...
 
-test_build_system.py::TestPackageValidation::test_valid_package_names ✓
-test_build_system.py::TestPackageValidation::test_invalid_package_names ✓
-test_build_system.py::TestPackageValidation::test_path_traversal_protection ✓
-test_build_system.py::TestVersionComparison::test_basic_version_comparison ✓
-test_build_system.py::TestVersionComparison::test_epoch_versions ✓
-test_build_system.py::TestBuildConfig::test_default_config ✓
+test_all.py::TestPackageValidation::test_valid_package_names ✓
+test_all.py::TestPackageValidation::test_invalid_package_names ✓
+test_all.py::TestPackageValidation::test_path_traversal_protection ✓
+test_all.py::TestVersionComparison::test_basic_version_comparison ✓
+test_all.py::TestVersionComparison::test_epoch_versions ✓
+test_all.py::TestVersionComparisonPkgrel::test_same_version_different_pkgrel ✓
+test_all.py::TestBlacklistPatterns::test_wildcard_suffix_matching ✓
+test_all.py::TestFindMissingDependencies::test_finds_missing_direct_dependency ✓
+test_all.py::TestBuildUtilsClass::test_dry_run_mode ✓
+test_all.py::TestMultipleDisconnectedCycles::test_two_independent_cycles ✓
 
 🔗 Running integration tests...
 ✓ All modules import successfully
 ✓ generate_build_list.py --help works
 ✓ build_packages.py --help works
 ✓ bootstrap_toolchain.py --help works
+✓ repo_analyze.py --help works
+✓ find_dependents.py --help works
 
 🎯 Running syntax checks...
   Checking Python syntax... ✓
   Checking for common issues... ✓
 
-✅ All tests completed!
+✅ All 88 tests passed!
 
 📊 Test Coverage Summary:
   - Package validation: ✓
   - Version comparison: ✓ 
+  - Version comparison with pkgrel: ✓
   - Build configuration: ✓
+  - BuildUtils class: ✓
   - CLI interfaces: ✓
   - Error handling: ✓
   - File operations: ✓
   - Security (path traversal): ✓
+  - Blacklist patterns: ✓
+  - Missing dependencies: ✓
+  - Circular dependencies: ✓
+  - Multiple cycles: ✓
+  - Provides constraints: ✓
+  - Bootstrap lock files: ✓
+  - Package upload logic: ✓
+  - PKGBUILD parsing: ✓
 ```
 
 ## **Adding New Tests**

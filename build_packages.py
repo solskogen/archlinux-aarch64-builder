@@ -381,16 +381,20 @@ echo "CHECKDEPENDS_END"
         return True
 
     def _find_last_successful_package(self, packages):
-        """Find the index of the last successfully built package"""
+        """Find packages that haven't been built successfully yet"""
         state_file = Path("last_successful.txt")
         if not state_file.exists():
             return None
         
         try:
-            last_pkg_name = state_file.read_text().strip()
+            # Read all successful package names
+            successful = set(state_file.read_text().strip().split('\n'))
+            # Find first package not in successful set
             for i, pkg in enumerate(packages):
-                if pkg['name'] == last_pkg_name:
-                    return i
+                if pkg['name'] not in successful:
+                    return i - 1 if i > 0 else None
+            # All packages were successful
+            return len(packages) - 1
         except Exception:
             pass
         
@@ -399,7 +403,15 @@ echo "CHECKDEPENDS_END"
     def _update_last_successful(self, pkg_name):
         """Update the last successful package state file"""
         try:
-            Path("last_successful.txt").write_text(pkg_name)
+            state_file = Path("last_successful.txt")
+            # Read existing successful packages
+            successful = set()
+            if state_file.exists():
+                successful = set(state_file.read_text().strip().split('\n'))
+            # Add this package
+            successful.add(pkg_name)
+            # Write back
+            state_file.write_text('\n'.join(sorted(successful)))
         except Exception as e:
             print(f"Warning: Failed to update last successful package: {e}")
     
@@ -528,6 +540,11 @@ echo "CHECKDEPENDS_END"
         successful_packages = []
         cycle_stage_1_success = {}  # Track which packages succeeded in stage 1 of each cycle
         
+        # Thread-safe locks for shared data structures
+        failed_lock = threading.Lock()
+        success_lock = threading.Lock()
+        cycle_lock = threading.Lock()
+        
         # When continuing, populate cycle_stage_1_success with packages that were already built
         if continue_build:
             last_successful_index = self._find_last_successful_package(packages)
@@ -568,7 +585,8 @@ echo "CHECKDEPENDS_END"
                     futures = {}
                     for i, pkg in stage_packages:
                         future = executor.submit(self._build_single_package, i, pkg, len(packages), 
-                                               cycle_info, cycle_stage_1_success, provides_map, failed_packages)
+                                               cycle_info, cycle_stage_1_success, provides_map, failed_packages,
+                                               failed_lock, success_lock, cycle_lock)
                         futures[future] = (i, pkg)
                     
                     for future in as_completed(futures):
@@ -576,30 +594,33 @@ echo "CHECKDEPENDS_END"
                         try:
                             success = future.result()
                             if success:
-                                successful_packages.append(pkg['name'])
+                                with success_lock:
+                                    successful_packages.append(pkg['name'])
                                 cycle_group = pkg.get('cycle_group')
                                 cycle_stage = pkg.get('cycle_stage')
                                 if cycle_group is not None and cycle_stage == 1:
-                                    if cycle_group not in cycle_stage_1_success:
-                                        cycle_stage_1_success[cycle_group] = set()
-                                    cycle_stage_1_success[cycle_group].add(pkg['name'])
+                                    with cycle_lock:
+                                        if cycle_group not in cycle_stage_1_success:
+                                            cycle_stage_1_success[cycle_group] = set()
+                                        cycle_stage_1_success[cycle_group].add(pkg['name'])
                             else:
-                                failed_packages.append(pkg)
+                                with failed_lock:
+                                    failed_packages.append(pkg)
                                 if self.stop_on_failure:
                                     print(f"Stopping build process due to failure in {pkg['name']}")
-                                    executor.shutdown(wait=False)
                                     break
                         except Exception as e:
                             print(f"Unexpected exception in parallel build: {e}")
-                            failed_packages.append(pkg)
+                            with failed_lock:
+                                failed_packages.append(pkg)
                             if self.stop_on_failure:
-                                executor.shutdown(wait=False)
                                 break
             else:
                 # Sequential build (original behavior)
                 for i, pkg in stage_packages:
                     success = self._build_single_package(i, pkg, len(packages), 
-                                                        cycle_info, cycle_stage_1_success, provides_map, failed_packages)
+                                                        cycle_info, cycle_stage_1_success, provides_map, failed_packages,
+                                                        failed_lock, success_lock, cycle_lock)
                     if success:
                         successful_packages.append(pkg['name'])
                         cycle_group = pkg.get('cycle_group')
@@ -618,8 +639,8 @@ echo "CHECKDEPENDS_END"
             if self.stop_on_failure and failed_packages:
                 break
             
-            # Clean up all temp chroots after each stage
-            if not self.preserve_chroot:
+            # Clean up all temp chroots after each stage (skip if there were failures)
+            if not self.preserve_chroot and not failed_packages:
                 try:
                     temp_dirs = list(self.chroot_path.glob("temp-*"))
                     for temp_dir in temp_dirs:
@@ -653,7 +674,8 @@ echo "CHECKDEPENDS_END"
                 print(f"  - {pkg['name']}")
             return 1
         return 0
-    def _build_single_package(self, i, pkg, total_packages, cycle_info, cycle_stage_1_success, provides_map, failed_packages):
+    def _build_single_package(self, i, pkg, total_packages, cycle_info, cycle_stage_1_success, provides_map, failed_packages,
+                              failed_lock, success_lock, cycle_lock):
         """Build a single package with proper cycle and dependency handling"""
         pkg_name = pkg['name']
         cycle_group = pkg.get('cycle_group')
@@ -668,16 +690,18 @@ echo "CHECKDEPENDS_END"
                 print(f"\n[{i}/{total_packages}] Building {pkg_name} ({cycle_desc}, Stage 1/2)")
             elif cycle_stage == 2:
                 # Check if this package succeeded in stage 1
-                if cycle_group not in cycle_stage_1_success or pkg_name not in cycle_stage_1_success[cycle_group]:
-                    print(f"\n[{i}/{total_packages}] Skipping {pkg_name} ({cycle_desc}, Stage 2/2) - failed in Stage 1")
-                    return False
+                with cycle_lock:
+                    if cycle_group not in cycle_stage_1_success or pkg_name not in cycle_stage_1_success[cycle_group]:
+                        print(f"\n[{i}/{total_packages}] Skipping {pkg_name} ({cycle_desc}, Stage 2/2) - failed in Stage 1")
+                        return False
                 
                 print(f"\n[{i}/{total_packages}] Building {pkg_name} ({cycle_desc}, Stage 2/2)")
         else:
             print(f"\n[{i}/{total_packages}] Building {pkg_name}")
         
         # Check if package should be skipped due to failed dependencies
-        should_skip, failed_deps = self._should_skip_due_to_failed_dependencies(pkg, failed_packages, provides_map)
+        with failed_lock:
+            should_skip, failed_deps = self._should_skip_due_to_failed_dependencies(pkg, failed_packages, provides_map)
         if should_skip:
             print(f"Skipping {pkg_name} - depends on failed packages: {', '.join(failed_deps)}")
             return False
@@ -870,32 +894,6 @@ Troubleshooting:
   - Check disk space and permissions
   - Verify network connectivity for dependency downloads
 """
-        """Clean up temporary chroot"""
-        if temp_copy_path in self.temp_copies:
-            should_cleanup = True
-            if self.stop_on_failure or self.preserve_chroot:
-                should_cleanup = False
-                print(f"Preserving temporary chroot: {temp_copy_path}")
-            
-            if should_cleanup:
-                try:
-                    subprocess.run([
-                        "sudo", "rm", "--recursive", "--force", "--one-file-system", str(temp_copy_path)
-                    ], check=True)
-                    self.temp_copies.remove(temp_copy_path)
-                except subprocess.CalledProcessError as e:
-                    print(f"Warning: Failed to cleanup chroot {temp_copy_path}: {e}")
-                except Exception as e:
-                    print(f"Error during cleanup: {e}")
-                finally:
-                    try:
-                        self.temp_copies.remove(temp_copy_path)
-                    except ValueError:
-                        pass
-                    try:
-                        lock_file.unlink()
-                    except Exception as e:
-                        print(f"Warning: Failed to remove lock file {lock_file}: {e}")
 
 
 def main():
