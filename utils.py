@@ -362,16 +362,26 @@ def load_database_packages(urls, arch_suffix, download=True, include_any=False):
     
     def download_and_parse(url):
         """Download and immediately parse a database file"""
+        import time
         try:
             db_filename = url.split('/')[-1].replace('.db', f'{arch_suffix}.db')
+            db_path = Path(db_filename)
             
-            if download or not Path(db_filename).exists():
-                if not download:
+            # Skip download if file exists and is less than 60 seconds old
+            needs_download = download
+            if db_path.exists():
+                age = time.time() - db_path.stat().st_mtime
+                if age < 60:
+                    needs_download = False
+                    print(f"Using existing {db_filename} (age: {int(age)}s)")
+            
+            if needs_download or not db_path.exists():
+                if not download and not db_path.exists():
                     print(f"Database {db_filename} not found, downloading...")
-                else:
+                elif needs_download:
                     print(f"Downloading {db_filename}...")
                 subprocess.run(["wget", "-q", "-O", db_filename, url], check=True)
-            else:
+            elif download:
                 print(f"Using existing {db_filename}")
             
             repo_name = url.split('/')[-4]  # Extract 'core' or 'extra' from URL
