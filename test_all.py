@@ -543,7 +543,7 @@ class TestCommandLineInterface:
         assert result.returncode == 0, "Help should work"
         
         help_text = result.stdout.lower()
-        expected_options = ["--packages", "--blacklist", "--missing-packages", "--use-latest", "--no-update"]
+        expected_options = ["--packages", "--blacklist", "--use-latest", "--no-update"]
         
         for option in expected_options:
             assert option in help_text, f"Option {option} not found in help"
@@ -918,12 +918,11 @@ class TestEdgeCases:
         # Empty package dictionaries
         empty_x86 = {}
         empty_target = {}
-        packages, skipped, blacklisted, warnings = compare_versions(
+        packages, skipped, warnings = compare_versions(
             empty_x86, empty_target, full_x86_packages={}
         )
         assert packages == [], "Empty packages should return empty list"
         assert isinstance(skipped, list), "Skipped should be list"
-        assert isinstance(blacklisted, list), "Blacklisted should be list"
         assert isinstance(warnings, list), "Warnings should be list"
     
     def test_malformed_package_data(self):
@@ -1308,12 +1307,11 @@ class TestEdgeCases:
         # Empty package dictionaries
         empty_x86 = {}
         empty_target = {}
-        packages, skipped, blacklisted, warnings = compare_versions(
+        packages, skipped, warnings = compare_versions(
             empty_x86, empty_target, full_x86_packages={}
         )
         assert packages == [], "Empty packages should return empty list"
         assert isinstance(skipped, list), "Skipped should be list"
-        assert isinstance(blacklisted, list), "Blacklisted should be list"
         assert isinstance(warnings, list), "Warnings should be list"
     
     def test_malformed_package_data(self):

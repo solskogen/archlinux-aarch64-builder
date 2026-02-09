@@ -19,7 +19,6 @@ Key features:
 Usage:
     ./generate_build_list.py                    # Find outdated packages
     ./generate_build_list.py --packages vim    # Force rebuild specific packages
-    ./generate_build_list.py --missing-packages # List missing packages
 """
 
 import json
@@ -45,23 +44,59 @@ from utils import (
 )
 
 # ============================================================
-# Helper Functions for Package Classification
+# Helper Functions
 # ============================================================
+
+BOOTSTRAP_PACKAGES = {'linux-api-headers', 'glibc', 'binutils', 'gcc'}
+SPLIT_PACKAGE_SUFFIXES = ['-headers', '-docs', '-devel', '-dev']
+
+# Global verbose/quiet flags (set by argument parser)
+verbose = False
+quiet = False
+
+def log(msg):
+    """Print message only in verbose mode"""
+    if verbose:
+        print(msg)
+
+def info(msg):
+    """Print message unless in quiet mode"""
+    if not quiet:
+        print(msg)
 
 def is_bootstrap_package(pkg_name):
     """Check if package is bootstrap-only (excluded from normal builds)"""
-    bootstrap_only = {'linux-api-headers', 'glibc', 'binutils', 'gcc'}
-    return pkg_name in bootstrap_only
+    return pkg_name in BOOTSTRAP_PACKAGES
 
-# ============================================================
-# Package Version Comparison Logic  
-# ============================================================
+def extract_dep_name(dep_str):
+    """Extract package name from dependency string like 'pkg>=1.0'"""
+    return dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+
+def build_provides_map(x86_packages, target_packages, build_packages=None):
+    """Build unified provides mapping: name -> basename"""
+    provides = {}
+    for pkg_dict in [x86_packages, target_packages]:
+        for pkg_name, pkg_data in pkg_dict.items():
+            basename = pkg_data.get('basename', pkg_name)
+            provides[pkg_name] = basename
+            provides[basename] = basename
+            for provide in pkg_data.get('provides', []):
+                provides[extract_dep_name(provide)] = basename
+    
+    # Add split package patterns for build list packages
+    if build_packages:
+        for pkg in build_packages:
+            basename = pkg.get('basename', pkg['name'])
+            for suffix in SPLIT_PACKAGE_SUFFIXES:
+                split_name = basename + suffix
+                if split_name not in provides:
+                    provides[split_name] = basename
+    return provides
 
 
 
 def write_results(packages, args):
     """Write results to packages_to_build.json"""
-    print("Writing results to packages_to_build.json...")
     
     # Prepare packages for JSON output - use build dependencies instead of filtered ones
     json_packages = []
@@ -81,44 +116,51 @@ def write_results(packages, args):
         
         json_packages.append(json_pkg)
     
+    output_file = Path("packages_to_build.json")
+    
+    if not packages:
+        # Remove the file if nothing to build
+        if output_file.exists():
+            output_file.unlink()
+        return
+    
     output_data = {
         "_command": " ".join(sys.argv),
         "_timestamp": datetime.datetime.now().isoformat(),
         "packages": json_packages
     }
-    with open("packages_to_build.json", "w") as f:
+    with open(output_file, "w") as f:
         json.dump(output_data, f, indent=2)
     
-    print(f"\nBuild Statistics:")
-    print(f"Total packages to build: {len(packages)}")
-    if packages:
-        stages = {}
-        cycles = {}
-        unique_packages = set()
+    info(f"\nBuild Statistics:")
+    info(f"Total packages to build: {len(packages)}")
+    stages = {}
+    cycles = {}
+    unique_packages = set()
+    
+    for pkg in packages:
+        stage = pkg.get('build_stage', 0)
+        stages[stage] = stages.get(stage, 0) + 1
+        unique_packages.add(pkg['name'])
         
-        for pkg in packages:
-            stage = pkg.get('build_stage', 0)
-            stages[stage] = stages.get(stage, 0) + 1
-            unique_packages.add(pkg['name'])
-            
-            # Track cycle information
-            if pkg.get('cycle_group') is not None:
-                cycle_id = pkg['cycle_group']
-                if cycle_id not in cycles:
-                    cycles[cycle_id] = set()
-                cycles[cycle_id].add(pkg['name'])
-        
-        print(f"Unique packages: {len(unique_packages)}")
-        print(f"Total build stages: {max(stages.keys()) + 1 if stages else 0}")
-        
-        if cycles:
-            print(f"Dependency cycles: {len(cycles)}")
-            for cycle_id, cycle_pkgs in cycles.items():
-                print(f"  Cycle {cycle_id + 1}: {', '.join(sorted(cycle_pkgs))} (built twice)")
-        
-        print("Packages per stage:")
-        for stage in sorted(stages.keys()):
-            print(f"  Stage {stage + 1}: {stages[stage]} packages")
+        # Track cycle information
+        if pkg.get('cycle_group') is not None:
+            cycle_id = pkg['cycle_group']
+            if cycle_id not in cycles:
+                cycles[cycle_id] = set()
+            cycles[cycle_id].add(pkg['name'])
+    
+    info(f"Unique packages: {len(unique_packages)}")
+    info(f"Total build stages: {max(stages.keys()) + 1 if stages else 0}")
+    
+    if cycles:
+        print(f"Dependency cycles: {len(cycles)}")
+        for cycle_id, cycle_pkgs in cycles.items():
+            print(f"  Cycle {cycle_id + 1}: {', '.join(sorted(cycle_pkgs))} (built twice)")
+    
+    info("Packages per stage:")
+    for stage in sorted(stages.keys()):
+        info(f"  Stage {stage + 1}: {stages[stage]} packages")
 
 
 
@@ -215,17 +257,17 @@ echo "$fullver"
         
         # Fetch or update PKGBUILD (skip if no_update is True)
         if no_update:
-            print(f"[{i}/{total}] Processing {name} (no update)...")
+            info(f"[{i}/{total}] Processing {name} (no update)...")
         elif not pkgbuild_path.exists():
             # Need to clone the repository
             try:
                 if pkg.get('use_aur', False):
-                    print(f"[{i}/{total}] Processing {name} (fetching from AUR)...")
+                    info(f"[{i}/{total}] Processing {name} (fetching from AUR)...")
                     result = subprocess.run(["git", "clone", f"https://aur.archlinux.org/{basename}.git", basename], 
                                          cwd=PKGBUILDS_DIR, check=True, 
                                          capture_output=True, text=True)
                 else:
-                    print(f"[{i}/{total}] Processing {name} (fetching {target_version})...")
+                    info(f"[{i}/{total}] Processing {name} (fetching {target_version})...")
                     # Check for package overrides
                     if basename in overrides:
                         override = overrides[basename]
@@ -243,30 +285,6 @@ echo "$fullver"
                         pkgctl_cmd.append(basename)
                         result = subprocess.run(pkgctl_cmd, cwd=PKGBUILDS_DIR, check=True, 
                                              capture_output=True, text=True)
-                        
-                        # Old git-based approach (commented out)
-                        # clone_url = f"git@gitlab.archlinux.org:archlinux/packaging/packages/{basename.replace('++', 'plusplus')}.git"
-                        # result = subprocess.run(["git", "clone", clone_url, basename], 
-                        #                      cwd=PKGBUILDS_DIR, check=True, 
-                        #                      capture_output=True, text=True)
-                        # if not pkg.get('force_latest', False):
-                        #     version_tag = pkg['version']
-                        #     git_version_tag = version_tag.replace(':', '-')
-                        #     tag_formats = [git_version_tag, version_tag, f"v{git_version_tag}", f"{basename}-{git_version_tag}"]
-                        #     checkout_success = False
-                        #     for tag_format in tag_formats:
-                        #         try:
-                        #             subprocess.run(["git", "checkout", tag_format], 
-                        #                          cwd=f"pkgbuilds/{basename}", check=True, 
-                        #                          capture_output=True, text=True)
-                        #             checkout_success = True
-                        #             break
-                        #         except subprocess.CalledProcessError:
-                        #             continue
-                        #     if not checkout_success:
-                        #         print(f"Warning: Could not find tag for {basename} version {version_tag}, using latest commit")
-                        #         subprocess.run(["git", "fetch", "origin"], cwd=f"pkgbuilds/{basename}", check=True, capture_output=True)
-                        #         subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=f"pkgbuilds/{basename}", check=True, capture_output=True)
                     
                     if not pkg.get('force_latest', False) and basename in overrides:
                         # For override packages, checkout the specified branch
@@ -290,7 +308,7 @@ echo "$fullver"
             pkg_repo_dir = Path("pkgbuilds") / basename
             try:
                 if pkg.get('force_latest', False):
-                    print(f"[{i}/{total}] Processing {name} (updating to latest commit)...")
+                    info(f"[{i}/{total}] Processing {name} (updating to latest commit)...")
                     # Stash changes, checkout main, pull, then restore
                     stash_result = subprocess.run(["git", "stash"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
                     has_changes = "No local changes to save" not in stash_result.stdout
@@ -351,9 +369,9 @@ echo "$fullver"
                         pass  # Keep original version if parsing fails
                 else:
                     if current_version:
-                        print(f"[{i}/{total}] Processing {name} (updating {current_version} -> {target_version})...")
+                        info(f"[{i}/{total}] Processing {name} (updating {current_version} -> {target_version})...")
                     else:
-                        print(f"[{i}/{total}] Processing {name} (updating to {target_version})...")
+                        info(f"[{i}/{total}] Processing {name} (updating to {target_version})...")
                     subprocess.run(["git", "fetch", "--tags"], cwd=pkg_repo_dir, check=True, capture_output=True)
                     
                     # Stash changes before checkout
@@ -420,7 +438,7 @@ echo "$fullver"
                 sys.exit(1)
         else:
             # Repository exists and is up to date
-            print(f"[{i}/{total}] Processing {name} (PKGBUILD already up to date: {current_version or target_version})...")
+            info(f"[{i}/{total}] Processing {name} (PKGBUILD already up to date: {current_version or target_version})...")
         
         # Parse dependencies from existing PKGBUILD (skip provides - use database)
         if pkgbuild_path.exists():
@@ -473,7 +491,7 @@ echo "$fullver"
             if dep_type in pkg:
                 filtered_deps = []
                 for dep in pkg[dep_type]:
-                    dep_name = dep.split('=')[0].split('>')[0].split('<')[0].strip()
+                    dep_name = extract_dep_name(dep)
                     # Skip self-dependencies
                     if dep_name == pkg['name']:
                         continue
@@ -493,35 +511,26 @@ echo "$fullver"
 
 
 
-def compare_versions(x86_packages, target_packages, force_packages=None, blacklist=None, missing_packages_mode=False, aur_packages=None, use_latest=False, full_x86_packages=None):
+def compare_versions(x86_packages, target_packages, force_packages=None, blacklist=None, aur_packages=None, use_latest=False, full_x86_packages=None):
     """
     Compare package versions between x86_64 and target architecture repositories.
-    
-    Identifies packages that need building by comparing versions and handling
-    various scenarios like missing packages, blacklisted packages, and
-    bootstrap-only packages.
     
     Args:
         x86_packages: Dictionary of x86_64 packages
         target_packages: Dictionary of target architecture packages  
         force_packages: Set of packages to force rebuild
         blacklist: List of blacklist patterns
-        missing_packages_mode: Only return missing packages
         aur_packages: Set of packages to get from AUR
         use_latest: Use latest git commits instead of version tags
         
     Returns:
-        tuple: (packages_to_build, skipped_packages, blacklisted_missing)
+        tuple: (packages_to_build, skipped_packages, bin_package_warnings)
     """
     force_packages = set(force_packages or [])
     aur_packages = set(aur_packages or [])
     blacklist = blacklist or []
     
-    # Bootstrap-only packages (excluded from normal builds but not from bootstrap detection)
-    # Note: Using helper function for consistency
-    
     skipped_packages = []
-    blacklisted_missing = []
     
     # Group packages by basename
     x86_bases = {}
@@ -531,13 +540,12 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
     # Group packages by basename and build provides mapping
     # ============================================================
     
-    # Build provides mapping for target architecture packages (only if needed for missing deps)
+    # Build provides mapping for target architecture packages
     target_provides = {name: pkg for name, pkg in target_packages.items()}
-    if not missing_packages_mode:
-        for pkg in target_packages.values():
-            for provide in pkg['provides']:
-                provide_name = provide.split('=')[0]
-                target_provides[provide_name] = pkg
+    for pkg in target_packages.values():
+        for provide in pkg['provides']:
+            provide_name = provide.split('=')[0]
+            target_provides[provide_name] = pkg
     
     # Group x86_64 packages by basename
     for name, pkg in x86_packages.items():
@@ -566,19 +574,14 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
                 blacklist_reason = f"package '{matching_pkg}' matches pattern '{pattern}'"
                 break
         
-        # Check if this is a missing package for blacklist tracking
-        is_missing = basename not in target_bases and basename not in target_provides
-        
         if blacklist_reason:
-            if missing_packages_mode and is_missing:
-                blacklisted_missing.append(basename)
             skipped_packages.append(f"{basename} ({blacklist_reason})")
             # Only add blacklisted packages to output if explicitly requested
             if force_packages and basename in force_packages:
                 newer_in_x86.append({
                     'name': basename,
                     'force_latest': use_latest,
-                    'use_aur': use_aur,
+                    'use_aur': basename in aur_packages,
                     'skip': 1,
                     'depends': x86_data.get('depends', []),
                     'makedepends': x86_data.get('makedepends', []),
@@ -586,6 +589,27 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
                     **x86_data
                 })
             continue
+        
+        # Check if package depends on blacklisted packages
+        if blacklist and not force_packages:
+            pkg_data = x86_data['pkg_data']
+            all_deps = pkg_data.get('depends', []) + pkg_data.get('makedepends', [])
+            blacklisted_dep = None
+            for dep in all_deps:
+                dep_name = extract_dep_name(dep)
+                # Check dep name and its pkgbase against blacklist
+                dep_basename = dep_name
+                if full_x86_packages and dep_name in full_x86_packages:
+                    dep_basename = full_x86_packages[dep_name].get('basename', dep_name)
+                for pattern in blacklist:
+                    if fnmatch.fnmatch(dep_name, pattern) or fnmatch.fnmatch(dep_basename, pattern):
+                        blacklisted_dep = dep_name
+                        break
+                if blacklisted_dep:
+                    break
+            if blacklisted_dep:
+                skipped_packages.append(f"{basename} (depends on blacklisted package: {blacklisted_dep})")
+                continue
         
         # Skip bootstrap-only packages unless explicitly forced
         if is_bootstrap_package(basename) and not force_packages:
@@ -596,30 +620,7 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
                 skipped_packages.append(f"{basename} (bootstrap-only package - newer version available, run bootstrap script)")
             continue
             
-        # For missing packages mode, skip all version comparison logic
-        if missing_packages_mode:
-            should_include = basename not in target_bases and basename not in target_provides
-            target_version = "not found"
-            
-            # Check if package depends on blacklisted packages
-            if should_include:
-                pkg_data = x86_data['pkg_data']
-                all_deps = pkg_data.get('depends', []) + pkg_data.get('makedepends', [])
-                
-                for dep in all_deps:
-                    # Strip version constraints from dependency name
-                    dep_name = dep.split('=')[0].split('<')[0].split('>')[0].split('>=')[0].split('<=')[0]
-                    
-                    # Check if dependency matches any blacklist pattern
-                    for pattern in blacklist:
-                        if fnmatch.fnmatch(dep_name, pattern):
-                            should_include = False
-                            skipped_packages.append(f"{basename} (depends on blacklisted package: {dep_name})")
-                            break
-                    
-                    if not should_include:
-                        break
-        elif force_packages:
+        if force_packages:
             # When --packages is specified, check if any individual package name is requested
             should_include = (basename in force_packages or 
                             any(pkg_name in force_packages for pkg_name in x86_data['packages']))
@@ -704,7 +705,7 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
                 'use_aur': bool(basename in aur_packages),
             })
     
-    return newer_in_x86, skipped_packages, blacklisted_missing, bin_package_warnings
+    return newer_in_x86, skipped_packages, bin_package_warnings
 
 def preserve_package_order(packages, ordered_names):
     """
@@ -832,7 +833,7 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
         seen_deps = set()
         for dep_str in all_deps:
             # Extract package name (remove version constraints)
-            dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+            dep_name = extract_dep_name(dep_str)
             if dep_name in seen_deps or dep_name == pkg_name:  # Skip duplicates and self-deps
                 continue
             seen_deps.add(dep_name)
@@ -861,7 +862,7 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
             all_deps.extend(pkg.get(dep_type, []))
         
         for dep_str in all_deps:
-            dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+            dep_name = extract_dep_name(dep_str)
             
             # Skip if dep is in our build list (already handled)
             if dep_name in pkg_map:
@@ -877,7 +878,7 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
             if dep_pkg:
                 # Check what this dependency depends on
                 for transitive_dep_str in dep_pkg.get('depends', []):
-                    transitive_dep_name = transitive_dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+                    transitive_dep_name = extract_dep_name(transitive_dep_str)
                     
                     # If the transitive dependency IS in our build list, create edge
                     if transitive_dep_name in pkg_map and transitive_dep_name != pkg_name:
@@ -918,7 +919,7 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
                     all_deps.extend(pkg.get(dep_type, []))
                 
                 for dep_str in all_deps:
-                    dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+                    dep_name = extract_dep_name(dep_str)
                     
                     # Resolve provides relationships
                     provider_pkg = None
@@ -961,7 +962,7 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
                 all_deps.extend(pkg.get(dep_type, []))
             
             for dep_str in all_deps:
-                dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+                dep_name = extract_dep_name(dep_str)
                 
                 # Find the provider
                 provider_pkg = None
@@ -993,7 +994,7 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
                 all_deps.extend(pkg.get(dep_type, []))
             
             for dep_str in all_deps:
-                dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+                dep_name = extract_dep_name(dep_str)
                 if dep_name in external_deps_for_cycles and dep_name != pkg_name:
                     ext_graph[dep_name].add(pkg_name)
                     ext_in_degree[pkg_name] += 1
@@ -1064,7 +1065,7 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
             seen_deps = set()
             seen_providers = set()  # Track provider packages to avoid duplicate edges
             for dep_str in all_deps:
-                dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+                dep_name = extract_dep_name(dep_str)
                 if dep_name in seen_deps or dep_name == pkg_name:  # Skip duplicates and self-deps
                     continue
                 seen_deps.add(dep_name)
@@ -1175,14 +1176,16 @@ if __name__ == "__main__":
                         help='Preserve exact order specified in --packages (skip dependency sorting)')
     parser.add_argument('--blacklist', default='blacklist.txt',
                         help='File containing packages to skip (default: blacklist.txt)')
-    parser.add_argument('--missing-packages', action='store_true',
-                        help=f'Generate list of all packages present in x86_64 but missing from {target_arch}')
     parser.add_argument('--rebuild-repo', choices=['core', 'extra'],
                         help='Rebuild all packages from specified repository regardless of version')
     parser.add_argument('--target-testing', action='store_true',
                         help='Also include target testing repos for comparison')
     parser.add_argument('--upstream-testing', action='store_true',
                         help='Also include upstream testing repos for comparison')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Show detailed progress messages')
+    parser.add_argument('-q', '--quiet', action='store_true',
+                        help='Only show warnings and errors')
     
     # Mutually exclusive group for git update options
     git_group = parser.add_mutually_exclusive_group()
@@ -1192,6 +1195,10 @@ if __name__ == "__main__":
                         help='Use latest git commit of package source instead of version tag when building')
     
     args = parser.parse_args()
+    
+    # Set global verbose/quiet flags
+    verbose = args.verbose
+    quiet = args.quiet
     
     # Validate --preserve-order requires --packages
     if args.preserve_order and not args.packages:
@@ -1236,8 +1243,8 @@ if __name__ == "__main__":
             })
         
         # Load packages for dependency resolution
-        all_x86_packages = load_x86_64_packages(download=not args.no_update, include_testing=args.upstream_testing)
-        target_packages = load_target_arch_packages(download=not args.no_update, include_testing=args.target_testing)
+        all_x86_packages = load_x86_64_packages(verbose=verbose, download=not args.no_update, include_testing=args.upstream_testing)
+        target_packages = load_target_arch_packages(verbose=verbose, download=not args.no_update, include_testing=args.target_testing)
         
         # Parse PKGBUILDs for dependencies
         newer_packages = fetch_pkgbuild_deps(newer_packages, True, all_x86_packages, target_packages)
@@ -1281,7 +1288,7 @@ if __name__ == "__main__":
             
             # Fetch PKGBUILDs and write results
             if newer_packages:
-                print("Processing PKGBUILDs for dependency information...")
+                log("Processing PKGBUILDs for dependency information...")
                 newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, {}, {})
             
             if args.preserve_order:
@@ -1294,11 +1301,19 @@ if __name__ == "__main__":
         args.use_aur_for_packages = set()
         args.aur = False
     
+    # Show what we're doing
+    if args.rebuild_repo:
+        info(f"Preparing to rebuild all {args.rebuild_repo} packages...")
+    elif args.packages:
+        info(f"Preparing build list for {len(args.packages)} specified package(s)...")
+    else:
+        info(f"Checking for outdated packages on {target_arch}...")
+    
     x86_packages = {}
     if args.packages and not args.aur:
         if args.no_update:
             # Skip all database operations for --no-update --packages mode
-            print(f"Generating build list for {len(args.packages)} specified packages (no database lookup)...")
+            log(f"Generating build list for {len(args.packages)} specified packages (no database lookup)...")
             x86_packages = {}
             target_packages = {}
             for pkg_name in args.packages:
@@ -1314,7 +1329,7 @@ if __name__ == "__main__":
             # Use same list for dependency resolution
             full_x86_packages = x86_packages
         else:
-            print(f"Looking up versions for {len(args.packages)} specified packages...")
+            log(f"Looking up versions for {len(args.packages)} specified packages...")
             # Load x86_64 packages and target packages for dependency checking
             # Include ARCH=any packages if --force is used
             if args.force:
@@ -1323,10 +1338,10 @@ if __name__ == "__main__":
                     f"{X86_64_MIRROR}/core/os/x86_64/core.db",
                     f"{X86_64_MIRROR}/extra/os/x86_64/extra.db"
                 ]
-                all_x86_packages = load_packages_with_any(any_urls, '_x86_64', download=not args.no_update, include_any=True)
+                all_x86_packages = load_packages_with_any(any_urls, '_x86_64', download=not args.no_update, include_any=True, verbose=verbose)
             else:
-                all_x86_packages = load_x86_64_packages(download=not args.no_update, include_testing=args.upstream_testing)
-            target_packages = load_target_arch_packages(download=not args.no_update, include_testing=args.target_testing)
+                all_x86_packages = load_x86_64_packages(verbose=verbose, download=not args.no_update, include_testing=args.upstream_testing)
+            target_packages = load_target_arch_packages(verbose=verbose, download=not args.no_update, include_testing=args.target_testing)
             
             # Filter to only requested packages for comparison, but keep full list for dependency resolution
             filtered_x86_packages = {}
@@ -1393,7 +1408,7 @@ if __name__ == "__main__":
     elif not args.aur:
         # Load packages using unified function
         repo_filter = [args.rebuild_repo] if args.rebuild_repo else None
-        x86_packages, target_packages = load_packages_unified(download=not args.no_update, x86_repos=repo_filter, target_repos=repo_filter, include_testing=args.target_testing, x86_testing=args.upstream_testing)
+        x86_packages, target_packages = load_packages_unified(verbose=verbose, download=not args.no_update, x86_repos=repo_filter, target_repos=repo_filter, include_testing=args.target_testing, x86_testing=args.upstream_testing)
         
         # Use same list for dependency resolution
         full_x86_packages = x86_packages
@@ -1414,7 +1429,7 @@ if __name__ == "__main__":
             print("[build]")
             print("target_base_url = https://your-repo.com/arch")
             sys.exit(1)
-        target_packages = load_packages_with_any(target_urls, f'_{target_arch}', download=not args.no_update)
+        target_packages = load_packages_with_any(target_urls, f'_{target_arch}', download=not args.no_update, verbose=verbose)
         print(f"Loaded {len(target_packages)} {target_arch} packages")
         
         if args.packages:
@@ -1429,19 +1444,22 @@ if __name__ == "__main__":
                     'repo': 'forge'
                 }
     
-    print("Comparing versions...")
+    log("Comparing versions...")
     # Skip blacklist entirely when using --packages
     if args.packages:
         blacklist = []
-        print("Ignoring blacklist (using --packages)")
+        log("Ignoring blacklist (using --packages)")
     else:
         blacklist = load_blacklist(args.blacklist)
     
     # Load provides mapping once (doesn't change)
-    print("Loading provides mapping from upstream databases...")
+    log("Loading provides mapping from upstream databases...")
     
     # Stage 1: Find outdated packages using .db files (fast comparison)
-    newer_packages, skipped_packages, blacklisted_missing, bin_package_warnings = compare_versions(x86_packages, target_packages, args.packages, blacklist, args.missing_packages, args.use_aur_for_packages, args.use_latest, full_x86_packages)
+    newer_packages, skipped_packages, bin_package_warnings = compare_versions(
+        x86_packages, target_packages, args.packages, blacklist, 
+        args.use_aur_for_packages, args.use_latest, full_x86_packages
+    )
     
     # Handle --rebuild-repo option
     if args.rebuild_repo:
@@ -1477,18 +1495,18 @@ if __name__ == "__main__":
                         'use_aur': False
                     })
         newer_packages = repo_packages
-        print(f"Found {len(newer_packages)} packages in {args.rebuild_repo} repository")
+        info(f"Found {len(newer_packages)} packages in {args.rebuild_repo} repository")
     
     # Capture initial package names before any processing
     initial_package_names = {pkg['name'] for pkg in newer_packages}
     
     # Stage 2: Parse PKGBUILDs for complete dependency info and find missing deps
-    if newer_packages and not args.missing_packages:
-        print("Processing PKGBUILDs for complete dependency information...")
+    if newer_packages:
+        log("Processing PKGBUILDs for complete dependency information...")
         newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, full_x86_packages, target_packages)
         
         if full_x86_packages:
-            print("Checking for missing dependencies (including checkdepends)...")
+            log("Checking for missing dependencies (including checkdepends)...")
             missing_deps = find_missing_dependencies(newer_packages, full_x86_packages, target_packages)
             if missing_deps:
                 print(f"Found {len(missing_deps)} missing dependencies: {', '.join(sorted(missing_deps))}")
@@ -1503,7 +1521,7 @@ if __name__ == "__main__":
                         all_deps += pkg['checkdepends']
                     
                     for dep in all_deps:
-                        dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
+                        dep_name = extract_dep_name(dep)
                         if dep_name in missing_deps:
                             if dep_name not in dep_reasons:
                                 dep_reasons[dep_name] = []
@@ -1556,7 +1574,7 @@ if __name__ == "__main__":
                 if added_basenames:
                     # Create list of only the newly added packages
                     new_packages = [pkg for pkg in newer_packages if pkg['name'] in added_basenames]
-                    print("Processing PKGBUILDs for missing dependencies...")
+                    log("Processing PKGBUILDs for missing dependencies...")
                     new_packages_with_deps = fetch_pkgbuild_deps(new_packages, args.no_update, full_x86_packages, target_packages)
                     
                     # Update the newer_packages list with the processed new packages
@@ -1567,7 +1585,7 @@ if __name__ == "__main__":
                                 break
                     
                     # Re-filter dependencies for all packages now that we have the complete list
-                    print("Re-filtering dependencies with complete package list...")
+                    log("Re-filtering dependencies with complete package list...")
                     
                     build_list_names = {pkg['name'] for pkg in newer_packages}
                     build_list_basenames = {pkg.get('basename', pkg['name']) for pkg in newer_packages}
@@ -1605,7 +1623,7 @@ if __name__ == "__main__":
                             if dep_type in pkg:
                                 filtered_deps = []
                                 for dep in pkg.get(f'build_{dep_type}', pkg.get(dep_type, [])):
-                                    dep_name = dep.split('=')[0].split('>')[0].split('<')[0].strip()
+                                    dep_name = extract_dep_name(dep)
                                     # Skip self-dependencies
                                     if dep_name == pkg['name']:
                                         continue
@@ -1615,17 +1633,7 @@ if __name__ == "__main__":
                                         filtered_deps.append(dep)
                                 pkg[dep_type] = filtered_deps
                     
-    elif newer_packages:
-        # For missing packages mode, still need PKGBUILD parsing
-        print("Processing PKGBUILDs for dependency information...")
-        newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, full_x86_packages, target_packages)
-    
     # Report results
-    if args.missing_packages and blacklisted_missing:
-        print(f"Found {len(newer_packages)} missing packages, {len(blacklisted_missing)} blacklisted")
-    elif args.missing_packages:
-        print(f"Found {len(newer_packages)} missing packages")
-    
     # Check if any skipped packages are dependencies of packages being built
     if skipped_packages and newer_packages:
         # Extract package names from skipped packages (remove reason text)
@@ -1640,8 +1648,7 @@ if __name__ == "__main__":
         for pkg in newer_packages:
             all_deps = pkg.get('depends', []) + pkg.get('makedepends', []) + pkg.get('checkdepends', [])
             for dep in all_deps:
-                # Remove version constraints from dependency names
-                dep_name = dep.split('>=')[0].split('<=')[0].split('=')[0].split('<')[0].split('>')[0]
+                dep_name = extract_dep_name(dep)
                 if dep_name in skipped_names:
                     # Check if pkgbase exists and is up-to-date in target or is provided
                     if dep_name in x86_packages:
@@ -1679,10 +1686,10 @@ if __name__ == "__main__":
         if relevant_skipped:
             # Extract just the package names (remove the reason text)
             unique_skipped_names = sorted(set(skipped.split(' (')[0] for skipped in relevant_skipped))
-            print(f"Skipped {len(unique_skipped_names)} blacklisted packages that are dependencies: {', '.join(unique_skipped_names)}")
+            log(f"Skipped {len(unique_skipped_names)} blacklisted packages that are dependencies: {', '.join(unique_skipped_names)}")
     elif skipped_packages and not newer_packages:
         # If no packages to build but some were skipped, show count only
-        print(f"Skipped {len(skipped_packages)} blacklisted packages")
+        log(f"Skipped {len(skipped_packages)} blacklisted packages")
     
     if args.packages:
         # Separate packages that need updates vs rebuilds
@@ -1698,25 +1705,24 @@ if __name__ == "__main__":
         
         rebuild_list = ', '.join(f"\033[1m{pkg}\033[0m" for pkg in rebuild_packages) if rebuild_packages else ""
         if rebuild_list:
-            print(f"Found {len(newer_packages)} packages (including rebuilds: {rebuild_list})")
+            info(f"Found {len(newer_packages)} packages (including rebuilds: {rebuild_list})")
         else:
-            print(f"Found {len(newer_packages)} packages")
+            info(f"Found {len(newer_packages)} packages")
     else:
-        if args.missing_packages:
-            print(f"Found {len(newer_packages)} missing packages")
+        # Count outdated vs new packages
+        outdated_count = len([pkg for pkg in newer_packages if pkg.get('current_version', 'unknown') not in ['not found', 'unknown']])
+        new_count = len([pkg for pkg in newer_packages if pkg.get('current_version') == 'not found'])
+        
+        if outdated_count > 0 and new_count > 0:
+            info(f"Found {outdated_count} packages where x86_64 is newer and {new_count} missing package{'s' if new_count != 1 else ''}.")
+        elif outdated_count > 0:
+            info(f"Found {outdated_count} packages where x86_64 is newer")
+        elif new_count > 0:
+            info(f"Found {new_count} missing package{'s' if new_count != 1 else ''}")
+        elif len(newer_packages) > 0:
+            info(f"Found {len(newer_packages)} packages")
         else:
-            # Count outdated vs new packages
-            outdated_count = len([pkg for pkg in newer_packages if pkg.get('current_version', 'unknown') not in ['not found', 'unknown']])
-            new_count = len([pkg for pkg in newer_packages if pkg.get('current_version') == 'not found'])
-            
-            if outdated_count > 0 and new_count > 0:
-                print(f"Found {outdated_count} packages where x86_64 is newer and {new_count} missing package{'s' if new_count != 1 else ''}.")
-            elif outdated_count > 0:
-                print(f"Found {outdated_count} packages where x86_64 is newer")
-            elif new_count > 0:
-                print(f"Found {new_count} missing package{'s' if new_count != 1 else ''}")
-            else:
-                print(f"Found {len(newer_packages)} packages")
+            info(f"All packages are up to date. Nothing to build.")
     
     # Categorize packages by version change type
     if newer_packages:
@@ -1744,42 +1750,44 @@ if __name__ == "__main__":
         
         # Show upgrades
         if upgrades:
-            print("\nUpgrades:")
+            info("\nUpgrades:")
             for pkg in upgrades:
                 current = pkg.get('current_version', 'unknown')
                 new = pkg['version']
-                print(f"  {pkg['name']}: {current} → {new}")
+                info(f"  {pkg['name']}: {current} → {new}")
         
         # Show missing packages
         if missing:
-            print("\nNew packages:")
+            info("\nNew packages:")
             for pkg in missing:
                 reason = pkg.get('added_reason', '')
                 if reason:
-                    print(f"  {pkg['name']}: {pkg['version']} ({reason})")
+                    info(f"  {pkg['name']}: {pkg['version']} ({reason})")
                 else:
-                    print(f"  {pkg['name']}: {pkg['version']}")
+                    info(f"  {pkg['name']}: {pkg['version']}")
         
         # Show rebuilds
         if rebuilds:
-            print("\nRebuilds:")
+            info("\nRebuilds:")
             for pkg in rebuilds:
-                print(f"  {pkg['name']}: {pkg['version']}")
+                info(f"  {pkg['name']}: {pkg['version']}")
         
         # Show downgrades
         if downgrades:
-            print("\nDowngrades:")
+            info("\nDowngrades:")
             for pkg in downgrades:
                 current = pkg.get('current_version', 'unknown')
                 new = pkg['version']
-                print(f"  {pkg['name']}: {current} → {new}")
+                info(f"  {pkg['name']}: {current} → {new}")
     
     if args.preserve_order and args.packages:
-        print("Preserving command line order...")
+        log("Preserving command line order...")
         sorted_packages = preserve_package_order(newer_packages, args.packages)
-    else:
-        print("Sorting by build order...")
+    elif newer_packages:
+        log("Sorting by build order...")
         sorted_packages = sort_by_build_order(newer_packages, full_x86_packages, target_packages)
+    else:
+        sorted_packages = []
     
     # Calculate package name sets for comparison (after all processing is complete)
     final_package_names = {pkg['name'] for pkg in sorted_packages}

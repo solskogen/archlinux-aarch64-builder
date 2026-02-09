@@ -354,7 +354,7 @@ def parse_database_file(db_filename, include_any=False):
     
     return packages
 
-def load_database_packages(urls, arch_suffix, download=True, include_any=False):
+def load_database_packages(urls, arch_suffix, download=True, include_any=False, verbose=False):
     """
     Download and parse database files for given URLs in parallel.
     """
@@ -373,24 +373,29 @@ def load_database_packages(urls, arch_suffix, download=True, include_any=False):
                 age = time.time() - db_path.stat().st_mtime
                 if age < 60:
                     needs_download = False
-                    print(f"Using existing {db_filename} (age: {int(age)}s)")
+                    if verbose:
+                        print(f"Using existing {db_filename} (age: {int(age)}s)")
             
             if needs_download or not db_path.exists():
                 if not download and not db_path.exists():
-                    print(f"Database {db_filename} not found, downloading...")
+                    if verbose:
+                        print(f"Database {db_filename} not found, downloading...")
                 elif needs_download:
-                    print(f"Downloading {db_filename}...")
+                    if verbose:
+                        print(f"Downloading {db_filename}...")
                 subprocess.run(["wget", "-q", "-O", db_filename, url], check=True)
                 db_path.touch()  # Update mtime (wget preserves server timestamp)
             elif download:
-                print(f"Using existing {db_filename}")
+                if verbose:
+                    print(f"Using existing {db_filename}")
             
             repo_name = url.split('/')[-4]  # Extract 'core' or 'extra' from URL
             # Handle testing repos
             if repo_name.endswith('-testing'):
                 repo_name = repo_name.replace('-testing', '')
             
-            print(f"Parsing {db_filename}...")
+            if verbose:
+                print(f"Parsing {db_filename}...")
             repo_packages = parse_database_file(db_filename, include_any=include_any)
             
             for name, pkg in repo_packages.items():
@@ -426,7 +431,7 @@ def load_database_packages(urls, arch_suffix, download=True, include_any=False):
     
     return packages
 
-def load_x86_64_packages(download=True, repos=None, include_testing=False):
+def load_x86_64_packages(download=True, repos=None, include_testing=False, verbose=False):
     """Load x86_64 packages from official repositories"""
     urls = [
         f"{X86_64_MIRROR}/core/os/x86_64/core.db",
@@ -448,14 +453,9 @@ def load_x86_64_packages(download=True, repos=None, include_testing=False):
             filtered_urls.extend([url for url in urls if f'/{repo}/' in url])
         urls = filtered_urls
     
-    if not download:
-        print("Using existing x86_64 databases...")
-    else:
-        print("Downloading x86_64 databases...")
-    
-    return load_database_packages(urls, '_x86_64', download)
+    return load_database_packages(urls, '_x86_64', download, verbose=verbose)
 
-def load_target_arch_packages(download=True, urls=None, include_testing=False):
+def load_target_arch_packages(download=True, urls=None, include_testing=False, verbose=False):
     """Load target architecture packages from configured repositories"""
     target_arch = get_target_architecture()
     
@@ -480,12 +480,7 @@ def load_target_arch_packages(download=True, urls=None, include_testing=False):
             print("target_base_url = https://your-repo.com/arch")
             sys.exit(1)
     
-    if not download:
-        print(f"Using existing {target_arch} databases...")
-    else:
-        print(f"Downloading {target_arch} databases...")
-    
-    return load_database_packages(urls, f'_{target_arch}', download)
+    return load_database_packages(urls, f'_{target_arch}', download, verbose=verbose)
 
 def load_blacklist(blacklist_file):
     """
@@ -767,7 +762,7 @@ def find_missing_dependencies(packages, x86_packages, target_packages):
     
     return missing_deps
 
-def load_packages_unified(download=True, include_any=False, use_existing=False, x86_repos=None, target_repos=None, include_testing=False, x86_testing=False):
+def load_packages_unified(download=True, include_any=False, use_existing=False, x86_repos=None, target_repos=None, include_testing=False, x86_testing=False, verbose=False):
     """
     Unified package loading function for all scripts.
     
@@ -779,6 +774,7 @@ def load_packages_unified(download=True, include_any=False, use_existing=False, 
         target_repos: Filter target repos (for compatibility)
         include_testing: Include testing repositories for target architecture
         x86_testing: Include testing repositories for x86_64 architecture
+        verbose: Show detailed progress messages
         
     Returns:
         tuple: (x86_64_packages, target_packages)
@@ -786,7 +782,8 @@ def load_packages_unified(download=True, include_any=False, use_existing=False, 
     if use_existing:
         download = False
     
-    print("Loading packages...")
+    if verbose:
+        print("Loading packages...")
     
     # Get target architecture
     target_arch = get_target_architecture()
@@ -795,7 +792,8 @@ def load_packages_unified(download=True, include_any=False, use_existing=False, 
     x86_packages, target_packages = load_all_packages_parallel(
         download=download, include_any=include_any, 
         x86_repos=x86_repos, target_repos=target_repos, 
-        include_testing=include_testing, x86_testing=x86_testing
+        include_testing=include_testing, x86_testing=x86_testing,
+        verbose=verbose
     )
     
     return x86_packages, target_packages
@@ -825,7 +823,7 @@ def safe_command_execution(cmd, operation_name, cwd=None, exit_on_error=True, **
     except Exception as e:
         return handle_command_error(e, operation_name, exit_on_error)
 
-def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None, include_any=False, include_testing=False, x86_testing=False):
+def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None, include_any=False, include_testing=False, x86_testing=False, verbose=False):
     """Load both x86_64 and target architecture packages in parallel"""
     from concurrent.futures import ThreadPoolExecutor, as_completed
     
@@ -875,7 +873,7 @@ def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None,
             target_urls = [url for url in target_urls if '/extra/' in url or '/extra-testing/' in url]
     
     def load_arch_packages(urls, arch_suffix, arch_name):
-        packages = load_database_packages(urls, arch_suffix, download, include_any)
+        packages = load_database_packages(urls, arch_suffix, download, include_any, verbose=verbose)
         
         # Count unique pkgbase
         pkgbase_count = len(set(pkg.get('basename', pkg['name']) for pkg in packages.values()))
@@ -885,7 +883,8 @@ def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None,
             testing_note = " (including testing)"
         elif arch_name != 'x86_64' and include_testing:
             testing_note = " (including testing)"
-        print(f"Loaded {len(packages)} {arch_name} packages ({pkgbase_count} pkgbase){any_note}{testing_note}")
+        if verbose:
+            print(f"Loaded {len(packages)} {arch_name} packages ({pkgbase_count} pkgbase){any_note}{testing_note}")
         return packages
     
     with ThreadPoolExecutor(max_workers=2) as executor:
@@ -897,7 +896,7 @@ def load_all_packages_parallel(download=True, x86_repos=None, target_repos=None,
     
     return x86_packages, target_packages
 
-def load_packages_with_any(urls, arch_suffix, download=True, include_any=True):
+def load_packages_with_any(urls, arch_suffix, download=True, include_any=True, verbose=False):
     """Load packages including ARCH=any packages"""
     import subprocess
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -909,13 +908,16 @@ def load_packages_with_any(urls, arch_suffix, download=True, include_any=True):
             db_filename = url.split('/')[-1].replace('.db', f'{arch_suffix}.db')
             
             if download:
-                print(f"Downloading {db_filename}...")
+                if verbose:
+                    print(f"Downloading {db_filename}...")
                 subprocess.run(["wget", "-q", "-O", db_filename, url], check=True)
             else:
-                print(f"Using existing {db_filename}...")
+                if verbose:
+                    print(f"Using existing {db_filename}...")
             
             repo_name = url.split('/')[-4]
-            print(f"Parsing {db_filename}...")
+            if verbose:
+                print(f"Parsing {db_filename}...")
             repo_packages = parse_database_file(db_filename, include_any=include_any)
             
             # Add repo info to each package

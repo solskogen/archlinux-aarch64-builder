@@ -242,6 +242,8 @@ def main():
         description=f'Analyze differences between x86_64 and {target_arch} repositories'
     )
     parser.add_argument('--blacklist', help='Blacklist file (default: blacklist.txt)')
+    parser.add_argument('--no-blacklist', action='store_true',
+                        help='Ignore blacklist (use with --missing-pkgbase)')
     parser.add_argument('--use-existing-db', action='store_true', 
                         help='Use existing database files instead of downloading')
     parser.add_argument('--missing-pkgbase', action='store_true', 
@@ -263,8 +265,11 @@ def main():
     args = parser.parse_args()
     
     # Load data
-    blacklist_file = args.blacklist or 'blacklist.txt'
-    blacklist = load_blacklist(blacklist_file) if Path(blacklist_file).exists() else []
+    if args.no_blacklist:
+        blacklist = []
+    else:
+        blacklist_file = args.blacklist or 'blacklist.txt'
+        blacklist = load_blacklist(blacklist_file) if Path(blacklist_file).exists() else []
     
     print("Loading packages...")
     x86_packages, target_packages = load_all_packages_parallel(
