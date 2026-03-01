@@ -94,15 +94,24 @@ def find_outdated_any_packages(target_by_basename, target_packages, x86_bases, t
         if basename not in x86_bases:
             continue
         x86_version = x86_bases[basename]['version']
+        x86_arch = x86_bases[basename].get('arch', 'unknown')
         
         for pkg_name in pkg_names:
             pkg = target_packages[pkg_name]
-            if pkg.get('arch') == 'any' or pkg.get('filename', '').endswith('any.pkg.tar.zst'):
+            target_pkg_arch = pkg.get('arch') or ('any' if pkg.get('filename', '').endswith('any.pkg.tar.zst') else 'unknown')
+            
+            # Only report if target package is 'any' AND x86_64 package is also 'any'
+            if target_pkg_arch == 'any' and x86_arch == 'any':
                 try:
                     if version.parse(pkg['version']) < version.parse(x86_version):
                         outdated.append(f"{pkg_name}: {target_arch}={pkg['version']}, x86_64={x86_version}")
                 except Exception:
                     pass
+            # Report architecture changes
+            elif target_pkg_arch == 'any' and x86_arch != 'any':
+                outdated.append(f"{pkg_name}: {target_arch}={pkg['version']} (any), x86_64={x86_version} (ARCH CHANGED to {x86_arch})")
+            elif target_pkg_arch != 'any' and x86_arch == 'any':
+                outdated.append(f"{pkg_name}: {target_arch}={pkg['version']} ({target_pkg_arch}), x86_64={x86_version} (ARCH CHANGED to any)")
     
     return outdated
 
@@ -282,14 +291,31 @@ def main():
     x86_provides = build_provides_map(x86_packages)
     target_provides = build_provides_map(target_packages)
     
-    # Find missing pkgbase (not blacklisted)
+    # Find missing pkgbase (not blacklisted, exclude ARCH=any)
     missing_pkgbase = [
         basename for basename in x86_bases
-        if basename not in target_bases and not is_blacklisted(basename, x86_bases[basename], blacklist)
+        if (basename not in target_bases and 
+            not is_blacklisted(basename, x86_bases[basename], blacklist) and
+            x86_bases[basename].get('arch') != 'any')
     ]
     
     if args.missing_pkgbase:
-        print(' '.join(sorted(missing_pkgbase)))
+        # Split into truly missing vs provided by other packages
+        truly_missing = []
+        provided_by_other = []
+        for basename in sorted(missing_pkgbase):
+            if basename in target_provides:
+                provided_by_other.append(basename)
+            else:
+                truly_missing.append(basename)
+        
+        print(f"Missing pkgbase (not available on {target_arch}): {len(truly_missing)}")
+        print(' '.join(truly_missing))
+        if provided_by_other:
+            print(f"\nMissing pkgbase, but provided by other packages: {len(provided_by_other)}")
+            for basename in provided_by_other:
+                provider = target_provides[basename]
+                print(f"  {basename} -> {provider}")
         return
     
     # Determine what to show

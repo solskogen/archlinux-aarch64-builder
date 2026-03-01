@@ -45,7 +45,7 @@ class BootstrapBuilder(BuildUtils):
         self.start_from = start_from
         self.target_arch = get_target_architecture()
     
-    def get_start_index(self, packages):
+    def get_start_index(self, packages, stage_num):
         """Get starting index for continue mode or start_from option"""
         if self.start_from:
             try:
@@ -58,14 +58,20 @@ class BootstrapBuilder(BuildUtils):
             return 0
         
         try:
-            last_completed = int(self.progress_file.read_text().strip())
-            return last_completed + 1
+            progress_data = self.progress_file.read_text().strip().split(':')
+            if len(progress_data) == 2:
+                saved_stage, saved_index = int(progress_data[0]), int(progress_data[1])
+                if saved_stage == stage_num:
+                    return saved_index  # Retry the failed package
+                elif saved_stage > stage_num:
+                    return len(packages)  # Stage already completed
+            return 0
         except (ValueError, FileNotFoundError):
             return 0
     
-    def save_progress(self, index):
+    def save_progress(self, stage_num, index):
         """Save build progress for continue mode"""
-        self.progress_file.write_text(str(index))
+        self.progress_file.write_text(f"{stage_num}:{index}")
 
     def setup_environment(self):
         """Setup chroot environment for bootstrap"""
@@ -213,7 +219,7 @@ class BootstrapBuilder(BuildUtils):
         """Build a stage of packages"""
         print(f"\n=== {stage_name} ({stage_num}/{total_stages}) ===")
         
-        start_index = self.get_start_index(packages) if stage_num == 1 else 0
+        start_index = self.get_start_index(packages, stage_num)
         
         if start_index > 0:
             print(f"Starting from package {start_index + 1}/{len(packages)} in {stage_name}")
@@ -230,7 +236,7 @@ class BootstrapBuilder(BuildUtils):
                 print(f"ERROR: Failed to build {pkg_name}")
                 sys.exit(1)
             built_count += 1
-            self.save_progress(i)
+            self.save_progress(stage_num, i + 1)  # Save next index after success
             print(f"✓ {pkg_name} built successfully")
         
         print(f"✓ {stage_name} completed: {built_count}/{len(packages) - start_index} packages built")
@@ -286,30 +292,26 @@ class BootstrapBuilder(BuildUtils):
         # Lock file in current directory (not BUILD_ROOT which gets cleared)
         lock_file = Path("bootstrap.lock")
         
-        try:
-            if not self.dry_run:
-                if lock_file.exists():
-                    try:
-                        lock_content = lock_file.read_text().strip()
-                        if lock_content.startswith("PID:"):
-                            old_pid = int(lock_content.split(":")[1].split("\n")[0])
-                            try:
-                                os.kill(old_pid, 0)
-                                print("ERROR: Bootstrap already running (bootstrap.lock exists)")
-                                print("If no other bootstrap is running, remove bootstrap.lock and try again")
-                                sys.exit(1)
-                            except OSError:
-                                lock_file.unlink()
-                                print("Removed stale bootstrap.lock file")
-                    except (ValueError, IndexError):
-                        lock_file.unlink()
-                        print("Removed invalid bootstrap.lock file")
-                
-                current_pid = os.getpid()
-                lock_file.write_text(f"PID:{current_pid}\nBootstrap started at {subprocess.run(['date'], capture_output=True, text=True).stdout.strip()}")
-        except FileExistsError:
-            print("ERROR: Bootstrap already running (bootstrap.lock exists)")
-            sys.exit(1)
+        if not self.dry_run:
+            if lock_file.exists():
+                try:
+                    lock_content = lock_file.read_text().strip()
+                    if lock_content.startswith("PID:"):
+                        old_pid = int(lock_content.split(":")[1].split("\n")[0])
+                        try:
+                            os.kill(old_pid, 0)
+                            print("ERROR: Bootstrap already running (bootstrap.lock exists)")
+                            print("If no other bootstrap is running, remove bootstrap.lock and try again")
+                            sys.exit(1)
+                        except OSError:
+                            lock_file.unlink()
+                            print("Removed stale bootstrap.lock file")
+                except (ValueError, IndexError):
+                    lock_file.unlink()
+                    print("Removed invalid bootstrap.lock file")
+            
+            current_pid = os.getpid()
+            lock_file.write_text(f"PID:{current_pid}\nBootstrap started at {subprocess.run(['date'], capture_output=True, text=True).stdout.strip()}")
         
         def signal_handler(signum, frame):
             print(f"\nReceived signal {signum}, cleaning up...")

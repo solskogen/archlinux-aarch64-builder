@@ -160,7 +160,10 @@ def write_results(packages, args):
     
     info("Packages per stage:")
     for stage in sorted(stages.keys()):
+        stage_packages = [pkg['name'] for pkg in packages if pkg.get('build_stage', 0) == stage]
         info(f"  Stage {stage + 1}: {stages[stage]} packages")
+        if verbose:
+            info(f"    {', '.join(stage_packages)}")
 
 
 

@@ -567,8 +567,11 @@ echo "CHECKDEPENDS_END"
         for stage_num in sorted(stages.keys()):
             stage_packages = stages[stage_num]
             
-            if parallel_jobs > 1 and len(stage_packages) > 1:
-                # Parallel build within stage
+            # Check if any packages in this stage are in a cycle
+            has_cycle = any(pkg.get('cycle_group') is not None for _, pkg in stage_packages)
+            
+            if parallel_jobs > 1 and len(stage_packages) > 1 and not has_cycle:
+                # Parallel build within stage (but not for cycle packages)
                 with ThreadPoolExecutor(max_workers=min(parallel_jobs, len(stage_packages))) as executor:
                     futures = {}
                     for i, pkg in stage_packages:
@@ -577,6 +580,7 @@ echo "CHECKDEPENDS_END"
                                                failed_lock, success_lock, cycle_lock)
                         futures[future] = (i, pkg)
                     
+                    should_stop = False
                     for future in as_completed(futures):
                         i, pkg = futures[future]
                         try:
@@ -596,13 +600,21 @@ echo "CHECKDEPENDS_END"
                                     failed_packages.append(pkg)
                                 if self.stop_on_failure:
                                     print(f"Stopping build process due to failure in {pkg['name']}")
+                                    should_stop = True
                                     break
                         except Exception as e:
                             print(f"Unexpected exception in parallel build: {e}")
                             with failed_lock:
                                 failed_packages.append(pkg)
                             if self.stop_on_failure:
+                                should_stop = True
                                 break
+                    
+                    # Cancel remaining futures if stopping
+                    if should_stop:
+                        for remaining_future in futures:
+                            if not remaining_future.done():
+                                remaining_future.cancel()
             else:
                 # Sequential build (original behavior)
                 for i, pkg in stage_packages:
@@ -666,6 +678,18 @@ echo "CHECKDEPENDS_END"
                               failed_lock, success_lock, cycle_lock):
         """Build a single package with proper cycle and dependency handling"""
         pkg_name = pkg['name']
+        
+        # Skip if already built successfully (for --continue mode)
+        state_file = Path("last_successful.txt")
+        if state_file.exists():
+            try:
+                successful = set(state_file.read_text().strip().split('\n'))
+                if pkg_name in successful:
+                    print(f"\n[{i}/{total_packages}] Skipping {pkg_name} (already built successfully)")
+                    return True
+            except Exception:
+                pass
+        
         cycle_group = pkg.get('cycle_group')
         cycle_stage = pkg.get('cycle_stage')
         
