@@ -885,10 +885,11 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
                     
                     # If the transitive dependency IS in our build list, create edge
                     if transitive_dep_name in pkg_map and transitive_dep_name != pkg_name:
-                        # transitive_dep_name must be built before pkg_name
-                        graph[transitive_dep_name].add(pkg_name)
-                        reverse_graph[pkg_name].add(transitive_dep_name)
-                        in_degree[pkg_name] += 1
+                        # Only increment in_degree if this is a NEW edge
+                        if transitive_dep_name not in reverse_graph[pkg_name]:
+                            graph[transitive_dep_name].add(pkg_name)
+                            reverse_graph[pkg_name].add(transitive_dep_name)
+                            in_degree[pkg_name] += 1
     
     # Find strongly connected components (cycles)
     sccs = find_strongly_connected_components(reverse_graph)
@@ -980,6 +981,33 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
                     if not is_in_any_cycle:
                         external_deps_for_cycles.add(provider_pkg)
     
+    # Recursively expand external deps to include all their transitive dependencies
+    # within the build list (so they're all built before the cycles)
+    cycle_pkg_set = set()
+    for cycle_pkgs in cycles:
+        cycle_pkg_set.update(cycle_pkgs)
+    
+    changed = True
+    while changed:
+        changed = False
+        for pkg_name in list(external_deps_for_cycles):
+            pkg = pkg_map[pkg_name]
+            all_deps = []
+            for dep_type in ['depends', 'makedepends', 'checkdepends']:
+                all_deps.extend(pkg.get(dep_type, []))
+            for dep_str in all_deps:
+                dep_name = extract_dep_name(dep_str)
+                provider_pkg = None
+                if dep_name in pkg_map:
+                    provider_pkg = dep_name
+                elif dep_name in all_provides:
+                    provider_pkg = all_provides[dep_name]
+                if (provider_pkg and provider_pkg in pkg_map and 
+                    provider_pkg not in external_deps_for_cycles and
+                    provider_pkg not in cycle_pkg_set):
+                    external_deps_for_cycles.add(provider_pkg)
+                    changed = True
+    
     # First, build external dependencies of cycles
     if external_deps_for_cycles:
         external_packages = [pkg for pkg in packages if pkg['name'] in external_deps_for_cycles]
@@ -996,32 +1024,58 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
             for dep_type in ['depends', 'makedepends', 'checkdepends']:
                 all_deps.extend(pkg.get(dep_type, []))
             
+            seen_ext_providers = set()
             for dep_str in all_deps:
                 dep_name = extract_dep_name(dep_str)
-                if dep_name in external_deps_for_cycles and dep_name != pkg_name:
-                    ext_graph[dep_name].add(pkg_name)
-                    ext_in_degree[pkg_name] += 1
+                # Resolve through provides (e.g., llvm-libs -> llvm)
+                resolved = dep_name
+                if dep_name not in external_deps_for_cycles and dep_name in all_provides:
+                    resolved = all_provides[dep_name]
+                if resolved in external_deps_for_cycles and resolved != pkg_name:
+                    if resolved not in seen_ext_providers:
+                        seen_ext_providers.add(resolved)
+                        ext_graph[resolved].add(pkg_name)
+                        ext_in_degree[pkg_name] += 1
         
-        # Topological sort for external dependencies
-        queue = deque([pkg for pkg in external_packages if ext_in_degree[pkg['name']] == 0])
+        # Topological sort for external dependencies (level-by-level)
+        queue = deque()
+        for pkg in external_packages:
+            if ext_in_degree[pkg['name']] == 0:
+                queue.append((pkg['name'], current_stage))
+        
         while queue:
-            pkg = queue.popleft()
-            pkg_copy = pkg.copy()
-            pkg_copy['build_stage'] = current_stage
-            pkg_copy['cycle_group'] = None
-            pkg_copy['cycle_stage'] = None
-            pkg_copy['_sequence'] = sequence_counter
-            sequence_counter += 1
-            result.append(pkg_copy)
-            processed_packages.add(pkg['name'])
+            next_queue = deque()
+            stage_packages = []
             
-            for dependent in ext_graph[pkg['name']]:
-                ext_in_degree[dependent] -= 1
-                if ext_in_degree[dependent] == 0:
-                    dep_pkg = next(p for p in external_packages if p['name'] == dependent)
-                    queue.append(dep_pkg)
-        
-        current_stage += 1
+            while queue:
+                pkg_name, stage = queue.popleft()
+                if stage == current_stage:
+                    stage_packages.append(pkg_name)
+                else:
+                    next_queue.append((pkg_name, stage))
+            
+            if not stage_packages:
+                current_stage += 1
+                queue = next_queue
+                continue
+            
+            for pkg_name in stage_packages:
+                pkg = pkg_map[pkg_name].copy()
+                pkg['build_stage'] = current_stage
+                pkg['cycle_group'] = None
+                pkg['cycle_stage'] = None
+                pkg['_sequence'] = sequence_counter
+                sequence_counter += 1
+                result.append(pkg)
+                processed_packages.add(pkg_name)
+                
+                for dependent in ext_graph[pkg_name]:
+                    ext_in_degree[dependent] -= 1
+                    if ext_in_degree[dependent] == 0:
+                        next_queue.append((dependent, current_stage + 1))
+            
+            current_stage += 1
+            queue = next_queue
     
     # Now process cycles
     for cycle_id, cycle_pkgs in enumerate(cycles):
@@ -1245,9 +1299,9 @@ if __name__ == "__main__":
                 'build_stage': 0
             })
         
-        # Load packages for dependency resolution
-        all_x86_packages = load_x86_64_packages(verbose=verbose, download=not args.no_update, include_testing=args.upstream_testing)
-        target_packages = load_target_arch_packages(verbose=verbose, download=not args.no_update, include_testing=args.target_testing)
+        # --local gets dependencies from PKGBUILDs, not database files
+        all_x86_packages = {}
+        target_packages = {}
         
         # Parse PKGBUILDs for dependencies
         newer_packages = fetch_pkgbuild_deps(newer_packages, True, all_x86_packages, target_packages)

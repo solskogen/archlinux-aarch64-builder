@@ -300,7 +300,7 @@ echo "CHECKDEPENDS_END"
         
         cmd = [
             "makechrootpkg", "-l", temp_copy_path.name, "-r", str(self.chroot_path),
-            "-d", str(self.cache_dir), "-t", "/tmp:size=128G",
+            "-d", str(self.cache_dir), "-t", "/tmp:size=32G",
             "--"
         ]
         if use_ignorearch:
@@ -843,8 +843,9 @@ done
         finally:
             self._cleanup_temp_chroot(temp_copy_path, not build_success)
             
-            # Clean up lock files
-            for lock_file in self.chroot_path.glob("*.lock"):
+            # Clean up lock file for this build's temp chroot only
+            lock_file = Path(str(temp_copy_path) + ".lock")
+            if lock_file.exists():
                 try:
                     lock_file.unlink()
                 except Exception as e:

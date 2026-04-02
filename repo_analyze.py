@@ -177,13 +177,13 @@ def get_bin_package_version_info(basename, target_data, x86_packages):
     x86_counterpart = None
     
     if counterpart in x86_packages:
-        x86_counterpart = counterpart
+        x86_counterpart = x86_packages[counterpart]['basename']
         x86_version = x86_packages[counterpart]['version']
     else:
         for provide in target_data.get('provides', []):
-            provide_name = provide.split('=')[0].split('<')[0].split('>')[0]
+            provide_name = provide.split('=')[0].split('<')[0].split('>')[0].strip()
             if provide_name in x86_packages:
-                x86_counterpart = provide_name
+                x86_counterpart = x86_packages[provide_name]['basename']
                 x86_version = x86_packages[provide_name]['version']
                 break
     
@@ -221,7 +221,9 @@ def find_target_only(target_bases, target_packages, target_by_basename, x86_base
         
         if len(pkg_names) == 1 and pkg_names[0] == basename:
             filename = f"{basename}-{target_data['version']}-{arch}.pkg.tar.zst"
-            version_info = get_bin_package_version_info(basename, target_data, x86_packages)
+            # For packages with incorrect basename grouping, use the actual package data
+            actual_pkg_data = target_packages.get(basename, target_data)
+            version_info = get_bin_package_version_info(basename, actual_pkg_data, x86_packages)
             line = f"{basename}: {target_data['version']} ({target_data['repo']}) (file: {filename}){version_info}"
             if target_data['repo'] in ['core', 'extra']:
                 line = f"\033[31m{line}\033[0m"
@@ -229,7 +231,13 @@ def find_target_only(target_bases, target_packages, target_by_basename, x86_base
         else:
             for pkg_name in pkg_names:
                 filename = f"{pkg_name}-{target_data['version']}-{arch}.pkg.tar.zst"
-                only.append(f"{pkg_name}: {target_data['version']} ({target_data['repo']}) (file: {filename})")
+                # Use actual package data for version info
+                actual_pkg_data = target_packages.get(pkg_name, target_data)
+                version_info = get_bin_package_version_info(pkg_name, actual_pkg_data, x86_packages)
+                line = f"{pkg_name}: {target_data['version']} ({target_data['repo']}) (file: {filename}){version_info}"
+                if target_data['repo'] in ['core', 'extra']:
+                    line = f"\033[31m{line}\033[0m"
+                only.append(line)
     
     return only
 
