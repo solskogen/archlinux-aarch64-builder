@@ -300,7 +300,7 @@ echo "CHECKDEPENDS_END"
         
         cmd = [
             "makechrootpkg", "-l", temp_copy_path.name, "-r", str(self.chroot_path),
-            "-d", str(self.cache_dir), "-t", "/tmp:size=32G",
+            "-d", str(self.cache_dir), "-t", "/tmp:size=64G",
             "--"
         ]
         if use_ignorearch:

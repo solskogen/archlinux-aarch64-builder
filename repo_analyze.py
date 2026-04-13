@@ -273,6 +273,8 @@ def main():
                         help=f'Show packages where {target_arch} is newer')
     parser.add_argument('--target-only', action='store_true', 
                         help=f'Show {target_arch} only packages')
+    parser.add_argument('--target-only-files', action='store_true',
+                        help=f'Print filenames of {target_arch}-only packages in core/extra')
     # Legacy aliases
     for alias, dest in [('--repo-mismatches', 'repo_issues'), ('--target-duplicates', 'repo_issues'),
                         ('--arm-newer', 'target_newer'), ('--arm-only', 'target_only'),
@@ -324,6 +326,15 @@ def main():
             for basename in provided_by_other:
                 provider = target_provides[basename]
                 print(f"  {basename} -> {provider}")
+        return
+    
+    if args.target_only_files:
+        for name, pkg in sorted(target_packages.items()):
+            if pkg['basename'] in x86_bases:
+                continue
+            if pkg['repo'] not in ('core', 'extra'):
+                continue
+            print(pkg.get('filename', f"{name}-{pkg['version']}-{pkg.get('arch', target_arch)}.pkg.tar.zst"))
         return
     
     # Determine what to show

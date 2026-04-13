@@ -277,7 +277,7 @@ echo "$fullver"
                         clone_url = override['url']
                         default_branch = override.get('branch', 'main')
                         print(f"  Using override: {clone_url} (branch: {default_branch})")
-                        result = subprocess.run(["git", "clone", clone_url, basename], 
+                        result = subprocess.run(["git", "clone", "-b", default_branch, clone_url, basename], 
                                              cwd=PKGBUILDS_DIR, check=True, 
                                              capture_output=True, text=True)
                     else:
@@ -1079,8 +1079,26 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
     
     # Now process cycles
     for cycle_id, cycle_pkgs in enumerate(cycles):
-        # Add first build of cycle packages
+        # Best-effort ordering within cycle: sort by number of in-cycle dependents
+        # (most depended-on packages first, so e.g. glib2 builds before libdex)
+        cycle_pkg_set = set(cycle_pkgs)
+        dep_count = {name: 0 for name in cycle_pkgs}
         for pkg_name in cycle_pkgs:
+            pkg = pkg_map[pkg_name]
+            all_deps = []
+            for dep_type in ['depends', 'makedepends', 'checkdepends']:
+                all_deps.extend(pkg.get(dep_type, []))
+            for dep_str in all_deps:
+                dep_name = extract_dep_name(dep_str)
+                provider = dep_name
+                if dep_name not in cycle_pkg_set and dep_name in all_provides:
+                    provider = all_provides[dep_name]
+                if provider in cycle_pkg_set and provider != pkg_name:
+                    dep_count[provider] += 1
+        sorted_cycle_pkgs = sorted(cycle_pkgs, key=lambda n: dep_count[n], reverse=True)
+
+        # Add first build of cycle packages
+        for pkg_name in sorted_cycle_pkgs:
             pkg = pkg_map[pkg_name].copy()
             pkg['build_stage'] = current_stage
             pkg['cycle_group'] = cycle_id
@@ -1235,6 +1253,8 @@ if __name__ == "__main__":
                         help='File containing packages to skip (default: blacklist.txt)')
     parser.add_argument('--rebuild-repo', choices=['core', 'extra'],
                         help='Rebuild all packages from specified repository regardless of version')
+    parser.add_argument('--single-stage', action='store_true',
+                        help='Flatten to one build stage (no cycle duplication), useful for major rebuilds')
     parser.add_argument('--target-testing', action='store_true',
                         help='Also include target testing repos for comparison')
     parser.add_argument('--upstream-testing', action='store_true',
@@ -1523,26 +1543,29 @@ if __name__ == "__main__":
         print(f"Rebuilding all packages from {args.rebuild_repo} repository...")
         repo_packages = []
         toolchain_packages = {'gcc', 'binutils', 'glibc'}
+        seen_basenames = set()
         
         for pkg_name, pkg_data in x86_packages.items():
             if pkg_data['repo'] == args.rebuild_repo:
-                if pkg_data['basename'] in toolchain_packages:
+                basename = pkg_data['basename']
+                if basename in toolchain_packages or basename in seen_basenames:
                     continue
                     
                 blacklist_reason = None
                 if blacklist:
                     for pattern in blacklist:
-                        if fnmatch.fnmatch(pkg_data['basename'], pattern):
-                            blacklist_reason = f"basename '{pkg_data['basename']}' matches pattern '{pattern}'"
+                        if fnmatch.fnmatch(basename, pattern):
+                            blacklist_reason = f"basename '{basename}' matches pattern '{pattern}'"
                             break
                         if fnmatch.fnmatch(pkg_name, pattern):
                             blacklist_reason = f"package '{pkg_name}' matches pattern '{pattern}'"
                             break
                 
                 if not blacklist_reason:
+                    seen_basenames.add(basename)
                     repo_packages.append({
-                        'name': pkg_name,
-                        'basename': pkg_data['basename'],
+                        'name': basename,
+                        'basename': basename,
                         'version': pkg_data['version'],
                         'repo': pkg_data['repo'],
                         'depends': pkg_data['depends'],
@@ -1845,6 +1868,19 @@ if __name__ == "__main__":
         sorted_packages = sort_by_build_order(newer_packages, full_x86_packages, target_packages)
     else:
         sorted_packages = []
+    
+    # Flatten to single stage: remove cycle duplicates, set all stages to 0
+    if args.single_stage and sorted_packages:
+        seen = set()
+        flattened = []
+        for pkg in sorted_packages:
+            if pkg['name'] not in seen:
+                seen.add(pkg['name'])
+                pkg['build_stage'] = 0
+                pkg['cycle_group'] = None
+                pkg['cycle_stage'] = None
+                flattened.append(pkg)
+        sorted_packages = flattened
     
     # Calculate package name sets for comparison (after all processing is complete)
     final_package_names = {pkg['name'] for pkg in sorted_packages}
