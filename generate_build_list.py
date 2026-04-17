@@ -120,17 +120,9 @@ def write_results(packages, args):
     
     if not packages:
         # Remove the file if nothing to build
-        if output_file.exists():
+        if not getattr(args, 'dry_run', False) and output_file.exists():
             output_file.unlink()
         return
-    
-    output_data = {
-        "_command": " ".join(sys.argv),
-        "_timestamp": datetime.datetime.now().isoformat(),
-        "packages": json_packages
-    }
-    with open(output_file, "w") as f:
-        json.dump(output_data, f, indent=2)
     
     info(f"\nBuild Statistics:")
     info(f"Total packages to build: {len(packages)}")
@@ -169,6 +161,20 @@ def write_results(packages, args):
 
 
 
+
+
+    if getattr(args, 'dry_run', False):
+        info(f"\n[DRY RUN] Would write {len(packages)} packages to {output_file}")
+        return
+    
+    output_data = {
+        "_command": " ".join(sys.argv),
+        "_timestamp": datetime.datetime.now().isoformat(),
+        "packages": json_packages
+    }
+    with open(output_file, "w") as f:
+        json.dump(output_data, f, indent=2)
+    
 
 def load_package_overrides():
     """Load package URL/branch overrides from package-overrides.json"""
@@ -1263,6 +1269,8 @@ if __name__ == "__main__":
                         help='Show detailed progress messages')
     parser.add_argument('-q', '--quiet', action='store_true',
                         help='Only show warnings and errors')
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Show what would be generated without writing the JSON file')
     
     # Mutually exclusive group for git update options
     git_group = parser.add_mutually_exclusive_group()
@@ -1276,6 +1284,10 @@ if __name__ == "__main__":
     # Set global verbose/quiet flags
     verbose = args.verbose
     quiet = args.quiet
+
+    # --dry-run implies --no-update
+    if args.dry_run:
+        args.no_update = True
     
     # Validate --preserve-order requires --packages
     if args.preserve_order and not args.packages:
