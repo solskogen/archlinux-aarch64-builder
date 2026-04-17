@@ -192,6 +192,58 @@ The system automatically maintains ports of Arch Linux for multiple architecture
 **Usage**: `./find_dependents.py PACKAGE_NAME`
 **Output**: Space-separated list of dependent package basenames
 
+#### `auto_builder.py`
+**Purpose**: Continuous build daemon that automates the full build cycle
+
+**Cycle Flow**:
+1. Update heartbeat (for web dashboard status)
+2. Load and prune failure tracker (`auto_builder_failures.json`)
+3. Sync ARCH=any packages from upstream (`sync_any_packages.py`)
+4. Generate build list (`generate_build_list.py`)
+5. Filter out previously failed packages (version-aware)
+6. Mark packages as QUEUED in report database
+7. Start background reporter thread (updates BUILDING status every 30s)
+8. Build packages (`build_packages.py --continue --parallel-jobs 5`)
+9. Stop background reporter, clear QUEUED/BUILDING entries
+10. Ingest build logs into report database
+11. Promote packages from testing to stable repos
+12. Record failures, clean up logs
+13. Wait for repo DB regeneration (80s) or idle interval (180s)
+
+**Key Features**:
+- Lock file prevents concurrent runs
+- Failed package tracking with version awareness (won't retry same version)
+- Dependency-aware skipping (won't build B if A failed and B depends on A)
+- Background reporter provides near-real-time build status
+- Graceful shutdown on SIGINT/SIGTERM
+- Web dashboard with live status at `reports/latest.html`
+
+**Configuration**: Uses `[paths]` section in `config.ini`
+
+#### `sync_any_packages.py`
+**Purpose**: Sync ARCH=any packages from x86_64 upstream to aarch64 testing repos
+
+**Process**:
+1. Rsync x86_64 mirror to local path
+2. Parse x86_64 .db files for ARCH=any packages
+3. Download aarch64 .db files (stable + testing)
+4. Compare versions, copy missing/outdated packages to testing repos
+
+#### `generate_report.py`
+**Purpose**: Ingest build logs into SQLite database for web reporting
+
+**Database Schema** (`reports/builds.db`):
+- `builds` table: package, version, status, started, finished, duration, log (lzma compressed)
+- `repo_stats` table: key-value pairs (package counts, heartbeat, load average, memory, in_testing)
+
+**Report Dashboard** (`reports/latest.html`):
+- Static HTML page using sql.js (WebAssembly SQLite) to query builds.db client-side
+- Shows: builder status, repo stats, package status table, build logs
+- Statuses: QUEUED → BUILDING → SUCCESS/TESTING/FAILED/SKIPPED
+
+#### `queue_helper.py`
+**Purpose**: Helper script to mark/clear QUEUED entries in the report database
+
 ### 2. Utility Module (`utils.py`)
 
 **Core Functions**:
@@ -297,7 +349,15 @@ The system automatically maintains ports of Arch Linux for multiple architecture
 [build]
 build_root = /scratch/builder
 upload_bucket = arch-linux-repos.drzee.net
+target_base_url = https://your-repo.com/arch
 x86_64_mirror = https://geo.mirror.pkgbuild.com
+
+[paths]
+mirror_path = /scratch/archlinux
+repos_path = /mnt/repos
+served_db_path = /mnt/repos/build_reports/builds.db
+repo_user = arch
+move_to_release_script = /mnt/repos/move-from-testing-to-release.sh
 ```
 
 ### `chroot-config/pacman.conf`

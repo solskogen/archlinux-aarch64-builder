@@ -12,7 +12,28 @@ An automated build system that maintains ports of Arch Linux for multiple archit
 ./build_packages.py
 ```
 
-That's it! The system will automatically detect your target architecture, compare versions, and build packages in the correct order.
+### Continuous Auto Builder
+
+For automated continuous building:
+
+```bash
+# Start the auto builder daemon (checks every 180s)
+./auto_builder.py
+
+# Run once and exit
+./auto_builder.py --once
+
+# Custom interval
+./auto_builder.py --interval 300
+```
+
+The auto builder:
+- Syncs ARCH=any packages from upstream x86_64 mirror
+- Generates build lists and builds outdated packages
+- Tracks failed packages (won't retry same version)
+- Promotes packages from testing to stable repos
+- Provides a live web dashboard at `reports/latest.html`
+- Shows real-time build status (QUEUED → BUILDING → SUCCESS/FAILED)
 
 ## Prerequisites
 
@@ -69,20 +90,34 @@ Create `config.ini` with your settings:
 
 ```ini
 [build]
-build_root = /tmp/builder
+build_root = /scratch/builder
 upload_bucket = your-s3-bucket.example.com
 target_base_url = https://your-repo.com/arch
+x86_64_mirror = https://geo.mirror.pkgbuild.com
 
-[repositories]
-# Optional: Override default repository URLs
-target_core_url = https://example.com/core/os/aarch64/core.db
-target_extra_url = https://example.com/extra/os/aarch64/extra.db
+[paths]
+# Local x86_64 mirror for syncing -any packages
+mirror_path = /scratch/archlinux
+# Repository root (where testing/stable repos live)
+repos_path = /mnt/repos
+# Where to copy builds.db for serving (empty to disable)
+served_db_path = /mnt/repos/build_reports/builds.db
+# User to run repo operations as
+repo_user = arch
+# Move-from-testing script
+move_to_release_script = /mnt/repos/move-from-testing-to-release.sh
 ```
 
 **Configuration Options:**
 - `build_root`: Directory for build operations and chroot
 - `upload_bucket`: S3 bucket name for uploading built packages
 - `target_base_url`: Base URL for your target architecture repositories
+- `x86_64_mirror`: URL for x86_64 package mirror (used when local mirror unavailable)
+- `mirror_path`: Local rsync mirror of x86_64 packages (used for fast .db lookups)
+- `repos_path`: Where testing and stable repository directories live
+- `served_db_path`: Where to copy the build report database for web serving
+- `repo_user`: System user for repository file operations
+- `move_to_release_script`: Script to promote packages from testing to stable
 
 ## Package Overrides
 
@@ -207,6 +242,9 @@ cat config.ini
 | `--target-testing` | Also include target testing repos for comparison |
 | `--upstream-testing` | Also include upstream testing repos for comparison |
 | `--force` | Force rebuild ARCH=any packages (use with --packages) |
+| `--dry-run` | Show what would be generated without writing JSON or running git |
+| `--rsync` | Rsync x86_64 mirror before checking for packages |
+| `--single-stage` | Flatten to one build stage (no cycle duplication) |
 
 #### build_packages.py
 
@@ -239,6 +277,36 @@ cat config.ini
 | `--target-only` | Show target architecture only packages |
 
 ### Advanced Examples
+
+#### Auto Builder
+```bash
+# Start continuous builder with quiet mode
+./auto_builder.py -q
+
+# Pass extra args to generate_build_list
+./auto_builder.py --generate-args --upstream-testing
+```
+
+#### Sync ARCH=any Packages
+```bash
+# Rsync mirror and sync -any packages to testing
+./sync_any_packages.py
+
+# Skip rsync, use existing mirror
+./sync_any_packages.py --no-rsync
+
+# Dry run
+./sync_any_packages.py --dry-run
+```
+
+#### Build Reports
+```bash
+# Ingest build logs into database
+./generate_report.py
+
+# View report
+# Open reports/latest.html in a browser (reads builds.db via sql.js)
+```
 
 #### Repository Migration
 ```bash

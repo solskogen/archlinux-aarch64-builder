@@ -1271,6 +1271,8 @@ if __name__ == "__main__":
                         help='Only show warnings and errors')
     parser.add_argument('--dry-run', action='store_true',
                         help='Show what would be generated without writing the JSON file')
+    parser.add_argument('--rsync', action='store_true',
+                        help='Rsync x86_64 mirror before checking for packages')
     
     # Mutually exclusive group for git update options
     git_group = parser.add_mutually_exclusive_group()
@@ -1288,6 +1290,17 @@ if __name__ == "__main__":
     # --dry-run implies --no-update
     if args.dry_run:
         args.no_update = True
+
+    # Rsync x86_64 mirror if requested
+    if args.rsync:
+        mirror_path = config.get('paths', 'mirror_path', fallback='')
+        if mirror_path:
+            info("Syncing x86_64 mirror...")
+            subprocess.run(["sudo", "rsync", "-av", "--delete", "--progress",
+                          "rsync://geo.mirror.pkgbuild.com/packages/", mirror_path + "/"])
+        else:
+            print("ERROR: paths.mirror_path not set in config.ini")
+            sys.exit(1)
     
     # Validate --preserve-order requires --packages
     if args.preserve_order and not args.packages:

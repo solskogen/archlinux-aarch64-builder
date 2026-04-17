@@ -367,6 +367,21 @@ def load_database_packages(urls, arch_suffix, download=True, include_any=False, 
             db_filename = url.split('/')[-1].replace('.db', f'{arch_suffix}.db')
             db_path = Path(db_filename)
             
+            # Check if local mirror has this file
+            mirror_path = config.get('paths', 'mirror_path', fallback='')
+            if mirror_path and X86_64_MIRROR in url:
+                local_path = Path(url.replace(X86_64_MIRROR, mirror_path))
+                if local_path.exists():
+                    if verbose:
+                        print(f"Using local mirror: {local_path}")
+                    repo_name = url.split('/')[-4]
+                    if repo_name.endswith('-testing'):
+                        repo_name = repo_name.replace('-testing', '')
+                    repo_packages = parse_database_file(str(local_path), include_any=include_any)
+                    for name, pkg in repo_packages.items():
+                        pkg['repo'] = repo_name
+                    return repo_packages
+
             # Skip download if file exists and is less than 60 seconds old
             needs_download = download
             if db_path.exists():
