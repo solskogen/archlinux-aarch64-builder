@@ -50,6 +50,23 @@ GIT_COMMAND_TIMEOUT = 10      # Seconds to wait for git commands
 # Constants
 PACKAGE_SKIP_FLAG = 1
 
+
+def check_auto_builder_lock(script_name):
+    """Exit if auto_builder.py is running, unless called by it."""
+    if os.environ.get("AUTO_BUILDER") == "1":
+        return
+    lock_file = Path("auto_builder.lock")
+    if lock_file.exists():
+        try:
+            pid = int(lock_file.read_text().strip())
+            os.kill(pid, 0)
+            print(f"ERROR: auto_builder.py is running (PID {pid})")
+            print(f"Stop it first with Ctrl+C, then run {script_name} manually")
+            sys.exit(1)
+        except (OSError, ValueError):
+            pass  # Stale lock file, safe to proceed
+PACKAGE_SKIP_FLAG = 1
+
 def get_target_architecture():
     """Read target architecture from chroot-config/makepkg.conf"""
     makepkg_conf = Path("chroot-config/makepkg.conf")

@@ -35,6 +35,7 @@ import tarfile
 from pathlib import Path
 from packaging import version
 from utils import (
+    check_auto_builder_lock,
     load_blacklist, load_x86_64_packages, load_target_arch_packages,
     validate_package_name, safe_path_join, is_version_newer,
     PACKAGE_SKIP_FLAG, parse_pkgbuild_deps, parse_database_file, X86_64_MIRROR,
@@ -1282,6 +1283,8 @@ if __name__ == "__main__":
                         help='Use latest git commit of package source instead of version tag when building')
     
     args = parser.parse_args()
+    
+    check_auto_builder_lock("generate_build_list.py")
     
     # Set global verbose/quiet flags
     verbose = args.verbose

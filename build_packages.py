@@ -23,6 +23,7 @@ import argparse
 import threading
 from pathlib import Path
 from utils import (
+    check_auto_builder_lock,
     load_blacklist, filter_blacklisted_packages, 
     validate_package_name, safe_path_join, PACKAGE_SKIP_FLAG,
     BuildUtils, BUILD_ROOT, CACHE_PATH, TEMP_CHROOT_ID_MIN, TEMP_CHROOT_ID_MAX, 
@@ -37,7 +38,7 @@ class PackageBuilder:
     Manages chroot environments, dependency installation, package building,
     and cleanup operations. Supports dry-run mode and graceful interruption.
     """
-    def __init__(self, dry_run=False, chroot_path=None, cache_dir=None, no_cache=False, no_upload=False, stop_on_failure=False, preserve_chroot=False, cleanup_on_failure=False):
+    def __init__(self, dry_run=False, chroot_path=None, cache_dir=None, no_cache=False, no_upload=False, stop_on_failure=False, preserve_chroot=False, cleanup_on_failure=False, no_reporting=False):
         """
         Initialize the package builder.
         
@@ -50,6 +51,7 @@ class PackageBuilder:
             stop_on_failure: Stop on first build failure
             preserve_chroot: Preserve chroot even on successful builds
             cleanup_on_failure: Delete temporary chroots even on build failure
+            no_reporting: Skip updating the build report database
         """
         self.build_utils = BuildUtils(dry_run)
         self.dry_run = dry_run
@@ -58,6 +60,7 @@ class PackageBuilder:
         self.stop_on_failure = stop_on_failure
         self.preserve_chroot = preserve_chroot
         self.cleanup_on_failure = cleanup_on_failure
+        self.no_reporting = no_reporting
         self.chroot_path = Path(chroot_path) if chroot_path else Path(BUILD_ROOT)
         self.cache_dir = Path(cache_dir) if cache_dir else Path(CACHE_PATH)
         self.logs_dir = Path("logs")
@@ -69,6 +72,29 @@ class PackageBuilder:
         # Set up signal handler for graceful cleanup
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
+    
+    def _ingest_report(self):
+        """Ingest build logs into report database after each package."""
+        if not self.no_reporting:
+            subprocess.run(["./generate_report.py"], capture_output=True)
+            self._sync_report_db()
+
+    def _sync_report_db(self):
+        """Copy report DB to served location if configured."""
+        try:
+            import configparser
+            cfg = configparser.ConfigParser()
+            cfg.read('config.ini')
+            served = cfg.get('paths', 'served_db_path', fallback='')
+            user = cfg.get('paths', 'repo_user', fallback='arch')
+            if served:
+                import sqlite3
+                conn = sqlite3.connect('reports/builds.db', timeout=10)
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.close()
+                subprocess.run(["sudo", "-u", user, "cp", "reports/builds.db", served], capture_output=True)
+        except Exception:
+            pass
     
     def _signal_handler(self, signum, frame):
         """
@@ -502,6 +528,24 @@ echo "CHECKDEPENDS_END"
         
         print(f"Building {len(packages)} packages...")
         
+        # Mark all packages as QUEUED in report DB
+        if not self.no_reporting:
+            try:
+                import sqlite3 as _sql
+                conn = _sql.connect('reports/builds.db', timeout=10)
+                import datetime as _dt
+                now = _dt.datetime.now().isoformat()
+                conn.execute('DELETE FROM builds WHERE status IN ("QUEUED", "BUILDING")')
+                for pkg in packages:
+                    conn.execute(
+                        "INSERT INTO builds (package,version,status,log_file,log_tail,recorded_at) VALUES (?,?,?,?,?,?)",
+                        (pkg['name'], pkg.get('version', ''), 'QUEUED', f"zzz-queued-{pkg['name']}", '', now))
+                conn.commit()
+                conn.close()
+                self._sync_report_db()
+            except Exception:
+                pass
+        
         # Set up build environment
         self.setup_chroot()
         import_gpg_keys()
@@ -634,6 +678,7 @@ echo "CHECKDEPENDS_END"
                         if self.stop_on_failure:
                             print(f"Stopping build process due to failure in {pkg['name']}")
                             break
+                    self._ingest_report()
             
             # Break out of stage loop if stop_on_failure triggered
             if self.stop_on_failure and failed_packages:
@@ -719,6 +764,18 @@ echo "CHECKDEPENDS_END"
             return False
         
         try:
+            # Mark as BUILDING in report DB
+            if not self.no_reporting:
+                try:
+                    import sqlite3 as _sql, datetime as _dt
+                    conn = _sql.connect('reports/builds.db', timeout=10)
+                    conn.execute("UPDATE builds SET status='BUILDING', started=? WHERE package=? AND status='QUEUED'",
+                                (_dt.datetime.now().strftime('%a %b %d %H:%M:%S %Y'), pkg_name))
+                    conn.commit()
+                    conn.close()
+                    self._sync_report_db()
+                except Exception:
+                    pass
             return self.build_package(pkg_name, pkg)
         except Exception as e:
             print(f"Unexpected exception building {pkg_name}: {e}")
@@ -935,8 +992,12 @@ def main():
                         help='Custom chroot directory path')
     parser.add_argument('--parallel-jobs', type=int, default=1,
                         help='Number of packages to build in parallel within the same stage (default: 1)')
+    parser.add_argument('--no-reporting', action='store_true',
+                        help='Skip updating the build report database')
     
     args = parser.parse_args()
+    
+    check_auto_builder_lock("build_packages.py")
     
     if not Path(args.json).exists():
         print(f"ERROR: Package file {args.json} not found")
@@ -951,7 +1012,8 @@ def main():
         no_upload=args.no_upload,
         stop_on_failure=args.stop_on_failure,
         preserve_chroot=args.preserve_chroot,
-        cleanup_on_failure=args.cleanup_on_failure
+        cleanup_on_failure=args.cleanup_on_failure,
+        no_reporting=args.no_reporting
     )
     
     exit_code = builder.build_packages(
@@ -960,6 +1022,11 @@ def main():
         args.continue_build,
         args.parallel_jobs
     )
+
+    # Ingest build logs into report database
+    if not args.no_reporting:
+        subprocess.run(["./generate_report.py"], capture_output=True)
+
     sys.exit(exit_code)
 
 if __name__ == "__main__":
