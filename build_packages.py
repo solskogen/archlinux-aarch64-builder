@@ -20,6 +20,7 @@ import os
 import subprocess
 import signal
 import argparse
+import datetime
 import threading
 from pathlib import Path
 from utils import (
@@ -68,6 +69,7 @@ class PackageBuilder:
         self.temp_copies_lock = threading.Lock()
         self.current_process = None
         self.preserved_chroot = None
+        self._interrupted = False
         
         # Set up signal handler for graceful cleanup
         signal.signal(signal.SIGINT, self._signal_handler)
@@ -80,22 +82,41 @@ class PackageBuilder:
             self._sync_report_db()
 
     def _sync_report_db(self):
-        """Copy report DB to served location if configured."""
+        """Update heartbeat, checkpoint WAL, and copy DB to served location."""
         try:
             import configparser
             cfg = configparser.ConfigParser()
             cfg.read('config.ini')
             served = cfg.get('paths', 'served_db_path', fallback='')
             user = cfg.get('paths', 'repo_user', fallback='arch')
+
+            import sqlite3
+            conn = sqlite3.connect('reports/builds.db', timeout=10)
+            conn.execute("INSERT OR REPLACE INTO repo_stats (key, value) VALUES ('last_check', ?)",
+                         (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),))
+            load_avg = os.getloadavg()
+            conn.execute("INSERT OR REPLACE INTO repo_stats (key, value) VALUES ('load_avg', ?)",
+                         (f"{load_avg[0]:.1f} {load_avg[1]:.1f} {load_avg[2]:.1f}",))
+            with open('/proc/meminfo') as f:
+                mi = {}
+                for line in f:
+                    parts = line.split()
+                    mi[parts[0].rstrip(':')] = int(parts[1])
+            mem_used = (mi['MemTotal'] - mi['MemAvailable']) // 1024
+            mem_total = mi['MemTotal'] // 1024
+            swap_used = (mi['SwapTotal'] - mi['SwapFree']) // 1024
+            swap_total = mi['SwapTotal'] // 1024
+            conn.execute("INSERT OR REPLACE INTO repo_stats (key, value) VALUES ('memory', ?)",
+                         (f"{mem_used}/{mem_total}MB ram, {swap_used}/{swap_total}MB swap",))
+            conn.commit()
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.close()
+
             if served:
-                import sqlite3
-                conn = sqlite3.connect('reports/builds.db', timeout=10)
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                conn.close()
                 subprocess.run(["sudo", "-u", user, "cp", "reports/builds.db", served], capture_output=True)
-        except Exception:
-            pass
-    
+        except Exception as e:
+            print(f"Warning: DB sync failed: {e}")
+
     def _signal_handler(self, signum, frame):
         """
         Graceful cleanup on Ctrl+C or termination signals.
@@ -104,13 +125,36 @@ class PackageBuilder:
         to prevent leaving the system in an inconsistent state.
         """
         print(f"\nReceived signal {signum}, cleaning up...")
+        self._interrupted = True
         if self.current_process:
             self.current_process.terminate()
             self.current_process.kill()
+
+        self.cleanup_temp_copies()
+        # Mark interrupted builds as ABORTED in report DB
+        if not self.no_reporting:
+            try:
+                import sqlite3 as _sql
+                conn = _sql.connect('reports/builds.db', timeout=10)
+                conn.execute('UPDATE builds SET status="ABORTED" WHERE status IN ("QUEUED", "BUILDING")')
+                conn.commit()
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                conn.close()
+                import configparser
+                cfg = configparser.ConfigParser()
+                cfg.read('config.ini')
+                served = cfg.get('paths', 'served_db_path', fallback='')
+                user = cfg.get('paths', 'repo_user', fallback='arch')
+                if served:
+                    subprocess.run(["sudo", "-u", user, "cp", "reports/builds.db", served])
+            except Exception:
+                pass
+        sys.exit(1)
+
     def cleanup_temp_copies(self):
         """Clean up all temporary chroots"""
         with self.temp_copies_lock:
-            for temp_copy in self.temp_copies[:]:  # Copy list to avoid modification during iteration
+            for temp_copy in self.temp_copies[:]:
                 try:
                     subprocess.run([
                         "sudo", "rm", "--recursive", "--force", "--one-file-system", str(temp_copy)
@@ -118,10 +162,6 @@ class PackageBuilder:
                     self.temp_copies.remove(temp_copy)
                 except Exception as e:
                     print(f"Warning: Failed to cleanup chroot {temp_copy}: {e}")
-
-        self.cleanup_temp_copies()
-        sys.exit(1)
-    
 
     def setup_chroot(self):
         """
@@ -535,11 +575,16 @@ echo "CHECKDEPENDS_END"
                 conn = _sql.connect('reports/builds.db', timeout=10)
                 import datetime as _dt
                 now = _dt.datetime.now().isoformat()
-                conn.execute('DELETE FROM builds WHERE status IN ("QUEUED", "BUILDING")')
+                conn.execute('DELETE FROM builds WHERE status IN ("QUEUED", "BUILDING", "ABORTED")')
                 for pkg in packages:
+                    display_name = pkg['name']
+                    if pkg.get('cycle_stage'):
+                        display_name = f"{pkg['name']} (stage {pkg['cycle_stage']})"
+                    # Remove old entries for this package (keep only the new QUEUED one)
+                    conn.execute("DELETE FROM builds WHERE package=?", (display_name,))
                     conn.execute(
                         "INSERT INTO builds (package,version,status,log_file,log_tail,recorded_at) VALUES (?,?,?,?,?,?)",
-                        (pkg['name'], pkg.get('version', ''), 'QUEUED', f"zzz-queued-{pkg['name']}", '', now))
+                        (display_name, pkg.get('version', ''), 'QUEUED', f"zzz-queued-{display_name}", '', now))
                 conn.commit()
                 conn.close()
                 self._sync_report_db()
@@ -605,9 +650,6 @@ echo "CHECKDEPENDS_END"
             build_stage = pkg.get('build_stage', 0)  # Default to stage 0 if missing
             stages[build_stage].append((i + 1, pkg))
         
-        if parallel_jobs > 1:
-            from concurrent.futures import ThreadPoolExecutor, as_completed
-        
         for stage_num in sorted(stages.keys()):
             stage_packages = stages[stage_num]
             
@@ -616,52 +658,99 @@ echo "CHECKDEPENDS_END"
             
             if parallel_jobs > 1 and len(stage_packages) > 1 and not has_cycle:
                 # Parallel build within stage (but not for cycle packages)
+                # Adaptive: reduce to 1 job if system load >= nproc
+                from concurrent.futures import ThreadPoolExecutor, as_completed
+                import multiprocessing
+                nproc = multiprocessing.cpu_count()
+
                 with ThreadPoolExecutor(max_workers=min(parallel_jobs, len(stage_packages))) as executor:
                     futures = {}
-                    for i, pkg in stage_packages:
-                        future = executor.submit(self._build_single_package, i, pkg, len(packages), 
+                    pending = list(stage_packages)
+
+                    def _effective_jobs():
+                        load1 = os.getloadavg()[0]
+                        if load1 >= nproc:
+                            return 1
+                        # Check CPU idle via mpstat (1 second sample)
+                        try:
+                            r = subprocess.run(['mpstat', '1', '1'], capture_output=True, text=True, timeout=5)
+                            idle = float(r.stdout.strip().split('\n')[-1].split()[-1])
+                            if idle < 10.0:  # Less than 10% idle = saturated
+                                return 1
+                        except Exception:
+                            pass
+                        return min(parallel_jobs, len(stage_packages))
+
+                    # Submit first job immediately
+                    if pending:
+                        i, pkg = pending.pop(0)
+                        future = executor.submit(self._build_single_package, i, pkg, len(packages),
                                                cycle_info, cycle_stage_1_success, provides_map, failed_packages,
                                                failed_lock, success_lock, cycle_lock)
                         futures[future] = (i, pkg)
-                    
+
                     should_stop = False
-                    for future in as_completed(futures):
-                        i, pkg = futures[future]
-                        try:
-                            success = future.result()
-                            if success:
-                                with success_lock:
-                                    successful_packages.append(pkg['name'])
-                                cycle_group = pkg.get('cycle_group')
-                                cycle_stage = pkg.get('cycle_stage')
-                                if cycle_group is not None and cycle_stage == 1:
-                                    with cycle_lock:
-                                        if cycle_group not in cycle_stage_1_success:
-                                            cycle_stage_1_success[cycle_group] = set()
-                                        cycle_stage_1_success[cycle_group].add(pkg['name'])
-                            else:
+                    while futures or pending:
+                        if should_stop or self._interrupted:
+                            break
+
+                        # Try to submit more work (one at a time, check load each time)
+                        if pending and len(futures) < _effective_jobs():
+                            i, pkg = pending.pop(0)
+                            future = executor.submit(self._build_single_package, i, pkg, len(packages),
+                                                   cycle_info, cycle_stage_1_success, provides_map, failed_packages,
+                                                   failed_lock, success_lock, cycle_lock)
+                            futures[future] = (i, pkg)
+                            # Don't submit another immediately - let this one ramp up
+                            # Fall through to the sleep to recheck load after a delay
+
+                        # Check for completed builds (non-blocking with timeout)
+                        completed = []
+                        for f in list(futures):
+                            if f.done():
+                                completed.append(f)
+                        
+                        if not completed and futures:
+                            # Nothing completed yet, wait then re-check
+                            # Short wait if we have pending jobs (to recheck load)
+                            # Longer wait if all jobs submitted (just waiting for completion)
+                            import time as _time
+                            _time.sleep(5 if pending else 20)
+                            continue
+
+                        for done in completed:
+                            i, pkg = futures.pop(done)
+                            try:
+                                success = done.result()
+                                if success:
+                                    with success_lock:
+                                        successful_packages.append(pkg['name'])
+                                    cycle_group = pkg.get('cycle_group')
+                                    cycle_stage = pkg.get('cycle_stage')
+                                    if cycle_group is not None and cycle_stage == 1:
+                                        with cycle_lock:
+                                            if cycle_group not in cycle_stage_1_success:
+                                                cycle_stage_1_success[cycle_group] = set()
+                                            cycle_stage_1_success[cycle_group].add(pkg['name'])
+                                else:
+                                    with failed_lock:
+                                        failed_packages.append(pkg)
+                                    if self.stop_on_failure:
+                                        print(f"Stopping build process due to failure in {pkg['name']}")
+                                        should_stop = True
+                            except Exception as e:
+                                print(f"Unexpected exception in parallel build: {e}")
                                 with failed_lock:
                                     failed_packages.append(pkg)
                                 if self.stop_on_failure:
-                                    print(f"Stopping build process due to failure in {pkg['name']}")
                                     should_stop = True
-                                    break
-                        except Exception as e:
-                            print(f"Unexpected exception in parallel build: {e}")
-                            with failed_lock:
-                                failed_packages.append(pkg)
-                            if self.stop_on_failure:
-                                should_stop = True
-                                break
-                    
-                    # Cancel remaining futures if stopping
-                    if should_stop:
-                        for remaining_future in futures:
-                            if not remaining_future.done():
-                                remaining_future.cancel()
+
+                            self._ingest_report()
             else:
                 # Sequential build (original behavior)
                 for i, pkg in stage_packages:
+                    if self._interrupted:
+                        break
                     success = self._build_single_package(i, pkg, len(packages), 
                                                         cycle_info, cycle_stage_1_success, provides_map, failed_packages,
                                                         failed_lock, success_lock, cycle_lock)
@@ -687,7 +776,9 @@ echo "CHECKDEPENDS_END"
             # Clean up all temp chroots after each stage (skip if there were failures)
             if not self.preserve_chroot and not failed_packages:
                 try:
-                    temp_dirs = list(self.chroot_path.glob("temp-*"))
+                    with self.temp_copies_lock:
+                        active = set(self.temp_copies)
+                    temp_dirs = [d for d in self.chroot_path.glob("temp-*") if d not in active]
                     for temp_dir in temp_dirs:
                         subprocess.run(["sudo", "rm", "-rf", str(temp_dir)], check=True)
                     if temp_dirs:
@@ -768,9 +859,14 @@ echo "CHECKDEPENDS_END"
             if not self.no_reporting:
                 try:
                     import sqlite3 as _sql, datetime as _dt
+                    display_name = pkg_name
+                    if pkg.get('cycle_stage'):
+                        display_name = f"{pkg_name} (stage {pkg['cycle_stage']})"
                     conn = _sql.connect('reports/builds.db', timeout=10)
                     conn.execute("UPDATE builds SET status='BUILDING', started=? WHERE package=? AND status='QUEUED'",
-                                (_dt.datetime.now().strftime('%a %b %d %H:%M:%S %Y'), pkg_name))
+                                (_dt.datetime.now().strftime('%a %b %d %H:%M:%S %Y'), display_name))
+                    conn.execute("INSERT OR REPLACE INTO repo_stats (key, value) VALUES ('last_check', ?)",
+                                (_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),))
                     conn.commit()
                     conn.close()
                     self._sync_report_db()
@@ -991,7 +1087,7 @@ def main():
     parser.add_argument('--chroot',
                         help='Custom chroot directory path')
     parser.add_argument('--parallel-jobs', type=int, default=1,
-                        help='Number of packages to build in parallel within the same stage (default: 1)')
+                        help='Max packages to build in parallel (default: 1). Adaptive: reduces to 1 when system load >= nproc. New jobs are submitted one at a time every 20s if load permits.')
     parser.add_argument('--no-reporting', action='store_true',
                         help='Skip updating the build report database')
     

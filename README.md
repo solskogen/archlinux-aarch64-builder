@@ -261,7 +261,7 @@ cat config.ini
 | `--cleanup-on-failure` | Delete temporary chroots even on build failure |
 | `--stop-on-failure` | Stop building on first package failure |
 | `--chroot DIR` | Custom chroot directory path |
-| `--parallel-jobs N` | Number of packages to build in parallel within the same stage (default: 1) |
+| `--parallel-jobs N` | Max packages to build in parallel (default: 1). Adaptive: reduces to 1 when system load >= nproc. New jobs are submitted one at a time every 20s if load permits. |
 
 #### repo_analyze.py
 

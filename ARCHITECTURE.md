@@ -112,7 +112,7 @@ The system automatically maintains ports of Arch Linux for multiple architecture
 - `--cleanup-on-failure`: Delete temporary chroots even on build failure
 - `--stop-on-failure`: Stop on first failure
 - `--chroot DIR`: Custom chroot directory
-- `--parallel-jobs N`: Number of packages to build in parallel within the same stage (default: 1)
+- `--parallel-jobs N`: Max packages to build in parallel (default: 1). Adaptive: reduces to 1 when system load >= nproc. New jobs submitted one at a time every 20s if load permits.
 
 **Build Process**:
 1. Create temporary chroot copy using `rsync`
