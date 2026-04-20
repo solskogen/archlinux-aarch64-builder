@@ -568,6 +568,8 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
         basename = pkg['basename']
         if basename not in target_bases:
             target_bases[basename] = {'version': pkg['version']}
+        elif is_version_newer(target_bases[basename]['version'], pkg['version']):
+            target_bases[basename] = {'version': pkg['version']}
     
     newer_in_x86 = []
     bin_package_warnings = []

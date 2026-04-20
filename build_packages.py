@@ -568,7 +568,7 @@ echo "CHECKDEPENDS_END"
         
         print(f"Building {len(packages)} packages...")
         
-        # Mark all packages as QUEUED in report DB
+        # Mark packages as QUEUED in report DB (skip already-built ones in --continue mode)
         if not self.no_reporting:
             try:
                 import sqlite3 as _sql
@@ -576,7 +576,13 @@ echo "CHECKDEPENDS_END"
                 import datetime as _dt
                 now = _dt.datetime.now().isoformat()
                 conn.execute('DELETE FROM builds WHERE status IN ("QUEUED", "BUILDING", "ABORTED")')
+                # Load already-successful packages for --continue mode
+                already_built = set()
+                if continue_build and Path("last_successful.txt").exists():
+                    already_built = set(Path("last_successful.txt").read_text().strip().split('\n'))
                 for pkg in packages:
+                    if pkg['name'] in already_built:
+                        continue
                     display_name = pkg['name']
                     if pkg.get('cycle_stage'):
                         display_name = f"{pkg['name']} (stage {pkg['cycle_stage']})"
@@ -779,11 +785,10 @@ echo "CHECKDEPENDS_END"
                     with self.temp_copies_lock:
                         active = set(self.temp_copies)
                     temp_dirs = [d for d in self.chroot_path.glob("temp-*") if d not in active]
-                    for temp_dir in temp_dirs:
-                        subprocess.run(["sudo", "rm", "-rf", str(temp_dir)], check=True)
                     if temp_dirs:
-                        print(f"Cleaned up {len(temp_dirs)} temporary chroots after stage {stage_num}")
-                except subprocess.CalledProcessError as e:
+                        subprocess.run(["sudo", "rm", "-rf"] + [str(d) for d in temp_dirs], check=True)
+                        print(f"Cleaned up {len(temp_dirs)} temporary chroots")
+                except Exception as e:
                     print(f"Warning: Failed to clean up temp chroots: {e}")
         
         # Save failed packages for retry

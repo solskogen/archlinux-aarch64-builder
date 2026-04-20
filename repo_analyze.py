@@ -242,6 +242,17 @@ def find_target_only(target_bases, target_packages, target_by_basename, x86_base
     return only
 
 
+def find_orphaned_split_packages(x86_packages, target_packages, x86_bases):
+    """Find target packages whose pkgbase exists in x86 but the package name was removed"""
+    orphans = []
+    for name, pkg in target_packages.items():
+        basename = pkg['basename']
+        if basename in x86_bases and name not in x86_packages:
+            filename = pkg.get('filename', f"{name}-{pkg['version']}-{pkg.get('arch', 'aarch64')}.pkg.tar.zst")
+            orphans.append(f"{name}: {pkg['version']} (pkgbase={basename}, repo={pkg['repo']}, file={filename})")
+    return orphans
+
+
 def print_section(title, items, show_empty=True):
     """Print a section with title and items"""
     if items:
@@ -273,6 +284,8 @@ def main():
                         help=f'Show packages where {target_arch} is newer')
     parser.add_argument('--target-only', action='store_true', 
                         help=f'Show {target_arch} only packages')
+    parser.add_argument('--orphaned', action='store_true',
+                        help='Show orphaned split packages (removed upstream but still in target)')
     parser.add_argument('--target-only-files', action='store_true',
                         help=f'Print filenames of {target_arch}-only packages in core/extra')
     # Legacy aliases
@@ -339,7 +352,7 @@ def main():
     
     # Determine what to show
     show_all = not any([args.outdated_any, args.missing_any, args.repo_issues, 
-                        args.target_newer, args.target_only])
+                        args.target_newer, args.target_only, args.orphaned])
     
     # Collect results
     results = {
@@ -389,6 +402,10 @@ def main():
     
     if show_all or args.target_newer:
         print_section(f"{target_arch} Newer Versions", results['target_newer'])
+    
+    if show_all or args.orphaned:
+        orphans = find_orphaned_split_packages(x86_packages, target_packages, x86_bases)
+        print_section("Orphaned Split Packages (removed upstream)", orphans)
     
     if show_all and not any(results.values()):
         print("No issues found")
