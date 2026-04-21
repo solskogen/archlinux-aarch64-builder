@@ -87,46 +87,16 @@ class PackageBuilder:
         signal.signal(signal.SIGTERM, self._signal_handler)
     
     def _ingest_report(self):
-        """Ingest build logs into report database after each package."""
+        """Update repo stats and sync heartbeat after each package."""
         if not self.no_reporting:
             subprocess.run(["./generate_report.py"], capture_output=True)
-            self._sync_report_db()
+            self._sync_heartbeat()
 
-    def _sync_report_db(self):
-        """Update heartbeat, checkpoint WAL, and copy DB to served location."""
-        try:
-            import configparser
-            cfg = configparser.ConfigParser()
-            cfg.read('config.ini')
-            served = cfg.get('paths', 'served_db_path', fallback='')
-            user = cfg.get('paths', 'repo_user', fallback='arch')
-
-            import sqlite3
-            conn = sqlite3.connect('reports/builds.db', timeout=10)
-            conn.execute("INSERT OR REPLACE INTO repo_stats (key, value) VALUES ('last_check', ?)",
-                         (datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),))
-            load_avg = os.getloadavg()
-            conn.execute("INSERT OR REPLACE INTO repo_stats (key, value) VALUES ('load_avg', ?)",
-                         (f"{load_avg[0]:.1f} {load_avg[1]:.1f} {load_avg[2]:.1f}",))
-            with open('/proc/meminfo') as f:
-                mi = {}
-                for line in f:
-                    parts = line.split()
-                    mi[parts[0].rstrip(':')] = int(parts[1])
-            mem_used = (mi['MemTotal'] - mi['MemAvailable']) // 1024
-            mem_total = mi['MemTotal'] // 1024
-            swap_used = (mi['SwapTotal'] - mi['SwapFree']) // 1024
-            swap_total = mi['SwapTotal'] // 1024
-            conn.execute("INSERT OR REPLACE INTO repo_stats (key, value) VALUES ('memory', ?)",
-                         (f"{mem_used}/{mem_total}MB ram, {swap_used}/{swap_total}MB swap",))
-            conn.commit()
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            conn.close()
-
-            if served:
-                subprocess.run(["sudo", "-u", user, "cp", "reports/builds.db", served], capture_output=True)
-        except Exception as e:
-            print(f"Warning: DB sync failed: {e}")
+    def _sync_heartbeat(self):
+        """Update heartbeat, load, and memory stats in DynamoDB."""
+        dr = self._get_dynamo()
+        if dr:
+            dr.sync_repo_stats()
 
     def _signal_handler(self, signum, frame):
         """
@@ -142,27 +112,11 @@ class PackageBuilder:
             self.current_process.kill()
 
         self.cleanup_temp_copies()
-        # Mark interrupted builds as ABORTED in report DB
+        # Mark interrupted builds as ABORTED
         if not self.no_reporting:
-            try:
-                import sqlite3 as _sql
-                conn = _sql.connect('reports/builds.db', timeout=10)
-                conn.execute('UPDATE builds SET status="ABORTED" WHERE status IN ("QUEUED", "BUILDING")')
-                conn.commit()
-                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                conn.close()
-                dr = self._get_dynamo()
-                if dr:
-                    dr.mark_aborted()
-                import configparser
-                cfg = configparser.ConfigParser()
-                cfg.read('config.ini')
-                served = cfg.get('paths', 'served_db_path', fallback='')
-                user = cfg.get('paths', 'repo_user', fallback='arch')
-                if served:
-                    subprocess.run(["sudo", "-u", user, "cp", "reports/builds.db", served])
-            except Exception:
-                pass
+            dr = self._get_dynamo()
+            if dr:
+                dr.mark_aborted()
         sys.exit(1)
 
     def cleanup_temp_copies(self):
@@ -589,34 +543,10 @@ echo "CHECKDEPENDS_END"
         
         print(f"Building {len(packages)} packages...")
         
-        # Mark packages as QUEUED in report DB (skip already-built ones in --continue mode)
-        if not self.no_reporting:
-            try:
-                import sqlite3 as _sql
-                conn = _sql.connect('reports/builds.db', timeout=10)
-                import datetime as _dt
-                now = _dt.datetime.now().isoformat()
-                conn.execute('DELETE FROM builds WHERE status IN ("QUEUED", "BUILDING", "ABORTED")')
-                # Load already-successful packages for --continue mode
-                already_built = set()
-                if continue_build and Path("last_successful.txt").exists():
-                    already_built = set(Path("last_successful.txt").read_text().strip().split('\n'))
-                for pkg in packages:
-                    if pkg['name'] in already_built:
-                        continue
-                    display_name = pkg['name']
-                    if pkg.get('cycle_stage'):
-                        display_name = f"{pkg['name']} (stage {pkg['cycle_stage']})"
-                    # Remove old entries for this package (keep only the new QUEUED one)
-                    conn.execute("DELETE FROM builds WHERE package=?", (display_name,))
-                    conn.execute(
-                        "INSERT INTO builds (package,version,status,log_file,log_tail,recorded_at) VALUES (?,?,?,?,?,?)",
-                        (display_name, pkg.get('version', ''), 'QUEUED', f"zzz-queued-{display_name}", '', now))
-                conn.commit()
-                conn.close()
-                self._sync_report_db()
-            except Exception:
-                pass
+        # Mark packages as QUEUED (skip already-built ones in --continue mode)
+        already_built = set()
+        if continue_build and Path("last_successful.txt").exists():
+            already_built = set(Path("last_successful.txt").read_text().strip().split('\n'))
         dr = self._get_dynamo()
         if dr and not self.dry_run:
             dr.mark_queued([p for p in packages if p['name'] not in already_built])
@@ -884,23 +814,6 @@ echo "CHECKDEPENDS_END"
             return False
         
         try:
-            # Mark as BUILDING in report DB
-            if not self.no_reporting:
-                try:
-                    import sqlite3 as _sql, datetime as _dt
-                    display_name = pkg_name
-                    if pkg.get('cycle_stage'):
-                        display_name = f"{pkg_name} (stage {pkg['cycle_stage']})"
-                    conn = _sql.connect('reports/builds.db', timeout=10)
-                    conn.execute("UPDATE builds SET status='BUILDING', started=? WHERE package=? AND status='QUEUED'",
-                                (_dt.datetime.now().strftime('%a %b %d %H:%M:%S %Y'), display_name))
-                    conn.execute("INSERT OR REPLACE INTO repo_stats (key, value) VALUES ('last_check', ?)",
-                                (_dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),))
-                    conn.commit()
-                    conn.close()
-                    self._sync_report_db()
-                except Exception:
-                    pass
             dr = self._get_dynamo()
             if dr:
                 dr.mark_building(pkg_name, pkg.get('version', ''))
