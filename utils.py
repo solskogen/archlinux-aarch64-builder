@@ -202,8 +202,8 @@ class ArchVersionComparator:
     
     @staticmethod
     def _has_git_revision(version_str: str) -> bool:
-        """Check if version contains git revision marker"""
-        return '+r' in version_str
+        """Check if version contains git revision marker like +r123.gabcdef"""
+        return bool(re.search(r'\+r\d+\.[a-g0-9]+', version_str))
     
     @staticmethod
     def _compare_git_versions(ver1: str, ver2: str) -> int:

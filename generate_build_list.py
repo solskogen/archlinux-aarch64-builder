@@ -562,6 +562,9 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
         basename = pkg['basename']
         if basename not in x86_bases:
             x86_bases[basename] = {'packages': [], 'version': pkg['version'], 'pkg_data': pkg}
+        elif is_version_newer(x86_bases[basename]['version'], pkg['version']):
+            x86_bases[basename]['version'] = pkg['version']
+            x86_bases[basename]['pkg_data'] = pkg
         x86_bases[basename]['packages'].append(name)
     
     for name, pkg in target_packages.items():

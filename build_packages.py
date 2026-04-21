@@ -39,6 +39,17 @@ class PackageBuilder:
     Manages chroot environments, dependency installation, package building,
     and cleanup operations. Supports dry-run mode and graceful interruption.
     """
+    _dynamo = None
+
+    @staticmethod
+    def _get_dynamo():
+        if PackageBuilder._dynamo is None:
+            try:
+                import dynamo_reporter
+                PackageBuilder._dynamo = dynamo_reporter
+            except ImportError:
+                PackageBuilder._dynamo = False
+        return PackageBuilder._dynamo if PackageBuilder._dynamo else None
     def __init__(self, dry_run=False, chroot_path=None, cache_dir=None, no_cache=False, no_upload=False, stop_on_failure=False, preserve_chroot=False, cleanup_on_failure=False, no_reporting=False):
         """
         Initialize the package builder.
@@ -140,6 +151,9 @@ class PackageBuilder:
                 conn.commit()
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
                 conn.close()
+                dr = self._get_dynamo()
+                if dr:
+                    dr.mark_aborted()
                 import configparser
                 cfg = configparser.ConfigParser()
                 cfg.read('config.ini')
@@ -427,6 +441,13 @@ echo "CHECKDEPENDS_END"
                     f.write(f"==> Build finished: {pkg_name} {version} ({end_time}) [{status}]\n")
             except Exception:
                 pass  # Don't fail if we can't write the footer
+            # Upload log and update DynamoDB
+            dr = self._get_dynamo()
+            if dr and not self.dry_run:
+                end_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+                dr.update_build_status(pkg_name, version, status,
+                                       repo=pkg_data.get('repo', 'extra'), finished=end_iso)
+                dr.upload_build_log(pkg_name, version, log_file)
         
         # Upload packages
         if not self.no_upload:
@@ -596,6 +617,9 @@ echo "CHECKDEPENDS_END"
                 self._sync_report_db()
             except Exception:
                 pass
+        dr = self._get_dynamo()
+        if dr and not self.dry_run:
+            dr.mark_queued([p for p in packages if p['name'] not in already_built])
         
         # Set up build environment
         self.setup_chroot()
@@ -877,6 +901,9 @@ echo "CHECKDEPENDS_END"
                     self._sync_report_db()
                 except Exception:
                     pass
+            dr = self._get_dynamo()
+            if dr:
+                dr.mark_building(pkg_name, pkg.get('version', ''))
             return self.build_package(pkg_name, pkg)
         except Exception as e:
             print(f"Unexpected exception building {pkg_name}: {e}")

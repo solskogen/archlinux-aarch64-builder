@@ -64,13 +64,20 @@ def find_package_name_mismatches(x86_bases, x86_by_basename, target_by_basename,
         x86_pkg_names = set(x86_by_basename[basename])
         target_pkg_names = set(target_by_basename[basename])
         
-        x86_only = {p for p in x86_pkg_names - target_pkg_names if p not in target_provides}
-        target_only = {p for p in target_pkg_names - x86_pkg_names if p not in x86_provides}
+        x86_only = x86_pkg_names - target_pkg_names
+        target_only = target_pkg_names - x86_pkg_names
         
         if x86_only or target_only:
             parts = []
             if x86_only:
-                parts.append(f"x86_64 has {', '.join(sorted(x86_only))}")
+                x86_details = []
+                for p in sorted(x86_only):
+                    # Check if provided by a target package
+                    if p in target_provides:
+                        x86_details.append(f"{p} (provided by {target_provides[p]})")
+                    else:
+                        x86_details.append(p)
+                parts.append(f"x86_64 has {', '.join(x86_details)}")
             if target_only:
                 target_with_files = []
                 for pkg_name in sorted(target_only):
@@ -140,6 +147,17 @@ def find_repo_issues(target_bases, x86_bases, target_repo_count, target_arch):
     for basename, repos in target_repo_count.items():
         if len(repos) > 1:
             issues.append(f"{basename}: present in {', '.join(sorted(repos))} on {target_arch}")
+    
+    # Check for cross-repo duplicates by parsing raw DB files
+    from utils import parse_database_file, get_target_architecture
+    _target_arch = get_target_architecture()
+    pkg_repos = {}  # pkg_name -> set of repos
+    for db_file, repo_name in [(f'core_{_target_arch}.db', 'core'), (f'extra_{_target_arch}.db', 'extra'), (f'forge_{_target_arch}.db', 'forge')]:
+        for name in parse_database_file(db_file, include_any=True):
+            pkg_repos.setdefault(name, set()).add(repo_name)
+    for name, repos in sorted(pkg_repos.items()):
+        if len(repos) > 1:
+            issues.append(f"{name}: present in {', '.join(sorted(repos))} on {target_arch}")
     
     # Repo mismatches between architectures
     for basename, target_data in target_bases.items():
