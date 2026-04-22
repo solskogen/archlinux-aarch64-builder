@@ -50,7 +50,7 @@ class PackageBuilder:
             except ImportError:
                 PackageBuilder._dynamo = False
         return PackageBuilder._dynamo if PackageBuilder._dynamo else None
-    def __init__(self, dry_run=False, chroot_path=None, cache_dir=None, no_cache=False, no_upload=False, stop_on_failure=False, preserve_chroot=False, cleanup_on_failure=False, no_reporting=False):
+    def __init__(self, dry_run=False, chroot_path=None, cache_dir=None, no_cache=False, no_upload=False, stop_on_failure=False, preserve_chroot=False, cleanup_on_failure=False, no_reporting=False, no_check=False):
         """
         Initialize the package builder.
         
@@ -73,6 +73,7 @@ class PackageBuilder:
         self.preserve_chroot = preserve_chroot
         self.cleanup_on_failure = cleanup_on_failure
         self.no_reporting = no_reporting
+        self.no_check = no_check
         self.chroot_path = Path(chroot_path) if chroot_path else Path(BUILD_ROOT)
         self.cache_dir = Path(cache_dir) if cache_dir else Path(CACHE_PATH)
         self.logs_dir = Path("logs")
@@ -87,9 +88,8 @@ class PackageBuilder:
         signal.signal(signal.SIGTERM, self._signal_handler)
     
     def _ingest_report(self):
-        """Update repo stats and sync heartbeat after each package."""
+        """Update heartbeat after each package."""
         if not self.no_reporting:
-            subprocess.run(["./generate_report.py"], capture_output=True)
             self._sync_heartbeat()
 
     def _sync_heartbeat(self):
@@ -241,7 +241,7 @@ class PackageBuilder:
         
         # Parse and install only checkdepends (makechrootpkg handles depends/makedepends)
         depends, makedepends, checkdepends = self._parse_pkgbuild_deps(pkg_dir)
-        if checkdepends:
+        if checkdepends and not self.no_check:
             print(f"Installing checkdepends: {' '.join(checkdepends)}")
             try:
                 env = os.environ.copy()
@@ -666,18 +666,21 @@ echo "CHECKDEPENDS_END"
                     futures = {}
                     pending = list(stage_packages)
 
+                    def _cpu_idle_pct():
+                        """CPU idle % from /proc/stat (two samples, 0.5s apart)."""
+                        import time as _t
+                        def _read():
+                            vals = [int(v) for v in open('/proc/stat').readline().split()[1:]]
+                            return vals[3] + vals[4], sum(vals)
+                        idle1, total1 = _read()
+                        _t.sleep(0.5)
+                        idle2, total2 = _read()
+                        dt = total2 - total1
+                        return ((idle2 - idle1) / dt * 100) if dt > 0 else 0
+
                     def _effective_jobs():
-                        load1 = os.getloadavg()[0]
-                        if load1 >= nproc:
+                        if _cpu_idle_pct() < 10.0:
                             return 1
-                        # Check CPU idle via mpstat (1 second sample)
-                        try:
-                            r = subprocess.run(['mpstat', '1', '1'], capture_output=True, text=True, timeout=5)
-                            idle = float(r.stdout.strip().split('\n')[-1].split()[-1])
-                            if idle < 10.0:  # Less than 10% idle = saturated
-                                return 1
-                        except Exception:
-                            pass
                         return min(parallel_jobs, len(stage_packages))
 
                     # Submit first job immediately
@@ -689,35 +692,20 @@ echo "CHECKDEPENDS_END"
                         futures[future] = (i, pkg)
 
                     should_stop = False
+                    import time as _time
                     while futures or pending:
                         if should_stop or self._interrupted:
                             break
 
-                        # Try to submit more work (one at a time, check load each time)
-                        if pending and len(futures) < _effective_jobs():
-                            i, pkg = pending.pop(0)
-                            future = executor.submit(self._build_single_package, i, pkg, len(packages),
-                                                   cycle_info, cycle_stage_1_success, provides_map, failed_packages,
-                                                   failed_lock, success_lock, cycle_lock)
-                            futures[future] = (i, pkg)
-                            # Don't submit another immediately - let this one ramp up
-                            # Fall through to the sleep to recheck load after a delay
+                        # Wait for at least one future to complete
+                        from concurrent.futures import wait, FIRST_COMPLETED
+                        if futures:
+                            done_set, _ = wait(futures.keys(), timeout=5, return_when=FIRST_COMPLETED)
+                        else:
+                            done_set = set()
 
-                        # Check for completed builds (non-blocking with timeout)
-                        completed = []
-                        for f in list(futures):
-                            if f.done():
-                                completed.append(f)
-                        
-                        if not completed and futures:
-                            # Nothing completed yet, wait then re-check
-                            # Short wait if we have pending jobs (to recheck load)
-                            # Longer wait if all jobs submitted (just waiting for completion)
-                            import time as _time
-                            _time.sleep(5 if pending else 20)
-                            continue
-
-                        for done in completed:
+                        # Process completions
+                        for done in done_set:
                             i, pkg = futures.pop(done)
                             try:
                                 success = done.result()
@@ -735,7 +723,6 @@ echo "CHECKDEPENDS_END"
                                     with failed_lock:
                                         failed_packages.append(pkg)
                                     if self.stop_on_failure:
-                                        print(f"Stopping build process due to failure in {pkg['name']}")
                                         should_stop = True
                             except Exception as e:
                                 print(f"Unexpected exception in parallel build: {e}")
@@ -744,7 +731,23 @@ echo "CHECKDEPENDS_END"
                                 if self.stop_on_failure:
                                     should_stop = True
 
-                            self._ingest_report()
+                            # Only ingest report for actual builds (not skips)
+                            if pkg['name'] not in already_built:
+                                self._ingest_report()
+
+                        # Fill available slots
+                        while pending:
+                            # No running builds = no CPU check needed (skips or fresh start)
+                            if futures and len(futures) >= _effective_jobs():
+                                break
+                            if not futures and len(pending) > 0:
+                                pass  # No builds running, submit freely
+                            i, pkg = pending.pop(0)
+                            future = executor.submit(self._build_single_package, i, pkg, len(packages),
+                                                   cycle_info, cycle_stage_1_success, provides_map, failed_packages,
+                                                   failed_lock, success_lock, cycle_lock)
+                            futures[future] = (i, pkg)
+
             else:
                 # Sequential build (original behavior)
                 for i, pkg in stage_packages:
@@ -1074,6 +1077,8 @@ def main():
                         help='Max packages to build in parallel (default: 1). Adaptive: reduces to 1 when system load >= nproc. New jobs are submitted one at a time every 20s if load permits.')
     parser.add_argument('--no-reporting', action='store_true',
                         help='Skip updating the build report database')
+    parser.add_argument('--no-check', action='store_true',
+                        help='Skip installing checkdepends and running check()')
     
     args = parser.parse_args()
     
@@ -1093,7 +1098,8 @@ def main():
         stop_on_failure=args.stop_on_failure,
         preserve_chroot=args.preserve_chroot,
         cleanup_on_failure=args.cleanup_on_failure,
-        no_reporting=args.no_reporting
+        no_reporting=args.no_reporting,
+        no_check=args.no_check
     )
     
     exit_code = builder.build_packages(
