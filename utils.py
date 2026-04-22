@@ -139,6 +139,16 @@ class ArchVersionComparator:
         Compare two Arch Linux version strings.
         Returns: -1 if version1 < version2, 0 if equal, 1 if version1 > version2
         """
+        # Use pacman's vercmp if available (authoritative for Arch)
+        try:
+            result = subprocess.run(['vercmp', version1, version2],
+                                   capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                v = int(result.stdout.strip())
+                return -1 if v < 0 else (1 if v > 0 else 0)
+        except Exception:
+            pass
+        
         epoch1, ver1 = ArchVersionComparator._split_epoch_version(version1)
         epoch2, ver2 = ArchVersionComparator._split_epoch_version(version2)
         
@@ -202,8 +212,8 @@ class ArchVersionComparator:
     
     @staticmethod
     def _has_git_revision(version_str: str) -> bool:
-        """Check if version contains git revision marker like +r123.gabcdef"""
-        return bool(re.search(r'\+r\d+\.[a-g0-9]+', version_str))
+        """Check if version contains git revision marker like +r123.gabcdef or +r123+gabcdef"""
+        return bool(re.search(r'\+r\d+[.+][a-g][a-f0-9]+', version_str))
     
     @staticmethod
     def _compare_git_versions(ver1: str, ver2: str) -> int:

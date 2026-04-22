@@ -312,6 +312,28 @@ echo "CHECKDEPENDS_END"
         
         return depends, makedepends, checkdepends
 
+    @staticmethod
+    def _read_cpu_ticks():
+        """Read aggregate CPU ticks from /proc/stat. Returns (busy, total)."""
+        try:
+            vals = [int(v) for v in open("/proc/stat").readline().split()[1:]]
+            idle = vals[3] + vals[4]  # idle + iowait
+            total = sum(vals)
+            return total - idle, total
+        except Exception:
+            return None, None
+
+    @staticmethod
+    def _read_mem_available_mb():
+        """Read MemAvailable from /proc/meminfo in MB."""
+        try:
+            for line in open("/proc/meminfo"):
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+        except Exception:
+            pass
+        return None
+
     def _execute_build(self, pkg_name, pkg_data, temp_copy_path, pkg_dir, log_file):
         """Execute the actual package build"""
         env = os.environ.copy()
@@ -344,7 +366,10 @@ echo "CHECKDEPENDS_END"
         
         # Get formatted start time
         start_time = subprocess.run(['date', '+%a %b %d %H:%M:%S %Y'], capture_output=True, text=True).stdout.strip()
+        build_start_ts = datetime.datetime.now(datetime.timezone.utc)
         version = pkg_data.get('version', 'unknown')
+        cpu_before = self._read_cpu_ticks()
+        mem_before = self._read_mem_available_mb()
         
         build_success = False
         try:
@@ -399,8 +424,22 @@ echo "CHECKDEPENDS_END"
             dr = self._get_dynamo()
             if dr and not self.dry_run:
                 end_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+                dur = int((datetime.datetime.now(datetime.timezone.utc) - build_start_ts).total_seconds())
+                avg_cpu_pct = None
+                cpu_after = self._read_cpu_ticks()
+                if cpu_before[0] is not None and cpu_after[0] is not None:
+                    d_busy = cpu_after[0] - cpu_before[0]
+                    d_total = cpu_after[1] - cpu_before[1]
+                    if d_total > 0:
+                        avg_cpu_pct = round(d_busy / d_total * 100, 1)
+                peak_mem_mb = None
+                mem_after = self._read_mem_available_mb()
+                if mem_before is not None and mem_after is not None and mem_before > mem_after:
+                    peak_mem_mb = mem_before - mem_after
                 dr.update_build_status(pkg_name, version, status,
-                                       repo=pkg_data.get('repo', 'extra'), finished=end_iso)
+                                       repo=pkg_data.get('repo', 'extra'), finished=end_iso,
+                                       duration_secs=dur, avg_cpu_pct=avg_cpu_pct,
+                                       peak_mem_mb=peak_mem_mb)
                 dr.upload_build_log(pkg_name, version, log_file)
         
         # Upload packages

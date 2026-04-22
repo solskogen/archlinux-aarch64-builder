@@ -3,8 +3,8 @@
 Bootstrap toolchain builder for Arch Linux packages.
 
 Builds core toolchain packages (gcc, glibc, binutils, etc.) in a specific order
-required for a complete toolchain rebuild. Has special handling for gcc/glibc
-which must be manually checked out from special repositories.
+required for a complete toolchain rebuild. Has special handling for gcc
+which is checked out from a custom repository.
 """
 import subprocess
 import os
@@ -14,6 +14,11 @@ import argparse
 import signal
 from pathlib import Path
 from utils import BuildUtils, BUILD_ROOT, CACHE_PATH, upload_packages, get_target_architecture
+
+try:
+    import dynamo_reporter as dr
+except ImportError:
+    dr = None
 
 # Special repository configuration
 GCC_REPO_URL = "https://gitlab.archlinux.org/solskogen/gcc.git"
@@ -131,6 +136,17 @@ class BootstrapBuilder(BuildUtils):
         all_toolchain = STAGE1_PACKAGES + ["gcc-libs"]
         target_repo = "extra-testing" if pkg_name == "valgrind" else "core-testing"
         
+        # Get version from PKGBUILD
+        pkg_version = "unknown"
+        try:
+            import shlex
+            r = subprocess.run(['bash', '-c', f'cd {shlex.quote(str(pkg_dir))} && source PKGBUILD && echo "$pkgver-$pkgrel"'],
+                             capture_output=True, text=True, timeout=10)
+            if r.returncode == 0 and r.stdout.strip():
+                pkg_version = r.stdout.strip()
+        except Exception:
+            pass
+        
         if self.dry_run:
             self.format_dry_run(f"Would bootstrap build {pkg_name}", [
                 f"arch-nspawn {self.chroot_path}/root pacman -Syu --noconfirm {' '.join(all_toolchain)}",
@@ -162,6 +178,12 @@ class BootstrapBuilder(BuildUtils):
         try:
             env = os.environ.copy()
             env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
+            
+            if dr:
+                dr.mark_building(pkg_name, pkg_version)
+            
+            import datetime
+            build_start = datetime.datetime.now(datetime.timezone.utc)
             
             use_ignorearch = not self.check_arch_in_pkgbuild(pkg_dir)
             
@@ -199,12 +221,22 @@ class BootstrapBuilder(BuildUtils):
                     f.write(''.join(output_lines))
                 print(f"ERROR: Bootstrap build failed for {pkg_name} (return code: {process.returncode})")
                 print(f"Build log written to {log_file}")
+                if dr:
+                    end_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+                    dur = int((datetime.datetime.now(datetime.timezone.utc) - build_start).total_seconds())
+                    dr.update_build_status(pkg_name, pkg_version, 'FAILED', repo='core', finished=end_iso, duration_secs=dur)
+                    dr.upload_build_log(pkg_name, pkg_version, log_file)
                 sys.exit(1)
             
             # Upload to appropriate testing repository
             target_repo = "extra-testing" if pkg_name == "valgrind" else "core-testing"
             uploaded_count = upload_packages(pkg_dir, target_repo, self.dry_run)
             print(f"Successfully uploaded {uploaded_count} packages to {target_repo}")
+            
+            if dr:
+                end_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+                dur = int((datetime.datetime.now(datetime.timezone.utc) - build_start).total_seconds())
+                dr.update_build_status(pkg_name, pkg_version, 'SUCCESS', repo='core', finished=end_iso, duration_secs=dur)
             
             # Clear cache after successful build to force using newly uploaded packages
             self.clear_cache()
@@ -268,9 +300,23 @@ class BootstrapBuilder(BuildUtils):
             # Regular Arch packages - use pkgctl
             if pkg_dir.exists():
                 if self.dry_run:
-                    self.format_dry_run(f"Would update {pkg_name}", [f"pkgctl repo clone {pkg_name} (updates existing)"])
+                    self.format_dry_run(f"Would update {pkg_name}", [f"git pull in {pkg_dir}"])
                 else:
-                    print(f"✓ Using existing {pkg_name}")
+                    try:
+                        stash_result = subprocess.run(["git", "stash"], cwd=pkg_dir, check=True, capture_output=True, text=True)
+                        has_changes = "No local changes to save" not in stash_result.stdout
+                        self.run_command(["git", "fetch", "--tags"], cwd=pkg_dir)
+                        self.run_command(["git", "reset", "--hard", "origin/main"], cwd=pkg_dir)
+                        if has_changes:
+                            try:
+                                subprocess.run(["git", "stash", "pop"], cwd=pkg_dir, check=True, capture_output=True, text=True)
+                            except subprocess.CalledProcessError:
+                                print(f"ERROR: Failed to restore stashed changes for {pkg_name}")
+                                print(f"Please resolve conflicts in {pkg_dir} and run again.")
+                                sys.exit(1)
+                        print(f"✓ Updated {pkg_name}")
+                    except subprocess.CalledProcessError as e:
+                        print(f"Warning: Failed to update {pkg_name}, using existing")
             else:
                 if self.dry_run:
                     self.format_dry_run(f"Would clone {pkg_name}", [f"pkgctl repo clone {pkg_name}"])
