@@ -1287,6 +1287,9 @@ if __name__ == "__main__":
     git_group.add_argument('--use-latest', action='store_true',
                         help='Use latest git commit of package source instead of version tag when building')
     
+    parser.add_argument('--no-check', action='store_true',
+                        help='Exclude checkdepends from dependency resolution')
+    
     args = parser.parse_args()
     
     check_auto_builder_lock("generate_build_list.py")
@@ -1617,6 +1620,12 @@ if __name__ == "__main__":
     if newer_packages:
         log("Processing PKGBUILDs for complete dependency information...")
         newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, full_x86_packages, target_packages)
+        
+        # Strip checkdepends if --no-check
+        if args.no_check:
+            for pkg in newer_packages:
+                pkg['checkdepends'] = []
+                pkg['build_checkdepends'] = []
         
         if full_x86_packages:
             log("Checking for missing dependencies (including checkdepends)...")
