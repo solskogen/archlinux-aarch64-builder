@@ -655,147 +655,192 @@ echo "CHECKDEPENDS_END"
                     cycle_info[cycle_group] = set()
                 cycle_info[cycle_group].add(pkg['name'])
         
-        # Group packages by build stage
+        # Build dependency-ready queue instead of stage-based execution
+        # Each package starts as soon as its own dependencies are done
         from collections import defaultdict
-        stages = defaultdict(list)
+        from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
+        import time as _time
+
+        def _cpu_idle_pct():
+            def _read():
+                vals = [int(v) for v in open('/proc/stat').readline().split()[1:]]
+                return vals[3] + vals[4], sum(vals)
+            idle1, total1 = _read()
+            _time.sleep(0.5)
+            idle2, total2 = _read()
+            dt = total2 - total1
+            return ((idle2 - idle1) / dt * 100) if dt > 0 else 0
+
+        def _effective_jobs():
+            if _cpu_idle_pct() < 10.0:
+                return 1
+            return parallel_jobs
+
+        # Build remaining_deps: for each package, which in-list packages must complete first
+        all_pkg_names = {pkg['name'] for pkg in packages[start_index:]}
+        # Map dep names to build-list package names via provides
+        def resolve_dep(dep_name):
+            if dep_name in all_pkg_names:
+                return dep_name
+            return provides_map.get(dep_name)
+
+        remaining_deps = {}  # pkg_key -> set of pkg_names it waits on
+        pkg_by_key = {}      # pkg_key -> (index, pkg)
         for i, pkg in enumerate(packages[start_index:], start_index):
-            build_stage = pkg.get('build_stage', 0)  # Default to stage 0 if missing
-            stages[build_stage].append((i + 1, pkg))
-        
-        for stage_num in sorted(stages.keys()):
-            stage_packages = stages[stage_num]
-            
-            # Check if any packages in this stage are in a cycle
-            has_cycle = any(pkg.get('cycle_group') is not None for _, pkg in stage_packages)
-            
-            if parallel_jobs > 1 and len(stage_packages) > 1 and not has_cycle:
-                # Parallel build within stage (but not for cycle packages)
-                # Adaptive: reduce to 1 job if system load >= nproc
-                from concurrent.futures import ThreadPoolExecutor, as_completed
-                import multiprocessing
-                nproc = multiprocessing.cpu_count()
+            pkg_name = pkg['name']
+            cycle_stage = pkg.get('cycle_stage')
+            cycle_group = pkg.get('cycle_group')
+            # Unique key: name for normal, name#stage for cycle
+            key = f"{pkg_name}#s{cycle_stage}" if cycle_stage else pkg_name
+            pkg_by_key[key] = (i + 1, pkg)
 
-                with ThreadPoolExecutor(max_workers=min(parallel_jobs, len(stage_packages))) as executor:
-                    futures = {}
-                    pending = list(stage_packages)
+            deps = set()
+            if cycle_stage == 2:
+                # Stage 2 depends on all stage 1 packages in same cycle
+                if cycle_group is not None and cycle_group in cycle_info:
+                    for cn in cycle_info[cycle_group]:
+                        deps.add(f"{cn}#s1")
+            else:
+                # Normal deps from filtered dependency lists
+                for dep_type in ['depends', 'makedepends', 'checkdepends']:
+                    for dep_str in pkg.get(dep_type, []):
+                        dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+                        resolved = resolve_dep(dep_name)
+                        if resolved and resolved != pkg_name and resolved in all_pkg_names:
+                            # Find the right key (might be a cycle stage 2 dep, but we want the latest)
+                            # For cycle packages, depend on stage 2 if it exists, else stage 1
+                            if f"{resolved}#s2" in pkg_by_key:
+                                deps.add(f"{resolved}#s2")
+                            elif f"{resolved}#s1" in pkg_by_key:
+                                deps.add(f"{resolved}#s1")
+                            else:
+                                deps.add(resolved)
+            remaining_deps[key] = deps
 
-                    def _cpu_idle_pct():
-                        """CPU idle % from /proc/stat (two samples, 0.5s apart)."""
-                        import time as _t
-                        def _read():
-                            vals = [int(v) for v in open('/proc/stat').readline().split()[1:]]
-                            return vals[3] + vals[4], sum(vals)
-                        idle1, total1 = _read()
-                        _t.sleep(0.5)
-                        idle2, total2 = _read()
-                        dt = total2 - total1
-                        return ((idle2 - idle1) / dt * 100) if dt > 0 else 0
+        completed_keys = set()
+        failed_keys = set()
+        should_stop = False
 
-                    def _effective_jobs():
-                        if _cpu_idle_pct() < 10.0:
-                            return 1
-                        return min(parallel_jobs, len(stage_packages))
+        if parallel_jobs > 1:
+            with ThreadPoolExecutor(max_workers=parallel_jobs) as executor:
+                futures = {}  # future -> key
 
-                    # Submit first job immediately
-                    if pending:
-                        i, pkg = pending.pop(0)
-                        future = executor.submit(self._build_single_package, i, pkg, len(packages),
-                                               cycle_info, cycle_stage_1_success, provides_map, failed_packages,
-                                               failed_lock, success_lock, cycle_lock)
-                        futures[future] = (i, pkg)
-
-                    should_stop = False
-                    from concurrent.futures import wait, FIRST_COMPLETED
-                    import time as _time
-                    while futures or pending:
-                        if should_stop or self._interrupted:
-                            break
-
-                        # Quick check for completed futures
-                        done_set = {f for f in futures if f.done()}
-                        if not done_set and futures:
-                            _time.sleep(5)
+                def get_ready():
+                    """Return list of keys whose deps are all satisfied."""
+                    ready = []
+                    for key, deps in remaining_deps.items():
+                        if key in completed_keys or key in failed_keys:
                             continue
+                        if key in [futures[f] for f in futures]:
+                            continue  # already submitted
+                        if deps <= (completed_keys | already_built):
+                            ready.append(key)
+                    return ready
 
-                        # Process completions
-                        for done in done_set:
-                            i, pkg = futures.pop(done)
-                            try:
-                                success = done.result()
-                                if success:
-                                    with success_lock:
-                                        successful_packages.append(pkg['name'])
-                                    cycle_group = pkg.get('cycle_group')
-                                    cycle_stage = pkg.get('cycle_stage')
-                                    if cycle_group is not None and cycle_stage == 1:
-                                        with cycle_lock:
-                                            if cycle_group not in cycle_stage_1_success:
-                                                cycle_stage_1_success[cycle_group] = set()
-                                            cycle_stage_1_success[cycle_group].add(pkg['name'])
-                                else:
-                                    with failed_lock:
-                                        failed_packages.append(pkg)
-                                    if self.stop_on_failure:
-                                        should_stop = True
-                            except Exception as e:
-                                print(f"Unexpected exception in parallel build: {e}")
+                # Submit initial ready packages
+                for key in get_ready():
+                    i, pkg = pkg_by_key[key]
+                    future = executor.submit(self._build_single_package, i, pkg, len(packages),
+                                           cycle_info, cycle_stage_1_success, provides_map, failed_packages,
+                                           failed_lock, success_lock, cycle_lock)
+                    futures[future] = key
+
+                while futures or any(k not in completed_keys and k not in failed_keys and k not in [futures[f] for f in futures] for k in remaining_deps):
+                    if should_stop or self._interrupted:
+                        break
+
+                    # Quick poll for completions
+                    done_set = {f for f in futures if f.done()}
+                    if not done_set and futures:
+                        _time.sleep(5)
+                        done_set = {f for f in futures if f.done()}
+                    if not done_set and futures:
+                        continue
+
+                    # Process completions
+                    for done in done_set:
+                        key = futures.pop(done)
+                        i, pkg = pkg_by_key[key]
+                        try:
+                            success = done.result()
+                            if success:
+                                completed_keys.add(key)
+                                # Also mark the base name as completed for dep resolution
+                                completed_keys.add(pkg['name'])
+                                with success_lock:
+                                    successful_packages.append(pkg['name'])
+                                cycle_group = pkg.get('cycle_group')
+                                cycle_stage = pkg.get('cycle_stage')
+                                if cycle_group is not None and cycle_stage == 1:
+                                    with cycle_lock:
+                                        if cycle_group not in cycle_stage_1_success:
+                                            cycle_stage_1_success[cycle_group] = set()
+                                        cycle_stage_1_success[cycle_group].add(pkg['name'])
+                            else:
+                                failed_keys.add(key)
+                                failed_keys.add(pkg['name'])
                                 with failed_lock:
                                     failed_packages.append(pkg)
                                 if self.stop_on_failure:
                                     should_stop = True
+                        except Exception as e:
+                            print(f"Unexpected exception in parallel build: {e}")
+                            failed_keys.add(key)
+                            with failed_lock:
+                                failed_packages.append(pkg)
+                            if self.stop_on_failure:
+                                should_stop = True
 
-                            # Heartbeat handled per-stage, not per-package
-
-                        # Fill available slots
-                        while pending:
-                            if futures and len(futures) >= _effective_jobs():
-                                break
-                            i, pkg = pending.pop(0)
-                            future = executor.submit(self._build_single_package, i, pkg, len(packages),
-                                                   cycle_info, cycle_stage_1_success, provides_map, failed_packages,
-                                                   failed_lock, success_lock, cycle_lock)
-                            futures[future] = (i, pkg)
-            else:
-                # Sequential build (original behavior)
-                for i, pkg in stage_packages:
-                    if self._interrupted:
-                        break
-                    success = self._build_single_package(i, pkg, len(packages), 
-                                                        cycle_info, cycle_stage_1_success, provides_map, failed_packages,
-                                                        failed_lock, success_lock, cycle_lock)
-                    if success:
-                        successful_packages.append(pkg['name'])
-                        cycle_group = pkg.get('cycle_group')
-                        cycle_stage = pkg.get('cycle_stage')
-                        if cycle_group is not None and cycle_stage == 1:
-                            if cycle_group not in cycle_stage_1_success:
-                                cycle_stage_1_success[cycle_group] = set()
-                            cycle_stage_1_success[cycle_group].add(pkg['name'])
-                    else:
-                        failed_packages.append(pkg)
-                        if self.stop_on_failure:
-                            print(f"Stopping build process due to failure in {pkg['name']}")
+                    # Submit newly ready packages
+                    for key in get_ready():
+                        if futures and len(futures) >= _effective_jobs():
                             break
+                        i, pkg = pkg_by_key[key]
+                        future = executor.submit(self._build_single_package, i, pkg, len(packages),
+                                               cycle_info, cycle_stage_1_success, provides_map, failed_packages,
+                                               failed_lock, success_lock, cycle_lock)
+                        futures[future] = key
+
+                    # Periodic heartbeat
                     self._ingest_report()
-            
-            # Break out of stage loop if stop_on_failure triggered
-            if self.stop_on_failure and failed_packages:
-                break
-            
-            # Sync heartbeat after each stage
-            self._ingest_report()
-            
-            # Clean up temp chroots after each stage (skip if there were failures)
-            if not self.preserve_chroot and not failed_packages:
-                try:
-                    with self.temp_copies_lock:
-                        active = set(self.temp_copies)
-                    temp_dirs = [d for d in self.chroot_path.glob("temp-*") if d not in active]
-                    if temp_dirs:
-                        subprocess.run(["sudo", "rm", "-rf"] + [str(d) for d in temp_dirs], check=True)
-                except Exception:
-                    pass
-        
+        else:
+            # Sequential build: process in original order
+            for key in remaining_deps:
+                if self._interrupted:
+                    break
+                i, pkg = pkg_by_key[key]
+                success = self._build_single_package(i, pkg, len(packages),
+                                                    cycle_info, cycle_stage_1_success, provides_map, failed_packages,
+                                                    failed_lock, success_lock, cycle_lock)
+                if success:
+                    completed_keys.add(key)
+                    completed_keys.add(pkg['name'])
+                    successful_packages.append(pkg['name'])
+                    cycle_group = pkg.get('cycle_group')
+                    cycle_stage = pkg.get('cycle_stage')
+                    if cycle_group is not None and cycle_stage == 1:
+                        if cycle_group not in cycle_stage_1_success:
+                            cycle_stage_1_success[cycle_group] = set()
+                        cycle_stage_1_success[cycle_group].add(pkg['name'])
+                else:
+                    failed_keys.add(key)
+                    failed_packages.append(pkg)
+                    if self.stop_on_failure:
+                        print(f"Stopping build process due to failure in {pkg['name']}")
+                        break
+                self._ingest_report()
+
+        # Clean up temp chroots
+        if not self.preserve_chroot and not failed_packages:
+            try:
+                with self.temp_copies_lock:
+                    active = set(self.temp_copies)
+                temp_dirs = [d for d in self.chroot_path.glob("temp-*") if d not in active]
+                if temp_dirs:
+                    subprocess.run(["sudo", "rm", "-rf"] + [str(d) for d in temp_dirs], check=True)
+            except Exception:
+                pass
+
         # Save failed packages for retry
         if failed_packages:
             failed_file = Path("failed_packages.json")
