@@ -98,7 +98,6 @@ class PackageBuilder:
         dr = self._get_dynamo()
         if dr:
             dr.sync_repo_stats()
-            dr.update_status_counts()
 
     def _signal_handler(self, signum, frame):
         """
@@ -374,7 +373,13 @@ echo "CHECKDEPENDS_END"
         mem_before = self._read_mem_available_mb()
         
         build_success = False
+        bid = self._build_ids.get(pkg_name, "")
+        live_log = None
         try:
+            if bid and not self.dry_run:
+                from dynamo_reporter import LiveLogUploader
+                live_log = LiveLogUploader(pkg_name, bid, log_file)
+                live_log.__enter__()
             with open(log_file, 'w') as f:
                 # Write start header
                 f.write(f"==> Build started: {pkg_name} {version} ({start_time})\n")
@@ -414,6 +419,8 @@ echo "CHECKDEPENDS_END"
             print(f"\nBuild interrupted for {pkg_name}")
             sys.exit(1)
         finally:
+            if live_log:
+                live_log.__exit__(None, None, None)
             # Always write end footer
             end_time = subprocess.run(['date', '+%a %b %d %H:%M:%S %Y'], capture_output=True, text=True).stdout.strip()
             status = "SUCCESS" if build_success else "FAILED"
