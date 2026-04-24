@@ -32,7 +32,7 @@ config.read('config.ini')
 
 # Configuration constants
 BUILD_ROOT = config.get('build', 'build_root', fallback='/scratch/builder')
-CACHE_PATH = f"{BUILD_ROOT}/pacman-cache"
+CACHE_PATH = config.get('build', 'cache_path', fallback=f"{BUILD_ROOT}/pacman-cache")
 UPLOAD_BUCKET = config.get('build', 'upload_bucket')
 X86_64_MIRROR = config.get('build', 'x86_64_mirror', fallback='https://geo.mirror.pkgbuild.com')
 LOG_RETENTION_COUNT = 3

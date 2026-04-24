@@ -41,6 +41,11 @@ class PackageBuilder:
     """
     _dynamo = None
 
+    # Packages that cannot build concurrently (e.g., port conflicts in tests)
+    MUTEX_GROUPS = [
+        {'firefox', 'firefox-developer-edition'},
+    ]
+
     @staticmethod
     def _get_dynamo():
         if PackageBuilder._dynamo is None:
@@ -792,14 +797,24 @@ echo "CHECKDEPENDS_END"
                                 should_stop = True
 
                     # Submit newly ready packages
+                    running_names = {pkg_by_key[futures[f]][1]['name'] for f in futures}
                     for key in get_ready():
                         if futures and len(futures) >= _effective_jobs():
                             break
                         i, pkg = pkg_by_key[key]
+                        # Check mutex groups - skip if a conflicting package is running
+                        skip_mutex = False
+                        for group in self.MUTEX_GROUPS:
+                            if pkg['name'] in group and running_names & group:
+                                skip_mutex = True
+                                break
+                        if skip_mutex:
+                            continue
                         future = executor.submit(self._build_single_package, i, pkg, len(packages),
                                                cycle_info, cycle_stage_1_success, provides_map, failed_packages,
                                                failed_lock, success_lock, cycle_lock)
                         futures[future] = key
+                        running_names.add(pkg['name'])
 
                     # Periodic heartbeat
                     self._ingest_report()

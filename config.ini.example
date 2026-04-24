@@ -1,3 +1,4 @@
 [build]
 build_root = /scratch/builder
+cache_path = /scratch/builder/pacman-cache
 upload_bucket = arch-linux-repos.drzee.net
