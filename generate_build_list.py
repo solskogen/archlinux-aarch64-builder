@@ -234,7 +234,10 @@ def fetch_pkgbuild_deps(packages_to_build, no_update=False, full_x86_packages=No
     blacklisted_packages = [pkg for pkg in packages_to_build if pkg.get('skip', 0) == 1]
     
     total = len(packages_to_fetch)
-    for i, pkg in enumerate(packages_to_fetch, 1):
+    
+    def _fetch_one(i_pkg):
+        """Fetch/update a single package's PKGBUILD. Returns False to skip, raises SystemExit to abort."""
+        i, pkg = i_pkg
         name = pkg['name']
         basename = pkg.get('basename', name)  # Use basename for git operations
         pkgbuild_directory = Path(PKGBUILDS_DIR) / basename
@@ -295,6 +298,15 @@ echo "$fullver"
                         pkgctl_cmd.append(basename)
                         result = subprocess.run(pkgctl_cmd, cwd=PKGBUILDS_DIR, check=True, 
                                              capture_output=True, text=True)
+                        # pkgctl configure sets HTTPS for non-official packagers; force SSH
+                        pkg_repo = Path(PKGBUILDS_DIR) / basename
+                        if pkg_repo.exists():
+                            cur_url = subprocess.run(["git", "config", "remote.origin.url"],
+                                                    cwd=pkg_repo, capture_output=True, text=True).stdout.strip()
+                            if cur_url.startswith("https://gitlab.archlinux.org/"):
+                                ssh_url = cur_url.replace("https://gitlab.archlinux.org/", "git@gitlab.archlinux.org:")
+                                subprocess.run(["git", "remote", "set-url", "origin", ssh_url],
+                                             cwd=pkg_repo, capture_output=True)
                     
                     if not pkg.get('force_latest', False) and basename in overrides:
                         # For override packages, checkout the specified branch
@@ -312,7 +324,7 @@ echo "$fullver"
                 print(f"  Return code: {e.returncode}")
                 if "Username for" in error_msg or "Authentication failed" in error_msg:
                     print(f"  -> Package {basename} may not exist in official repositories or requires authentication")
-                continue
+                return  # skip this package
         elif needs_update or pkg.get('force_latest', False):
             # Repository exists but needs update
             pkg_repo_dir = Path("pkgbuilds") / basename
@@ -338,7 +350,11 @@ echo "$fullver"
                             default_branch = current_branch_result.stdout.strip() or "main"
                     
                     subprocess.run(["git", "checkout", default_branch], cwd=pkg_repo_dir, check=True, capture_output=True)
-                    subprocess.run(["git", "pull"], cwd=pkg_repo_dir, check=True, capture_output=True)
+                    if basename in overrides:
+                        subprocess.run(["git", "fetch", "origin"], cwd=pkg_repo_dir, check=True, capture_output=True)
+                        subprocess.run(["git", "reset", "--hard", f"origin/{default_branch}"], cwd=pkg_repo_dir, check=True, capture_output=True)
+                    else:
+                        subprocess.run(["git", "pull"], cwd=pkg_repo_dir, check=True, capture_output=True)
                     
                     if has_changes:
                         try:
@@ -393,10 +409,19 @@ echo "$fullver"
                         # For override packages, just checkout the specified branch
                         override_branch = overrides[basename].get('branch', 'main')
                         try:
-                            subprocess.run(["git", "checkout", override_branch], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
-                            subprocess.run(["git", "pull"], cwd=pkg_repo_dir, check=True, capture_output=True)
+                            subprocess.run(["git", "fetch", "origin"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
+                            subprocess.run(["git", "reset", "--hard", f"origin/{override_branch}"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
                         except subprocess.CalledProcessError as checkout_error:
-                            print(f"Warning: Failed to checkout/pull branch {override_branch} for {basename}: {checkout_error}")
+                            # Try rebase before giving up
+                            print(f"  Git update failed for override package {basename}, trying rebase...")
+                            try:
+                                subprocess.run(["git", "rebase", f"origin/{override_branch}"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
+                                print(f"  Rebased {basename} onto origin/{override_branch}")
+                            except subprocess.CalledProcessError:
+                                subprocess.run(["git", "rebase", "--abort"], cwd=pkg_repo_dir, capture_output=True)
+                                print(f"ERROR: Failed to update override package {basename}")
+                                print(f"  Please resolve manually in pkgbuilds/{basename} and run again.")
+                                sys.exit(1)
                     else:
                         git_version_tag = target_version.replace(':', '-')
                         tag_formats = list(set([git_version_tag, target_version, f"v{git_version_tag}", f"{basename}-{git_version_tag}"]))
@@ -459,6 +484,24 @@ echo "$fullver"
             pkg['provides'] = original_provides
         else:
             print(f"  PKGBUILD does not exist for {pkg['name']} at {pkgbuild_path}")
+    
+    # Fetch PKGBUILDs in parallel (10 at a time)
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    with ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(_fetch_one, (i, pkg)): pkg 
+                   for i, pkg in enumerate(packages_to_fetch, 1)}
+        for future in as_completed(futures):
+            try:
+                future.result()  # propagates SystemExit
+            except SystemExit:
+                # Cancel remaining futures and re-raise
+                for f in futures:
+                    f.cancel()
+                raise
+            except KeyboardInterrupt:
+                for f in futures:
+                    f.cancel()
+                raise
     
     # Return combined list with blacklisted packages (unchanged) and fetched packages (with updated deps)
     all_packages = packages_to_fetch + blacklisted_packages

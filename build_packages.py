@@ -93,7 +93,11 @@ class PackageBuilder:
         signal.signal(signal.SIGTERM, self._signal_handler)
     
     def _ingest_report(self):
-        """Update repo stats and sync heartbeat after each package."""
+        """Update repo stats and sync heartbeat after each package (throttled)."""
+        now = __import__('time').time()
+        if hasattr(self, '_last_ingest') and now - self._last_ingest < 30:
+            return
+        self._last_ingest = now
         if not self.no_reporting:
             subprocess.run(["./generate_report.py"], capture_output=True)
             self._sync_heartbeat()
@@ -362,7 +366,7 @@ echo "CHECKDEPENDS_END"
         
         cmd = [
             "makechrootpkg", "-l", temp_copy_path.name, "-r", str(self.chroot_path),
-            "-d", str(self.cache_dir), "-t", "/tmp:size=64G",
+            "-d", str(self.cache_dir), "-t", "/tmp:size=100G",
             "--"
         ]
         if use_ignorearch:
@@ -451,12 +455,14 @@ echo "CHECKDEPENDS_END"
                 if mem_before is not None and mem_after is not None and mem_before > mem_after:
                     peak_mem_mb = mem_before - mem_after
                 bid = self._build_ids.get(pkg_name, "")
-                if bid:
-                    dr.update_build_status(pkg_name, bid, status, version=version,
-                                           repo=pkg_data.get('repo', 'extra'), finished=end_iso,
-                                           duration_secs=dur, avg_cpu_pct=avg_cpu_pct,
-                                           peak_mem_mb=peak_mem_mb)
-                    dr.upload_build_log(pkg_name, bid, log_file)
+                if not bid:
+                    bid = dr._make_build_id(version)
+                    self._build_ids[pkg_name] = bid
+                dr.update_build_status(pkg_name, bid, status, version=version,
+                                       repo=pkg_data.get('repo', 'extra'), finished=end_iso,
+                                       duration_secs=dur, avg_cpu_pct=avg_cpu_pct,
+                                       peak_mem_mb=peak_mem_mb)
+                dr.upload_build_log(pkg_name, bid, log_file)
         
         # Upload packages
         if not self.no_upload:
@@ -707,12 +713,16 @@ echo "CHECKDEPENDS_END"
                         deps.add(f"{cn}#s1")
             else:
                 # Normal deps from filtered dependency lists
+                # For cycle stage 1: skip deps within the same cycle (that's the whole point of stage 1)
+                own_cycle_names = cycle_info.get(cycle_group, set()) if cycle_group is not None else set()
                 for dep_type in ['depends', 'makedepends', 'checkdepends']:
                     for dep_str in pkg.get(dep_type, []):
                         dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
                         resolved = resolve_dep(dep_name)
                         if resolved and resolved != pkg_name and resolved in all_pkg_names:
-                            # Find the right key (might be a cycle stage 2 dep, but we want the latest)
+                            # Skip in-cycle deps for stage 1 (breaking the cycle)
+                            if cycle_stage == 1 and resolved in own_cycle_names:
+                                continue
                             # For cycle packages, depend on stage 2 if it exists, else stage 1
                             if f"{resolved}#s2" in pkg_by_key:
                                 deps.add(f"{resolved}#s2")
@@ -738,12 +748,23 @@ echo "CHECKDEPENDS_END"
                             continue
                         if key in [futures[f] for f in futures]:
                             continue  # already submitted
+                        # Check if any dep has failed — cascade failure
+                        if deps & failed_keys:
+                            failed_keys.add(key)
+                            i, pkg = pkg_by_key[key]
+                            failed_dep = next(d for d in deps if d in failed_keys)
+                            print(f"Skipping {pkg['name']} — dependency {failed_dep} failed")
+                            with failed_lock:
+                                failed_packages.append(pkg)
+                            continue
                         if deps <= (completed_keys | already_built):
                             ready.append(key)
                     return ready
 
-                # Submit initial ready packages
-                for key in get_ready():
+                # Submit first ready package immediately
+                ready = get_ready()
+                if ready:
+                    key = ready[0]
                     i, pkg = pkg_by_key[key]
                     future = executor.submit(self._build_single_package, i, pkg, len(packages),
                                            cycle_info, cycle_stage_1_success, provides_map, failed_packages,
@@ -816,6 +837,18 @@ echo "CHECKDEPENDS_END"
                         futures[future] = key
                         running_names.add(pkg['name'])
 
+                    # Deadlock detection: nothing running, nothing ready
+                    if not futures and not get_ready():
+                        stuck = [k for k in remaining_deps if k not in completed_keys and k not in failed_keys]
+                        if stuck:
+                            print(f"WARNING: {len(stuck)} packages have unresolvable dependencies, marking as failed")
+                            for key in stuck:
+                                failed_keys.add(key)
+                                i, pkg = pkg_by_key[key]
+                                with failed_lock:
+                                    failed_packages.append(pkg)
+                        break
+
                     # Periodic heartbeat
                     self._ingest_report()
         else:
@@ -874,6 +907,18 @@ echo "CHECKDEPENDS_END"
         print(f"  Failed: {len(failed_packages)}")
         print(f"{'='*SEPARATOR_WIDTH}")
         
+        # Clean up stale QUEUED records from this cycle
+        dr = self._get_dynamo()
+        if dr and not self.dry_run and self._build_ids:
+            try:
+                table = dr._get_ddb().Table("ArchBuilder-Builds")
+                for name, bid in self._build_ids.items():
+                    resp = table.get_item(Key={"PkgName": name, "BuildId": bid}, ProjectionExpression="#s", ExpressionAttributeNames={"#s": "Status"})
+                    if resp.get("Item", {}).get("Status") == "QUEUED":
+                        table.delete_item(Key={"PkgName": name, "BuildId": bid})
+            except Exception as e:
+                print(f"Warning: Failed to clean up QUEUED records: {e}")
+        
         if failed_packages:
             print("Failed packages:")
             for pkg in failed_packages:
@@ -886,8 +931,9 @@ echo "CHECKDEPENDS_END"
         pkg_name = pkg['name']
         
         # Skip if already built successfully (for --continue mode)
+        # Don't skip cycle stage 2 — must rebuild even if stage 1 succeeded
         state_file = Path("last_successful.txt")
-        if state_file.exists():
+        if state_file.exists() and pkg.get('cycle_stage') != 2:
             try:
                 successful = set(state_file.read_text().strip().split('\n'))
                 if pkg_name in successful:
