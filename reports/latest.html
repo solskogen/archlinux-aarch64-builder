@@ -1,0 +1,444 @@
+<!DOCTYPE html>
+<html>
+<head>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🔨</text></svg>">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arch Linux AArch64 Build Report</title>
+<style>
+body { font-family: monospace; margin: 2em; background: #1a1a2e; color: #e0e0e0; }
+h1, h2 { color: #e94560; }
+table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+th, td { border: 1px solid #333; padding: 6px 12px; text-align: left; }
+th { background: #16213e; color: #e94560; cursor: pointer; }
+tr:nth-child(even) { background: #16213e; }
+tr:hover { background: #0f3460; }
+.success { color: #4ecca3; }
+.failed { color: #e94560; font-weight: bold; }
+.queued { color: #f0a500; }
+.building { color: #00b4d8; }
+.skipped { color: #888; font-style: italic; }
+.aborted { color: #f0a500; font-style: italic; }
+.retry { color: #f0a500; }
+.summary table { margin: 0; }
+.summary td { border: 1px solid #333; padding: 8px 16px; background: #16213e; }
+.filter { margin: 1em 0; }
+.filter input { background: #16213e; color: #e0e0e0; border: 1px solid #333; padding: 6px 12px; font-family: monospace; width: 300px; }
+#loading { color: #888; }
+a { color: #4ecca3; cursor: pointer; }
+.modal-overlay { display:none; position:fixed; top:0; left:0; width:100%; height:100%; background:rgba(0,0,0,0.8); z-index:100; }
+.modal { position:fixed; top:5%; left:5%; width:90%; height:90%; background:#0f0f23; z-index:101; overflow:auto; padding:1em; border:1px solid #333; }
+.modal pre { margin:0; white-space:pre-wrap; word-wrap:break-word; font-size:0.85em; }
+.modal-close { position:fixed; top:6%; right:6%; color:#e94560; cursor:pointer; font-size:1.5em; z-index:102; }
+</style>
+</head>
+<body>
+<h1>Arch Linux AArch64 Build Report</h1>
+<p id="updated"></p>
+<p id="loading">Loading...</p>
+<div id="content" style="display:none">
+<div id="summary" class="summary"></div>
+<h2>Package Status</h2>
+<div class="filter"><input type="text" id="filter" placeholder="Filter loaded packages or type exact name..." oninput="filterTable()"> <input type="checkbox" id="tz-local" checked onchange="toggleTz()" style="width:auto"><span onclick="document.getElementById('tz-local').click()">Local time</span><div style="margin-top:6px"><small style="color:#666">Filters loaded packages. Exact name (min 2 chars) queries the server if not already in the loaded set.<span id="load-all-hint" style="display:none"> Use <a onclick="loadAll()" style="font-size:inherit">load all</a> for full substring search.</span></small></div></div>
+<table id="builds">
+<thead><tr>
+<th onclick="sortTable(0)">Package</th>
+<th>History</th>
+<th onclick="sortTable(2)">Version</th>
+<th onclick="sortTable(3)">Status</th>
+<th onclick="sortTable(4)">Duration</th>
+<th onclick="sortTable(5)" id="th-started">Started</th>
+<th onclick="sortTable(6)" id="th-finished">Finished</th>
+<th onclick="sortTable(7)">Tier</th>
+<th>Log</th>
+</tr></thead>
+<tbody id="builds-body"></tbody>
+</table>
+<a id="show-more" style="display:none;cursor:pointer;color:#4ecca3"></a>
+</div>
+
+<div class="modal-overlay" id="modal-overlay" onclick="closeLog()">
+<span class="modal-close" onclick="closeLog()">✕</span>
+<div class="modal" onclick="event.stopPropagation()"><pre id="modal-log"></pre></div>
+</div>
+
+<script>
+// --- CONFIG ---
+const API_BASE = 'https://10uyy94ep9.execute-api.eu-central-1.amazonaws.com/v1';
+const LOG_BASE = 'https://arch-linux-repo.drzee.net';
+
+let allBuilds = [], stats = {};
+let rawBuilds = [];
+let showCount = 50, sortCol = -1, sortAsc = true, statusFilter = null;
+let fetching = false, allLoaded = false;
+const STATUS_ORDER = ['BUILDING', 'QUEUED', 'SUCCESS', 'FAILED', 'RETRY', 'SKIPPED', 'ABORTED'];
+// Per-status pagination: null = not started, false = exhausted, object = lastKey
+let statusKeys = {};
+
+async function fetchByStatus(status, lastKey) {
+  const params = new URLSearchParams();
+  if (lastKey) params.set('lastKey', JSON.stringify(lastKey));
+  const qs = params.toString();
+  const resp = await fetch(API_BASE + '/builds/status/' + status + (qs ? '?' + qs : ''));
+  const page = JSON.parse((await resp.text()).replace(/,\s*\]/g, ']'));
+  return { items: page.items || [], lastKey: page.lastKey || null };
+}
+
+let _knownKeys = new Set();
+
+function ingestItems(items) {
+  for (const b of items) {
+    const key = b.p + '#' + (b.bid || b.bs || Math.random());
+    if (_knownKeys.has(key)) continue;
+    _knownKeys.add(key);
+    if (!b.s) b.s = 'SUCCESS';
+    if (!b.t) b.t = '';
+    if (!b.v && b.bid) b.v = b.bid.split('#').slice(1).join('#');
+    rawBuilds.push(b);
+  }
+}
+
+async function fetchPage() {
+  if (fetching || allLoaded) return;
+  fetching = true;
+  try {
+    for (const s of STATUS_ORDER) {
+      if (statusKeys[s] === false) continue;
+      if (!statusKeys[s]) continue;
+      const page = await fetchByStatus(s, statusKeys[s]);
+      ingestItems(page.items);
+      statusKeys[s] = page.lastKey || false;
+      if (page.items.length > 0) { rebuildLatest(); break; }
+    }
+    allLoaded = STATUS_ORDER.every(s => !statusKeys[s] || statusKeys[s] === false);
+    render();
+  } finally { fetching = false; }
+}
+
+function rebuildLatest() {
+  const latest = {};
+  const histCount = {};
+  for (const b of rawBuilds) {
+    histCount[b.p] = (histCount[b.p]||0) + 1;
+    if (!latest[b.p] || (b.bid || b.bs || '') > (latest[b.p].bid || latest[b.p].bs || '')) latest[b.p] = b;
+  }
+  for (const b of Object.values(latest)) b._histCount = histCount[b.p] || 1;
+  allBuilds = Object.values(latest);
+}
+
+function getFilterText() {
+  return (document.getElementById('filter').value || '').toLowerCase().trim();
+}
+
+function getFiltered() {
+  let list = allBuilds;
+  const f = getFilterText();
+  if (f) list = list.filter(b => b.p.toLowerCase().includes(f));
+  if (statusFilter) list = list.filter(b => b.s === statusFilter);
+  if (list === allBuilds) list = list.slice();
+  list.sort((a,b) => {
+    const pa = a.s==='BUILDING'?0:a.s==='QUEUED'?1:2;
+    const pb = b.s==='BUILDING'?0:b.s==='QUEUED'?1:2;
+    if (pa !== pb) return pa - pb;
+    return (b.be||b.bs||'').localeCompare(a.be||a.bs||'');
+  });
+  return list;
+}
+
+function esc(s) { return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
+
+function render() {
+  const inTesting = stats.in_testing ? new Set(stats.in_testing.split(',')) : new Set();
+  const filtered = getFiltered();
+  const visible = filtered.slice(0, showCount);
+  const tbody = document.getElementById('builds-body');
+  tbody.innerHTML = visible.map(b => {
+    const cls = (b.s||'').toLowerCase();
+    const testing = b.s === 'SUCCESS' && inTesting.has(b.p) ? ' <i>(testing)</i>' : '';
+    const logUrl = b.l ? `${LOG_BASE}/${b.l}` : '';
+    const logLink = logUrl ? `<a onclick="viewLog('${esc(logUrl)}',${b.s==='BUILDING'})">view</a> · <a href="${esc(logUrl)}">download</a>` : '-';
+    const hist = b._histCount > 1 ? `<a onclick="showHistory('${esc(b.p)}')">${b._histCount} builds</a>` : '-';
+    return `<tr>
+      <td>${esc(b.p)}${testing}</td><td>${hist}</td><td>${esc(b.v)}</td>
+      <td class="${cls}">${b.s||'-'}</td>
+      <td>${fmtDur(b.bs, b.be)}</td>
+      <td>${fmtLocal(b.bs)}</td>
+      <td>${fmtLocal(b.be)}</td>
+      <td>${b.t||'-'}</td>
+      <td>${logLink}</td></tr>`;
+  }).join('');
+
+  const more = document.getElementById('show-more');
+  const hasFilter = getFilterText().length > 0;
+  if (hasFilter && !allLoaded) {
+    more.style.display = '';
+    more.textContent = 'Load all packages to complete search...';
+    more.onclick = loadAll;
+  } else if (filtered.length > showCount || (!hasFilter && !allLoaded)) {
+    more.style.display = '';
+    more.onclick = showMore;
+    const local = filtered.length > showCount ? `${filtered.length - showCount} loaded` : '';
+    const remote = !allLoaded ? (local ? ' + more on server' : 'Load more from server') : '';
+    more.textContent = `Show more (${local}${remote})`;
+  } else {
+    more.style.display = 'none';
+  }
+}
+
+async function showMore() {
+  showCount += 50;
+  if (showCount >= allBuilds.length && !allLoaded) await fetchPage();
+  render();
+}
+
+async function loadAll() {
+  if (allLoaded) return;
+  document.getElementById('show-more').style.display = '';
+  document.getElementById('show-more').textContent = 'Loading all packages...';
+  while (!allLoaded) await fetchPage();
+  render();
+}
+
+let searchTimer = null;
+function filterTable() {
+  showCount = 50;
+  const hint = document.getElementById('load-all-hint');
+  hint.style.display = getFilterText() && !allLoaded ? '' : 'none';
+  render();
+  const f = getFilterText();
+  clearTimeout(searchTimer);
+  if (f.length >= 2 && !allBuilds.some(b => b.p.toLowerCase() === f) && !allLoaded) {
+    searchTimer = setTimeout(() => searchServer(f), 400);
+  }
+}
+
+async function searchServer(name) {
+  try {
+    const resp = await fetch(API_BASE + '/builds/' + encodeURIComponent(name));
+    const items = JSON.parse((await resp.text()).replace(/,\s*\]/g, ']'));
+    if (!items.length) return;
+    ingestItems(items);
+    rebuildLatest();
+    render();
+  } catch(e) { /* silent */ }
+}
+
+async function init() {
+  try {
+    const statsResp = await fetch(API_BASE + '/stats');
+    stats = await statsResp.json();
+    document.getElementById('loading').style.display = 'none';
+    document.getElementById('content').style.display = '';
+    renderStatus();
+    await renderSummary();
+    // Fetch first page of every status
+    for (const s of STATUS_ORDER) {
+      const page = await fetchByStatus(s, null);
+      ingestItems(page.items);
+      statusKeys[s] = page.lastKey || false;
+    }
+    allLoaded = STATUS_ORDER.every(s => statusKeys[s] === false);
+    rebuildLatest();
+    render();
+  } catch(e) {
+    document.getElementById('loading').textContent = 'Failed to load: ' + e;
+  }
+}
+
+function renderStatus() {
+  const lastCheck = stats.last_check;
+  if (!lastCheck) return;
+  const ageSecs = (Date.now() - new Date(lastCheck.replace(' ', 'T') + 'Z').getTime()) / 1000;
+  const ageMin = Math.floor(ageSecs / 60);
+  const hasAuto = stats.auto_builder_pid && stats.auto_builder_pid !== '';
+  const status = hasAuto ? '🟢 Auto builder running' : ageSecs < 300 ? '🔵 Build active' : '🔴 Builder offline';
+  const ago = ageMin < 1 ? 'just now' : ageMin < 60 ? ageMin + 'm ago' : Math.floor(ageMin/60) + 'h ' + (ageMin%60) + 'm ago';
+  const load = stats.load_avg ? ' — load: ' + stats.load_avg : '';
+  const mem = stats.memory ? ' — ' + stats.memory : '';
+  document.getElementById('updated').innerHTML = status + ' — last updated: ' + fmtLocal(lastCheck) + ' (' + ago + ')' + load + mem;
+}
+
+async function renderSummary() {
+  const core = stats.core_aarch64 || '?';
+  const extra = stats.extra_aarch64 || '?';
+  const forge = stats.forge_aarch64 || '?';
+  const x86 = stats.x86_64_no_any || '?';
+  const any = stats.any_packages || '?';
+  const outdated = stats.outdated_any || '0';
+  const total = (parseInt(core)||0) + (parseInt(extra)||0) + (parseInt(forge)||0);
+
+  const sc = [['SUCCESS','success','last build ok'],['FAILED','failed','failed'],
+    ['BUILDING','building','building'],['QUEUED','queued','queued'],
+    ['RETRY','retry','retry'],['SKIPPED','skipped','skipped'],['ABORTED','aborted','aborted']];
+  const counts = await Promise.all(sc.map(([s]) =>
+    fetch(API_BASE + '/builds/count/' + s).then(r => r.json()).then(d => d.count).catch(() => 0)
+  ));
+  let statusHtml = '';
+  const tooltips = {
+    'SUCCESS': 'Packages whose most recent tracked build succeeded',
+    'FAILED': 'Packages whose most recent build failed',
+    'BUILDING': 'Packages currently being compiled',
+    'QUEUED': 'Packages waiting to be built',
+    'RETRY': 'Failed once, will retry next cycle',
+    'SKIPPED': 'Skipped due to a failed dependency',
+    'ABORTED': 'Build was interrupted',
+  };
+  sc.forEach(([status, cls, label], i) => {
+    if (counts[i] > 0) statusHtml += `<td class="${cls}" title="${tooltips[status]}"><a onclick="setFilter('${status}')">${counts[i]} ${label}</a></td>`;
+  });
+
+  document.getElementById('summary').innerHTML = `<table>
+    <tr><td><b>aarch64</b></td><td>core: ${core}</td><td>extra: ${extra}</td><td>forge: ${forge}</td>
+    <td><b>${total} aarch64 (${x86} x86_64) + ${any} any</b></td>
+    <td class="${outdated > 0 ? 'failed' : ''}">${outdated} outdated -any</td></tr>
+    <tr><td><b>Status</b></td>${statusHtml}</tr></table>`;
+}
+
+function fmtDur(start, end) {
+  if (!start || !end) return '-';
+  const a = new Date(start + 'Z'), b = new Date(end + 'Z');
+  const s = Math.round((b - a) / 1000);
+  if (isNaN(s) || s < 0) return '-';
+  if (s < 60) return s + 's';
+  if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+  return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+}
+
+function fmtLocal(utc) {
+  if (!utc) return '-';
+  const useLocal = document.getElementById('tz-local')?.checked;
+  if (!useLocal) return utc;
+  const d = new Date(utc.replace(' ', 'T').replace(/_/g, ':') + 'Z');
+  if (isNaN(d)) return utc;
+  return d.toLocaleString(undefined, {month:'short', day:'numeric', hour:'2-digit', minute:'2-digit', second:'2-digit'});
+}
+
+function toggleTz() {
+  const tz = document.getElementById('tz-local')?.checked ? '' : ' (UTC)';
+  document.getElementById('th-started').textContent = 'Started' + tz;
+  document.getElementById('th-finished').textContent = 'Finished' + tz;
+  renderStatus();
+  render();
+}
+
+async function setFilter(s) {
+  statusFilter = statusFilter === s ? null : s;
+  showCount = 50;
+  // When filtering by status, verify each matching package's true latest build
+  if (statusFilter) {
+    const matching = allBuilds.filter(b => b.s === statusFilter);
+    for (const b of matching) {
+      // Fetch all builds for this package to find the real latest
+      if (b._verified) continue;
+      try {
+        const resp = await fetch(API_BASE + '/builds/' + encodeURIComponent(b.p));
+        const items = JSON.parse((await resp.text()).replace(/,\s*\]/g, ']'));
+        ingestItems(items);
+      } catch(e) {}
+      b._verified = true;
+    }
+    rebuildLatest();
+  }
+  render();
+}
+
+function sortTable(col) {
+  if (sortCol === col) sortAsc = !sortAsc; else { sortCol = col; sortAsc = true; }
+  const tbody = document.getElementById('builds-body');
+  const rows = Array.from(tbody.rows);
+  rows.sort((a,b) => {
+    let va = a.cells[col].textContent, vb = b.cells[col].textContent;
+    if (col === 4) { va = parseDur(va); vb = parseDur(vb); }
+    return (va < vb ? -1 : va > vb ? 1 : 0) * (sortAsc ? 1 : -1);
+  });
+  rows.forEach(r => tbody.appendChild(r));
+}
+
+function parseDur(s) {
+  if (s === '-') return -1;
+  let t = 0;
+  const h = s.match(/(\d+)h/), m = s.match(/(\d+)m/), sec = s.match(/(\d+)s/);
+  if (h) t += parseInt(h[1])*3600;
+  if (m) t += parseInt(m[1])*60;
+  if (sec) t += parseInt(sec[1]);
+  return t;
+}
+
+let _logPoll = null;
+
+async function _fetchLog(url) {
+  const resp = await fetch(url);
+  if (!resp.ok) return null;
+  const ds = new DecompressionStream('gzip');
+  const reader = resp.body.pipeThrough(ds).getReader();
+  const chunks = [];
+  while (true) {
+    const {done, value} = await reader.read();
+    if (done) break;
+    chunks.push(value);
+  }
+  return new TextDecoder().decode(await new Blob(chunks).arrayBuffer());
+}
+
+async function viewLog(url, live) {
+  document.getElementById('modal-log').textContent = 'Loading...';
+  document.getElementById('modal-overlay').style.display = 'block';
+  try {
+    const text = await _fetchLog(url);
+    if (text === null) { document.getElementById('modal-log').textContent = 'Log not found'; return; }
+    const el = document.getElementById('modal-log');
+    el.textContent = text;
+    el.scrollTop = el.scrollHeight;
+    if (live) {
+      _logPoll = setInterval(async () => {
+        try {
+          const t = await _fetchLog(url);
+          if (t) { el.textContent = t; el.scrollTop = el.scrollHeight; }
+        } catch(e) {}
+      }, 30000);
+    }
+  } catch(e) {
+    document.getElementById('modal-log').textContent = 'Failed to load log: ' + e;
+  }
+}
+
+function showHistory(pkg) {
+  const builds = rawBuilds.filter(b => b.p === pkg).sort((a,b) => (b.bs||'').localeCompare(a.bs||''));
+  let html = `<h2 style="color:#e94560;margin-top:0">Build History: ${esc(pkg)}</h2>`;
+  html += `<table><thead><tr><th>Version</th><th>Status</th><th>Duration</th><th>Started</th><th>Tier</th><th>Log</th></tr></thead><tbody>`;
+  for (const b of builds) {
+    const cls = (b.s||'').toLowerCase();
+    const ver = b.v || (b.bid ? b.bid.split('#').slice(1).join('#') : '-');
+    const logUrl = b.l ? `${LOG_BASE}/${b.l}` : '';
+    const logLink = logUrl ? `<a onclick="closeLog();viewLog('${esc(logUrl)}',false)">view</a> · <a href="${esc(logUrl)}">download</a>` : '-';
+    html += `<tr><td>${esc(ver)}</td><td class="${cls}">${b.s||'-'}</td><td>${fmtDur(b.bs, b.be)}</td><td>${fmtLocal(b.bs)}</td><td>${b.t||'-'}</td><td>${logLink}</td></tr>`;
+  }
+  html += '</tbody></table>';
+  document.getElementById('modal-log').innerHTML = html;
+  document.getElementById('modal-overlay').style.display = 'block';
+}
+
+function closeLog() {
+  if (_logPoll) { clearInterval(_logPoll); _logPoll = null; }
+  document.getElementById('modal-overlay').style.display = 'none';
+  document.getElementById('modal-log').textContent = '';
+}
+
+document.addEventListener('keydown', e => { if (e.key === 'Escape') closeLog(); });
+
+init();
+</script>
+<hr style="border-color:#333;margin-top:2em">
+<h2>Status Legend</h2>
+<table>
+<tr><td class="queued">QUEUED</td><td>Package is waiting to be built</td></tr>
+<tr><td class="building">BUILDING</td><td>Package is currently being compiled</td></tr>
+<tr><td class="success">SUCCESS</td><td>Package built and in stable repository</td></tr>
+<tr><td class="success">SUCCESS <i>(testing)</i></td><td>Built but not yet moved to stable</td></tr>
+<tr><td class="failed">FAILED</td><td>Build failed — download log for details</td></tr>
+<tr><td class="skipped">SKIPPED</td><td>Skipped due to failed dependency</td></tr>
+<tr><td class="aborted">ABORTED</td><td>Build interrupted</td></tr>
+<tr><td class="retry">RETRY</td><td>Failed once, will retry next cycle</td></tr>
+</table>
+</body>
+</html>

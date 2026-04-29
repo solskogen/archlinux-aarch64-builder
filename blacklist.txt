@@ -1,0 +1,78 @@
+#packages that we know fails to build
+dotnet-core-6.0
+
+#bin packages that uses hardcoded x86 packages
+dwarffortress
+discord
+teamspeak3-server
+wine-mono
+cozy-desktop
+hsa-amd-aqlprofile-bin
+intel-oneapi-base-toolkit
+intel-oneapi-basekit
+
+#does not make sense on aarch64
+syslinux
+intel-media-driver
+dosemu
+e3
+tp_smapi
+libsmbios
+libx86
+thermald
+xf86-video-vesa
+xf86-video-intel
+amdsmi
+iucode-tool
+fasm
+framework-system
+xf86-input-vmmouse
+#virtualbox
+virtualbox-host-modules-arch
+vpl-gpu-rt
+mesa-amber
+libva-intel-driver
+libvpl-tools
+fastflowlm
+
+#isn't supported on aarch64
+dmd
+intel-media-sdk
+boxxy
+bugstalker
+bumblebee
+embree3
+teeworlds
+wavegain
+yabridge
+yate
+hyperscan
+java-rxtx
+nvidia-cg-toolkit
+#not supported yet?
+smlnj
+broadcom-wl
+rpp
+#rocprofiler
+occt
+
+#packages that we don't have (yet)
+linux-lts
+linux-hardened
+linux-rt
+linux-rt-lts
+linux-zen
+
+
+#to be removed from arch
+#and nothing depends on it
+
+#doesn't fetch
+
+#doesn't work or build and project is dead
+docker-machine
+evolution-on
+
+#fails to fetch
+
+#wait
