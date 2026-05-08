@@ -215,6 +215,25 @@ def run_cycle(args):
             return False
         packages_file.write_text(json.dumps(data, indent=2))
 
+    # Detect retry-only cycle: every package is a same-version retry (count == 1).
+    # Retries tend to fail due to transient resource contention — build serially for a
+    # better chance of success.
+    retry_only = False
+    if packages_file.exists() and failed_packages:
+        try:
+            data = json.loads(packages_file.read_text())
+            pkgs = data.get("packages", [])
+
+            def _is_retry(p):
+                info = failed_packages.get(p["name"])
+                if not isinstance(info, dict):
+                    return False
+                return info.get("version") == p.get("version") and info.get("count", 0) == 1
+
+            retry_only = bool(pkgs) and all(_is_retry(p) for p in pkgs)
+        except Exception:
+            retry_only = False
+
     # Start background reporter to ingest logs while building
     import threading
     stop_reporter = threading.Event()
@@ -222,7 +241,12 @@ def run_cycle(args):
     reporter_thread.start()
 
     # Build packages (may have partial failures)
-    success = run_step(["./build_packages.py", "--continue", "--parallel-jobs", "10"], "Building packages")
+    build_cmd = ["./build_packages.py", "--continue"]
+    if retry_only:
+        print(f"[{timestamp()}] Retry-only cycle: building serially")
+    else:
+        build_cmd += ["--parallel-jobs", "10"]
+    success = run_step(build_cmd, "Building packages")
 
     # Stop background reporter
     stop_reporter.set()

@@ -253,17 +253,33 @@ class PackageBuilder:
         depends, makedepends, checkdepends = self._parse_pkgbuild_deps(pkg_dir)
         if checkdepends and not self.no_check:
             print(f"Installing checkdepends: {' '.join(checkdepends)}")
-            try:
-                env = os.environ.copy()
-                env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
-                subprocess.run([
-                    "sudo", "arch-nspawn", 
-                    "-c", str(self.cache_dir),
-                    str(temp_copy_path),
-                    "pacman", "-S", "--noconfirm"
-                ] + checkdepends, check=True, env=env)
-            except KeyboardInterrupt:
-                sys.exit(1)
+            # Pre-installing checkdepends is an optimization to warm the chroot's
+            # pacman DB. If it fails (e.g. due to a shared-cache race between
+            # concurrent builds), we log and continue — makechrootpkg will attempt
+            # its own dep install later, and if that truly fails the build will
+            # fail with a proper log file showing the pacman error.
+            env = os.environ.copy()
+            env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
+            cmd = [
+                "sudo", "arch-nspawn",
+                "-c", str(self.cache_dir),
+                str(temp_copy_path),
+                "pacman", "-Sy", "--noconfirm"
+            ] + checkdepends
+            for attempt in (1, 2):
+                try:
+                    subprocess.run(cmd, check=True, env=env)
+                    break
+                except subprocess.CalledProcessError as e:
+                    if attempt == 1:
+                        print(f"Warning: checkdepends install failed (attempt {attempt}), retrying: {e}")
+                        import time as _time
+                        _time.sleep(2)
+                    else:
+                        print(f"Warning: checkdepends install failed after retry: {e}")
+                        print("  Continuing — makechrootpkg will retry dep install itself")
+                except KeyboardInterrupt:
+                    sys.exit(1)
 
     def _parse_pkgbuild_deps(self, pkg_dir):
         """Parse PKGBUILD dependencies using bash"""
@@ -349,6 +365,18 @@ echo "CHECKDEPENDS_END"
         env = os.environ.copy()
         env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
         
+        # Last-second DB refresh: other parallel builds may have uploaded new packages
+        # since _prepare_build_environment ran. makechrootpkg's internal `pacman -S`
+        # uses this DB, so if it's stale we get "Maximum file size exceeded" errors.
+        try:
+            subprocess.run([
+                "sudo", "arch-nspawn",
+                "-c", str(self.cache_dir),
+                str(temp_copy_path), "pacman", "-Sy", "--noconfirm"
+            ], check=True, capture_output=True, text=True, errors='replace')
+        except subprocess.CalledProcessError as e:
+            print(f"Warning: Failed to refresh pacman DB before build: {e}")
+        
         # Check if PKGBUILD arch array contains aarch64
         pkgbuild_path = pkg_dir / "PKGBUILD"
         use_ignorearch = True
@@ -398,6 +426,9 @@ echo "CHECKDEPENDS_END"
                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, 
                                          text=True, bufsize=1, errors='replace')
                 
+                # CPU watchdog disabled — needs to monitor entire process tree, not just direct child
+                # TODO: use /proc/{pid}/stat recursively or cgroup CPU accounting
+
                 # Stream output to both console and log file
                 while True:
                     line = process.stdout.readline()
@@ -547,8 +578,9 @@ echo "CHECKDEPENDS_END"
         
         return len(failed_deps) > 0, failed_deps
 
-    def build_packages(self, packages_file, blacklist_file=None, continue_build=False, parallel_jobs=1):
+    def build_packages(self, packages_file, blacklist_file=None, continue_build=False, parallel_jobs=1, keep_going=False):
         """Build all packages from JSON file"""
+        self._keep_going = keep_going
         # Load packages
         with open(packages_file, 'r') as f:
             data = json.load(f)
@@ -673,19 +705,63 @@ echo "CHECKDEPENDS_END"
         import time as _time
 
         def _cpu_idle_pct():
+            """Sample CPU idle+iowait percentage over a 1-second window from /proc/stat."""
             def _read():
                 vals = [int(v) for v in open('/proc/stat').readline().split()[1:]]
                 return vals[3] + vals[4], sum(vals)
             idle1, total1 = _read()
-            _time.sleep(0.5)
+            _time.sleep(1.0)
             idle2, total2 = _read()
             dt = total2 - total1
             return ((idle2 - idle1) / dt * 100) if dt > 0 else 0
 
-        def _effective_jobs():
-            if _cpu_idle_pct() < 10.0:
-                return 1
-            return parallel_jobs
+        # Adaptive ramp-up state. Rules:
+        #   - parallel_jobs is the hard cap (never exceeded).
+        #   - First launch is immediate (no CPU sample yet).
+        #   - Subsequent launches gated by either:
+        #       (a) a build completed since the last launch (slot opened naturally), OR
+        #       (b) ≥20s have passed since the last launch AND CPU idle ≥ 25%.
+        #   - If CPU is too busy, we skip launching and re-check every poll cycle.
+        RAMP_WAIT_SECS = 20.0
+        IDLE_THRESHOLD_PCT = 25.0
+        ramp_state = {
+            'last_launch': 0.0,
+            'last_completion': 0.0,
+            'gated_logged': False,
+        }
+
+        def _can_launch_more(n_running):
+            """Return True if we're allowed to start another build right now."""
+            # Hard cap
+            if n_running >= parallel_jobs:
+                return False
+            # No builds running yet → always allow first launch
+            if n_running == 0:
+                return True
+            now = _time.time()
+            since_launch = now - ramp_state['last_launch']
+            # If a build completed after the last launch, slot freed naturally — launch immediately
+            if ramp_state['last_completion'] > ramp_state['last_launch']:
+                return True
+            # Otherwise require 20s since last launch before sampling CPU
+            if since_launch < RAMP_WAIT_SECS:
+                return False
+            # Enough time has passed — check CPU headroom
+            idle = _cpu_idle_pct()
+            if idle >= IDLE_THRESHOLD_PCT:
+                ramp_state['gated_logged'] = False
+                return True
+            if not ramp_state['gated_logged']:
+                print(f"  [ramp-up] CPU idle {idle:.1f}% < {IDLE_THRESHOLD_PCT}%, holding at {n_running}/{parallel_jobs}")
+                ramp_state['gated_logged'] = True
+            return False
+
+        def _mark_launched():
+            ramp_state['last_launch'] = _time.time()
+            ramp_state['gated_logged'] = False
+
+        def _mark_completed():
+            ramp_state['last_completion'] = _time.time()
 
         # Build remaining_deps: for each package, which in-list packages must complete first
         all_pkg_names = {pkg['name'] for pkg in packages[start_index:]}
@@ -697,6 +773,10 @@ echo "CHECKDEPENDS_END"
 
         remaining_deps = {}  # pkg_key -> set of pkg_names it waits on
         pkg_by_key = {}      # pkg_key -> (index, pkg)
+        # Track which (dependent, provider) edges came from checkdepends only.
+        # If a cycle forms, these can safely be dropped — checkdepends only affect
+        # test runs, and pacman installs them from the repo at build time regardless.
+        checkonly_edges = set()  # set of (key, dep_key) tuples
         for i, pkg in enumerate(packages[start_index:], start_index):
             pkg_name = pkg['name']
             cycle_stage = pkg.get('cycle_stage')
@@ -715,6 +795,15 @@ echo "CHECKDEPENDS_END"
                 # Normal deps from filtered dependency lists
                 # For cycle stage 1: skip deps within the same cycle (that's the whole point of stage 1)
                 own_cycle_names = cycle_info.get(cycle_group, set()) if cycle_group is not None else set()
+                # Collect runtime deps (depends + makedepends) separately so we can mark
+                # checkdepends-only edges as cycle-breakable.
+                runtime_providers = set()
+                for dep_type in ['depends', 'makedepends']:
+                    for dep_str in pkg.get(dep_type, []):
+                        dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+                        resolved = resolve_dep(dep_name)
+                        if resolved and resolved != pkg_name and resolved in all_pkg_names:
+                            runtime_providers.add(resolved)
                 for dep_type in ['depends', 'makedepends', 'checkdepends']:
                     for dep_str in pkg.get(dep_type, []):
                         dep_name = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
@@ -725,12 +814,73 @@ echo "CHECKDEPENDS_END"
                                 continue
                             # For cycle packages, depend on stage 2 if it exists, else stage 1
                             if f"{resolved}#s2" in pkg_by_key:
-                                deps.add(f"{resolved}#s2")
+                                dep_key = f"{resolved}#s2"
                             elif f"{resolved}#s1" in pkg_by_key:
-                                deps.add(f"{resolved}#s1")
+                                dep_key = f"{resolved}#s1"
                             else:
-                                deps.add(resolved)
+                                dep_key = resolved
+                            deps.add(dep_key)
+                            # Mark edge as checkdepends-only if not in runtime_providers
+                            if dep_type == 'checkdepends' and resolved not in runtime_providers:
+                                checkonly_edges.add((key, dep_key))
             remaining_deps[key] = deps
+
+        # Break cycles in remaining_deps by dropping checkdepends-only edges.
+        # Detect SCCs via Tarjan; for each SCC > 1, remove checkonly edges between members.
+        def _find_sccs(graph):
+            idx_counter = [0]
+            stk = []
+            idx = {}
+            low = {}
+            on_stk = {}
+            out = []
+            def strong(n):
+                idx[n] = idx_counter[0]
+                low[n] = idx_counter[0]
+                idx_counter[0] += 1
+                stk.append(n)
+                on_stk[n] = True
+                for s in graph.get(n, set()):
+                    if s not in idx:
+                        strong(s)
+                        low[n] = min(low[n], low[s])
+                    elif on_stk.get(s):
+                        low[n] = min(low[n], idx[s])
+                if low[n] == idx[n]:
+                    comp = []
+                    while True:
+                        w = stk.pop()
+                        on_stk[w] = False
+                        comp.append(w)
+                        if w == n:
+                            break
+                    out.append(comp)
+            import sys as _sys
+            _old_limit = _sys.getrecursionlimit()
+            _sys.setrecursionlimit(max(_old_limit, len(graph) + 100))
+            try:
+                for n in list(graph):
+                    if n not in idx:
+                        strong(n)
+            finally:
+                _sys.setrecursionlimit(_old_limit)
+            return out
+
+        sccs_found = _find_sccs(remaining_deps)
+        dropped_edges = 0
+        for scc in sccs_found:
+            if len(scc) <= 1:
+                continue
+            scc_set = set(scc)
+            # Drop checkonly edges where both endpoints are in this SCC.
+            for node in scc:
+                to_remove = {d for d in remaining_deps[node]
+                             if d in scc_set and (node, d) in checkonly_edges}
+                if to_remove:
+                    remaining_deps[node] -= to_remove
+                    dropped_edges += len(to_remove)
+        if dropped_edges:
+            print(f"Broke {dropped_edges} checkdepends-only edges in {sum(1 for s in sccs_found if len(s) > 1)} SCC(s)")
 
         completed_keys = set()
         failed_keys = set()
@@ -749,27 +899,38 @@ echo "CHECKDEPENDS_END"
                         if key in [futures[f] for f in futures]:
                             continue  # already submitted
                         # Check if any dep has failed — cascade failure
-                        if deps & failed_keys:
+                        if deps & failed_keys and not keep_going:
+                            failed_dep = next(d for d in deps if d in failed_keys)
                             failed_keys.add(key)
                             i, pkg = pkg_by_key[key]
-                            failed_dep = next(d for d in deps if d in failed_keys)
                             print(f"Skipping {pkg['name']} — dependency {failed_dep} failed")
                             with failed_lock:
                                 failed_packages.append(pkg)
                             continue
-                        if deps <= (completed_keys | already_built):
+                        if deps <= (completed_keys | already_built | (failed_keys if keep_going else set())):
+                            # Trace which deps are satisfied by what
                             ready.append(key)
                     return ready
 
-                # Submit first ready package immediately
-                ready = get_ready()
-                if ready:
-                    key = ready[0]
+                # Submit initial ready packages - only ONE to start; ramp-up will add more
+                for key in get_ready():
+                    if not _can_launch_more(len(futures)):
+                        break
                     i, pkg = pkg_by_key[key]
+                    # Check mutex groups
+                    running_names = {pkg_by_key[futures[f]][1]['name'] for f in futures}
+                    skip_mutex = False
+                    for group in self.MUTEX_GROUPS:
+                        if pkg['name'] in group and running_names & group:
+                            skip_mutex = True
+                            break
+                    if skip_mutex:
+                        continue
                     future = executor.submit(self._build_single_package, i, pkg, len(packages),
                                            cycle_info, cycle_stage_1_success, provides_map, failed_packages,
                                            failed_lock, success_lock, cycle_lock)
                     futures[future] = key
+                    _mark_launched()
 
                 while futures or any(k not in completed_keys and k not in failed_keys and k not in [futures[f] for f in futures] for k in remaining_deps):
                     if should_stop or self._interrupted:
@@ -778,14 +939,17 @@ echo "CHECKDEPENDS_END"
                     # Quick poll for completions
                     done_set = {f for f in futures if f.done()}
                     if not done_set and futures:
-                        _time.sleep(5)
-                        done_set = {f for f in futures if f.done()}
+                        # Wait briefly for any future to complete (handles both fast skips and slow builds)
+                        from concurrent.futures import wait, FIRST_COMPLETED
+                        done, _ = wait(futures.keys(), timeout=5, return_when=FIRST_COMPLETED)
+                        done_set = done
                     if not done_set and futures:
                         continue
 
                     # Process completions
                     for done in done_set:
                         key = futures.pop(done)
+                        _mark_completed()
                         i, pkg = pkg_by_key[key]
                         try:
                             success = done.result()
@@ -817,10 +981,10 @@ echo "CHECKDEPENDS_END"
                             if self.stop_on_failure:
                                 should_stop = True
 
-                    # Submit newly ready packages
+                    # Submit newly ready packages (gated by adaptive ramp-up)
                     running_names = {pkg_by_key[futures[f]][1]['name'] for f in futures}
                     for key in get_ready():
-                        if futures and len(futures) >= _effective_jobs():
+                        if not _can_launch_more(len(futures)):
                             break
                         i, pkg = pkg_by_key[key]
                         # Check mutex groups - skip if a conflicting package is running
@@ -836,9 +1000,10 @@ echo "CHECKDEPENDS_END"
                                                failed_lock, success_lock, cycle_lock)
                         futures[future] = key
                         running_names.add(pkg['name'])
+                        _mark_launched()
 
                     # Deadlock detection: nothing running, nothing ready
-                    if not futures and not get_ready():
+                    if not futures and not get_ready() and not should_stop and not self._interrupted:
                         stuck = [k for k in remaining_deps if k not in completed_keys and k not in failed_keys]
                         if stuck:
                             print(f"WARNING: {len(stuck)} packages have unresolvable dependencies, marking as failed")
@@ -966,7 +1131,7 @@ echo "CHECKDEPENDS_END"
         # Check if package should be skipped due to failed dependencies
         with failed_lock:
             should_skip, failed_deps = self._should_skip_due_to_failed_dependencies(pkg, failed_packages, provides_map)
-        if should_skip:
+        if should_skip and not self._keep_going:
             print(f"Skipping {pkg_name} - depends on failed packages: {', '.join(failed_deps)}")
             dr = self._get_dynamo()
             if dr and pkg_name in self._build_ids:
@@ -1190,10 +1355,14 @@ def main():
                         help='Delete temporary chroots even on build failure')
     parser.add_argument('--stop-on-failure', action='store_true',
                         help='Stop building on first package failure')
+    parser.add_argument('--keep-going', action='store_true',
+                        help='Try building packages even if their dependencies failed')
     parser.add_argument('--chroot',
                         help='Custom chroot directory path')
     parser.add_argument('--parallel-jobs', type=int, default=1,
-                        help='Max packages to build in parallel (default: 1). Adaptive: reduces to 1 when system load >= nproc. New jobs are submitted one at a time every 20s if load permits.')
+                        help='Max packages to build in parallel (default: 1). Adaptive ramp-up: '
+                             'starts with 1, adds another every 20s if CPU idle >= 25%% (or on build '
+                             'completion). Never exceeds this cap.')
     parser.add_argument('--no-reporting', action='store_true',
                         help='Skip updating the build report database')
     parser.add_argument('--no-check', action='store_true',
@@ -1225,7 +1394,8 @@ def main():
         args.json,
         args.blacklist,
         args.continue_build,
-        args.parallel_jobs
+        args.parallel_jobs,
+        keep_going=args.keep_going
     )
 
     # Ingest build logs into report database

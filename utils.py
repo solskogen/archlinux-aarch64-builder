@@ -132,22 +132,51 @@ def safe_path_join(base: Path, user_input: str) -> Path:
 
 class ArchVersionComparator:
     """Centralized version comparison for Arch Linux packages"""
-    
+
+    # Cache results of compare() — same version pairs are compared repeatedly
+    # during dependency resolution and build-list generation.
+    _cache = {}
+    # Probe vercmp availability once; subprocess.run per call is expensive.
+    _vercmp_available = None
+
+    @staticmethod
+    def _probe_vercmp():
+        if ArchVersionComparator._vercmp_available is None:
+            try:
+                r = subprocess.run(['vercmp', '1', '1'],
+                                   capture_output=True, text=True, timeout=2)
+                ArchVersionComparator._vercmp_available = (r.returncode == 0)
+            except Exception:
+                ArchVersionComparator._vercmp_available = False
+        return ArchVersionComparator._vercmp_available
+
     @staticmethod
     def compare(version1: str, version2: str) -> int:
         """
         Compare two Arch Linux version strings.
         Returns: -1 if version1 < version2, 0 if equal, 1 if version1 > version2
         """
+        # Fast path: identical strings
+        if version1 == version2:
+            return 0
+        cache = ArchVersionComparator._cache
+        key = (version1, version2)
+        cached = cache.get(key)
+        if cached is not None:
+            return cached
+
         # Use pacman's vercmp if available (authoritative for Arch)
-        try:
-            result = subprocess.run(['vercmp', version1, version2],
-                                   capture_output=True, text=True, timeout=5)
-            if result.returncode == 0:
-                v = int(result.stdout.strip())
-                return -1 if v < 0 else (1 if v > 0 else 0)
-        except Exception:
-            pass
+        if ArchVersionComparator._probe_vercmp():
+            try:
+                result = subprocess.run(['vercmp', version1, version2],
+                                       capture_output=True, text=True, timeout=5)
+                if result.returncode == 0:
+                    v = int(result.stdout.strip())
+                    r = -1 if v < 0 else (1 if v > 0 else 0)
+                    cache[key] = r
+                    return r
+            except Exception:
+                pass
         
         epoch1, ver1 = ArchVersionComparator._split_epoch_version(version1)
         epoch2, ver2 = ArchVersionComparator._split_epoch_version(version2)

@@ -73,6 +73,56 @@ def extract_dep_name(dep_str):
     """Extract package name from dependency string like 'pkg>=1.0'"""
     return dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
 
+
+class CompiledBlacklist:
+    """
+    Precompiled blacklist for fast matching.
+
+    Partitions patterns into literal names (O(1) set lookup) and wildcard
+    patterns (fnmatch). With a typical all-literal blacklist this eliminates
+    millions of fnmatch calls.
+    """
+    __slots__ = ('literals', 'wildcards', '_match_cache')
+
+    def __init__(self, patterns):
+        self.literals = set()
+        self.wildcards = []
+        for p in patterns or []:
+            # fnmatch wildcard chars: * ? [
+            if any(c in p for c in '*?['):
+                self.wildcards.append(p)
+            else:
+                self.literals.add(p)
+        self._match_cache = {}
+
+    def __bool__(self):
+        return bool(self.literals) or bool(self.wildcards)
+
+    def matches(self, name):
+        """Return True if name matches any blacklist pattern."""
+        cached = self._match_cache.get(name)
+        if cached is not None:
+            return cached
+        if name in self.literals:
+            self._match_cache[name] = True
+            return True
+        for pat in self.wildcards:
+            if fnmatch.fnmatch(name, pat):
+                self._match_cache[name] = True
+                return True
+        self._match_cache[name] = False
+        return False
+
+    def matching_pattern(self, name):
+        """Return the first pattern that matches name, or None."""
+        if name in self.literals:
+            return name
+        for pat in self.wildcards:
+            if fnmatch.fnmatch(name, pat):
+                return pat
+        return None
+
+
 def build_provides_map(x86_packages, target_packages, build_packages=None):
     """Build unified provides mapping: name -> basename"""
     provides = {}
@@ -581,7 +631,8 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
     """
     force_packages = set(force_packages or [])
     aur_packages = set(aur_packages or [])
-    blacklist = blacklist or []
+    # Precompile blacklist once: splits literals (O(1) set) from wildcards (fnmatch)
+    bl = blacklist if isinstance(blacklist, CompiledBlacklist) else CompiledBlacklist(blacklist or [])
     
     skipped_packages = []
     
@@ -621,16 +672,18 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
     bin_package_warnings = []
     
     for basename, x86_data in x86_bases.items():
-        # Check blacklist against basename (pkgbase) and individual package names
+        # Check blacklist: fast O(1) literal lookup + wildcard fallback
         blacklist_reason = None
-        for pattern in blacklist:
-            if fnmatch.fnmatch(basename, pattern):
-                blacklist_reason = f"basename '{basename}' matches pattern '{pattern}'"
-                break
-            elif any(fnmatch.fnmatch(pkg_name, pattern) for pkg_name in x86_data['packages']):
-                matching_pkg = next(pkg_name for pkg_name in x86_data['packages'] if fnmatch.fnmatch(pkg_name, pattern))
-                blacklist_reason = f"package '{matching_pkg}' matches pattern '{pattern}'"
-                break
+        if bl:
+            pat = bl.matching_pattern(basename)
+            if pat:
+                blacklist_reason = f"basename '{basename}' matches pattern '{pat}'"
+            else:
+                for pkg_name in x86_data['packages']:
+                    pat = bl.matching_pattern(pkg_name)
+                    if pat:
+                        blacklist_reason = f"package '{pkg_name}' matches pattern '{pat}'"
+                        break
         
         if blacklist_reason:
             skipped_packages.append(f"{basename} ({blacklist_reason})")
@@ -649,22 +702,21 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
             continue
         
         # Check if package depends on blacklisted packages
-        if blacklist and not force_packages:
+        if bl and not force_packages:
             pkg_data = x86_data['pkg_data']
             all_deps = pkg_data.get('depends', []) + pkg_data.get('makedepends', [])
             blacklisted_dep = None
             for dep in all_deps:
                 dep_name = extract_dep_name(dep)
                 # Check dep name and its pkgbase against blacklist
-                dep_basename = dep_name
+                if bl.matches(dep_name):
+                    blacklisted_dep = dep_name
+                    break
                 if full_x86_packages and dep_name in full_x86_packages:
                     dep_basename = full_x86_packages[dep_name].get('basename', dep_name)
-                for pattern in blacklist:
-                    if fnmatch.fnmatch(dep_name, pattern) or fnmatch.fnmatch(dep_basename, pattern):
+                    if dep_basename != dep_name and bl.matches(dep_basename):
                         blacklisted_dep = dep_name
                         break
-                if blacklisted_dep:
-                    break
             if blacklisted_dep:
                 skipped_packages.append(f"{basename} (depends on blacklisted package: {blacklisted_dep})")
                 continue
@@ -734,10 +786,14 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
         if should_include:
             # Double-check blacklist before adding to results (safety check)
             is_blacklisted = False
-            for pattern in blacklist:
-                if fnmatch.fnmatch(basename, pattern) or any(fnmatch.fnmatch(pkg_name, pattern) for pkg_name in x86_data['packages']):
+            if bl:
+                if bl.matches(basename):
                     is_blacklisted = True
-                    break
+                else:
+                    for pkg_name in x86_data['packages']:
+                        if bl.matches(pkg_name):
+                            is_blacklisted = True
+                            break
             
             if is_blacklisted:
                 continue  # Skip blacklisted packages
@@ -873,16 +929,62 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
     graph = defaultdict(set)  # pkg -> set of packages that depend on it
     reverse_graph = defaultdict(set)  # pkg -> set of packages it depends on
     in_degree = defaultdict(int)  # pkg -> number of dependencies
-    
+
+    # Separate runtime-only reverse graph for SCC detection.
+    # Cycles through checkdepends alone do NOT require two-stage rebuild
+    # (they only affect check() during test runs, which can use whatever
+    # version is in the repo). Only cycles via depends/makedepends are real
+    # runtime cycles that need stage 1 + stage 2.
+    runtime_reverse_graph = defaultdict(set)
+
     # Initialize in_degree for all packages
+    # Identify GHC-compiled (Haskell) packages. These cannot participate in
+    # two-stage cycles because GHC embeds per-compile ABI hashes in each .so/.hi,
+    # so stage-2 rebuilds produce outputs inconsistent with what they were linked
+    # against. We detect these and use depends-only edges for cycle detection,
+    # which mirrors how Arch upstream serializes Haskell rebuilds.
+    GHC_TOOLCHAIN = {'ghc', 'ghc-libs', 'haskell-hadrian', 'alex', 'happy', 'cabal-install'}
+    def _is_ghc_compiled(pkg):
+        if pkg['name'] in GHC_TOOLCHAIN:
+            return True
+        for d in pkg.get('depends', []):
+            if extract_dep_name(d) == 'ghc-libs':
+                return True
+        return False
+
     for pkg in packages:
         in_degree[pkg['name']] = 0
     
     # Build the dependency graph
     for pkg in packages:
         pkg_name = pkg['name']
-        
-        # Collect all dependencies
+
+        # Runtime deps for SCC detection.
+        # - GHC-compiled packages: depends only (avoids spurious cycles via makedepends
+        #   on test tools / codegen that don't create ABI links).
+        # - Everything else: depends + makedepends (makedepends typically reflects
+        #   build-time linking for C/C++ and is ABI-relevant for cycle resolution).
+        if _is_ghc_compiled(pkg):
+            runtime_dep_types = ('depends',)
+        else:
+            runtime_dep_types = ('depends', 'makedepends')
+        runtime_deps_resolved = set()
+        for dep_type in runtime_dep_types:
+            for dep_str in pkg.get(dep_type, []):
+                dep_name = extract_dep_name(dep_str)
+                if dep_name == pkg_name:
+                    continue
+                provider_pkg = None
+                if dep_name in pkg_map:
+                    provider_pkg = dep_name
+                elif dep_name in all_provides:
+                    provider_pkg = all_provides[dep_name]
+                if provider_pkg and provider_pkg in pkg_map and provider_pkg != pkg_name:
+                    runtime_deps_resolved.add(provider_pkg)
+        for provider_pkg in runtime_deps_resolved:
+            runtime_reverse_graph[pkg_name].add(provider_pkg)
+
+        # Collect all dependencies (including checkdepends) for the full graph
         all_deps = []
         for dep_type in ['depends', 'makedepends', 'checkdepends']:
             all_deps.extend(pkg.get(dep_type, []))
@@ -947,8 +1049,38 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
                             in_degree[pkg_name] += 1
     
     # Find strongly connected components (cycles)
-    sccs = find_strongly_connected_components(reverse_graph)
-    
+    sccs = find_strongly_connected_components(runtime_reverse_graph)
+
+    # Safety check: detect genuine depends-only cycles among GHC-compiled packages.
+    # These indicate a packaging bug — Haskell packages cannot use two-stage cycle
+    # resolution because GHC embeds per-compile ABI hashes. If such a cycle exists,
+    # the repo will end up inconsistent (A refs B-stage1 ABI but repo has B-stage2).
+    # Arch upstream avoids this by bundling core Haskell libs into ghc-libs.
+    depends_only_rev = defaultdict(set)
+    for pkg in packages:
+        if not _is_ghc_compiled(pkg):
+            continue
+        for dep_str in pkg.get('depends', []):
+            dep_name = extract_dep_name(dep_str)
+            if dep_name == pkg['name']:
+                continue
+            provider = dep_name if dep_name in pkg_map else all_provides.get(dep_name)
+            if provider and provider in pkg_map and provider != pkg['name']:
+                if _is_ghc_compiled(pkg_map[provider]):
+                    depends_only_rev[pkg['name']].add(provider)
+    ghc_sccs = find_strongly_connected_components(depends_only_rev)
+    ghc_cycles = [s for s in ghc_sccs if len(s) > 1]
+    if ghc_cycles:
+        print(f"\n{'='*SEPARATOR_WIDTH}")
+        print(f"⚠️  WARNING: {len(ghc_cycles)} runtime cycle(s) among Haskell packages!")
+        print(f"{'='*SEPARATOR_WIDTH}")
+        print("Haskell packages cannot participate in two-stage cycle resolution due to")
+        print("per-compile ABI hashes. The resulting repo state will be inconsistent.")
+        print("This is a packaging bug — please report upstream or break the cycle manually.")
+        for i, scc in enumerate(ghc_cycles):
+            print(f"  Cycle {i+1} ({len(scc)} packages): {', '.join(sorted(scc))}")
+        print(f"{'='*SEPARATOR_WIDTH}\n")
+
     # Identify actual cycles (SCCs with more than one node or self-loops)
     cycles = []
     cycle_map = {}  # pkg_name -> cycle_id
@@ -1178,48 +1310,82 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
     # Now process remaining packages with topological sort
     remaining_packages = [pkg for pkg in packages if pkg['name'] not in processed_packages]
     if remaining_packages:
-        # Build new graph without cycle packages
-        remaining_graph = defaultdict(set)
-        remaining_in_degree = defaultdict(int)
-        
-        for pkg in remaining_packages:
-            remaining_in_degree[pkg['name']] = 0
-        
+        # Build new graph without cycle packages.
+        # We construct edges as (provider, dependent, dep_type) and then break any
+        # cycles that form among all-GHC-compiled packages by dropping makedepends /
+        # checkdepends edges inside those SCCs. GHC packages cannot be resolved via
+        # two-stage cycles due to ABI-hash linking, so their build order must be a
+        # strict DAG — test-framework / build-tool makedepends that happen to cycle
+        # back are broken here. The test tool will still be installed from the repo
+        # at build time; only the build-order hint is removed.
+        remaining_set = {p['name'] for p in remaining_packages}
+        remaining_rev = defaultdict(set)  # pkg -> providers
+        edge_types = {}  # (pkg, provider) -> 'depends' | 'makedepends' | 'checkdepends'
+
         for pkg in remaining_packages:
             pkg_name = pkg['name']
-            all_deps = []
-            for dep_type in ['depends', 'makedepends', 'checkdepends']:
-                all_deps.extend(pkg.get(dep_type, []))
-            
-            # Remove duplicates to avoid counting the same dependency multiple times
-            seen_deps = set()
-            seen_providers = set()  # Track provider packages to avoid duplicate edges
-            for dep_str in all_deps:
-                dep_name = extract_dep_name(dep_str)
-                if dep_name in seen_deps or dep_name == pkg_name:  # Skip duplicates and self-deps
-                    continue
-                seen_deps.add(dep_name)
-                
-                provider_pkg = None
-                if dep_name in pkg_map:
-                    provider_pkg = dep_name
-                elif dep_name in all_provides:
-                    provider_pkg = all_provides[dep_name]
-                
-                # Create edge if dependency is in remaining packages OR was in a cycle (already built)
-                if provider_pkg and provider_pkg in pkg_map and provider_pkg != pkg_name:
-                    if provider_pkg in processed_packages:
-                        # Dependency was in a cycle, already satisfied
+            # First pass collects provider per dep type (depends wins over makedepends over checkdepends)
+            seen_providers = {}  # provider -> dep_type
+            for dep_type in ('depends', 'makedepends', 'checkdepends'):
+                for dep_str in pkg.get(dep_type, []):
+                    dep_name = extract_dep_name(dep_str)
+                    if dep_name == pkg_name:
                         continue
-                    elif any(p['name'] == provider_pkg for p in remaining_packages):
-                        # Skip if we already added an edge to this provider
-                        if provider_pkg in seen_providers:
-                            continue
-                        seen_providers.add(provider_pkg)
-                        
-                        # Dependency is in remaining packages
-                        remaining_graph[provider_pkg].add(pkg_name)
-                        remaining_in_degree[pkg_name] += 1
+                    provider_pkg = None
+                    if dep_name in pkg_map:
+                        provider_pkg = dep_name
+                    elif dep_name in all_provides:
+                        provider_pkg = all_provides[dep_name]
+                    if not (provider_pkg and provider_pkg in pkg_map and provider_pkg != pkg_name):
+                        continue
+                    if provider_pkg in processed_packages:
+                        continue  # Dep was in an earlier cycle group — already built
+                    if provider_pkg not in remaining_set:
+                        continue
+                    # Keep the strongest edge type seen: depends > makedepends > checkdepends
+                    priority = {'depends': 0, 'makedepends': 1, 'checkdepends': 2}
+                    if provider_pkg in seen_providers:
+                        if priority[dep_type] < priority[seen_providers[provider_pkg]]:
+                            seen_providers[provider_pkg] = dep_type
+                    else:
+                        seen_providers[provider_pkg] = dep_type
+            for provider_pkg, dt in seen_providers.items():
+                remaining_rev[pkg_name].add(provider_pkg)
+                edge_types[(pkg_name, provider_pkg)] = dt
+
+        # Find SCCs in the remaining-graph and drop makedepends/checkdepends edges
+        # inside SCCs whose members are all GHC-compiled (Haskell packages that can't
+        # two-stage). This converts makedepends-induced Haskell cycles into a DAG.
+        rem_sccs = find_strongly_connected_components(remaining_rev)
+        dropped = 0
+        for scc in rem_sccs:
+            if len(scc) <= 1:
+                continue
+            if not all(_is_ghc_compiled(pkg_map[n]) for n in scc):
+                # Non-GHC or mixed SCC at this stage shouldn't happen (those were
+                # caught by the earlier two-stage cycle detection). If it does,
+                # leave the edges intact so the topological sort fails visibly.
+                continue
+            scc_set = set(scc)
+            for node in scc:
+                to_drop = {p for p in remaining_rev[node]
+                           if p in scc_set and edge_types.get((node, p)) in ('makedepends', 'checkdepends')}
+                remaining_rev[node] -= to_drop
+                for p in to_drop:
+                    edge_types.pop((node, p), None)
+                dropped += len(to_drop)
+        if dropped:
+            print(f"Broke {dropped} makedepends/checkdepends edges among Haskell packages to produce a DAG")
+
+        # Build forward graph + in_degree from the (possibly edge-reduced) reverse graph
+        remaining_graph = defaultdict(set)
+        remaining_in_degree = defaultdict(int)
+        for pkg in remaining_packages:
+            remaining_in_degree[pkg['name']] = 0
+        for dependent, providers in remaining_rev.items():
+            for provider in providers:
+                remaining_graph[provider].add(dependent)
+                remaining_in_degree[dependent] += 1
         
         # Topological sort for remaining packages
         queue = deque()
@@ -1446,6 +1612,22 @@ if __name__ == "__main__":
             if newer_packages:
                 log("Processing PKGBUILDs for dependency information...")
                 newer_packages = fetch_pkgbuild_deps(newer_packages, args.no_update, {}, {})
+            
+            # Validate that PKGBUILDs were actually fetched
+            failed_aur = []
+            valid_packages = []
+            for pkg in newer_packages:
+                pkgbuild = Path(PKGBUILDS_DIR) / pkg['name'] / "PKGBUILD"
+                if pkgbuild.exists():
+                    valid_packages.append(pkg)
+                else:
+                    failed_aur.append(pkg['name'])
+            
+            if failed_aur:
+                print(f"ERROR: AUR package(s) not found: {', '.join(failed_aur)}")
+                sys.exit(1)
+            
+            newer_packages = valid_packages
             
             if args.preserve_order:
                 newer_packages = preserve_package_order(newer_packages, list(args.use_aur_for_packages))
