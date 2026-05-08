@@ -198,7 +198,6 @@ When overrides are specified, the system clones from the custom URL and checks o
 | `sync_any_packages.py` | Sync ARCH=any packages from x86_64 to target testing repos |
 | `generate_report.py` | Calculate repo stats and publish to DynamoDB |
 | `dynamo_reporter.py` | DynamoDB/S3 reporting module (build status, logs, stats) |
-| `queue_helper.py` | Legacy helper for SQLite build queue (mostly unused) |
 | `utils.py` | Shared utilities (validation, version comparison, DB parsing, etc.) |
 | `test_all.py` | Comprehensive test suite (88 tests) |
 

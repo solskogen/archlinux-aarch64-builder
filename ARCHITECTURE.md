@@ -267,9 +267,6 @@ Parses local `.db` files to count packages per repo, calculates outdated ARCH=an
 - `sync_repo_stats()`: Write heartbeat, load average, memory stats
 - `mark_aborted()`: Mark all QUEUED/BUILDING items as ABORTED
 
-#### `queue_helper.py`
-**Purpose**: Legacy helper for SQLite build queue status (mark/clear QUEUED entries in `reports/builds.db`). Mostly unused since migration to DynamoDB.
-
 ### 2. Utility Module (`utils.py`)
 
 **Package Validation**:
