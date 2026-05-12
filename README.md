@@ -162,6 +162,9 @@ When overrides are specified, the system clones from the custom URL and checks o
 ./repo_analyze.py --outdated-any     # Show outdated ARCH=any packages
 ./repo_analyze.py --target-only      # Show target-only packages
 ./repo_analyze.py --orphaned         # Show orphaned split packages
+./repo_analyze.py --broken-deps      # Show target packages with unresolvable dependencies
+./repo_analyze.py --unsatisfied-deps # Show unsatisfied version constraints (SONAME drift)
+./repo_analyze.py --blocked-by-blacklist  # Show missing packages blocked by blacklisted deps
 ```
 
 ### Dry Run
@@ -239,8 +242,9 @@ When overrides are specified, the system clones from the custom URL and checks o
 | `--preserve-chroot` | Preserve chroot even on successful builds |
 | `--cleanup-on-failure` | Delete temporary chroots even on build failure |
 | `--stop-on-failure` | Stop building on first package failure |
+| `--keep-going` | Try building packages even if their dependencies failed |
 | `--chroot DIR` | Custom chroot directory path |
-| `--parallel-jobs N` | Max packages to build in parallel (default: 1) |
+| `--parallel-jobs N` | Max packages to build in parallel (default: 1). Adaptive ramp-up: starts at 1, adds another every 20s if CPU idle ≥ 25% |
 | `--no-reporting` | Skip updating the DynamoDB build report |
 | `--no-check` | Skip installing checkdepends and running check() |
 
@@ -269,6 +273,9 @@ When overrides are specified, the system clones from the custom URL and checks o
 | `--target-newer` | Show packages where target architecture is newer |
 | `--target-only` | Show target architecture only packages |
 | `--orphaned` | Show orphaned split packages (removed upstream) |
+| `--broken-deps` | Show target packages with unresolvable dependencies |
+| `--unsatisfied-deps` | Show target packages with unsatisfied version constraints (includes SONAME drift) |
+| `--blocked-by-blacklist` | Show missing packages blocked by blacklisted dependencies |
 | `--target-only-files` | Print filenames of target-only packages in core/extra |
 
 ### find_dependents.py

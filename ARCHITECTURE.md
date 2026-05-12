@@ -110,8 +110,9 @@ Fields added during processing:
 - `--preserve-chroot`: Keep chroot after successful builds
 - `--cleanup-on-failure`: Delete temporary chroots even on build failure
 - `--stop-on-failure`: Stop on first failure
+- `--keep-going`: Try building packages even if their dependencies failed (default: cascade-skip)
 - `--chroot DIR`: Custom chroot directory
-- `--parallel-jobs N`: Max packages to build in parallel (default: 1)
+- `--parallel-jobs N`: Max packages to build in parallel (default: 1). Adaptive ramp-up: starts at 1, adds another when a build completes or every 20s if CPU idle ≥ 25%. Never exceeds this cap.
 - `--no-reporting`: Skip DynamoDB build status updates
 - `--no-check`: Skip installing checkdepends and running check()
 
@@ -139,7 +140,9 @@ Fields added during processing:
 **Parallel Building**:
 - Uses `ThreadPoolExecutor` with dependency-ready queue
 - Each package starts as soon as its dependencies complete
-- Adaptive: reduces to 1 job when CPU idle < 10%
+- Adaptive ramp-up: starts at 1 job; launches another when a build completes, or every 20s if CPU idle ≥ 25%; never exceeds `--parallel-jobs`
+- Cascade-skips dependents when a package fails (unless `--keep-going`)
+- Within-SCC checkdepends-only edges are dropped to break cycles that aren't actual build-order constraints
 - Mutex groups prevent conflicting packages from building concurrently (e.g., firefox variants)
 
 **Chroot Management**:
@@ -179,6 +182,9 @@ Fields added during processing:
 - Version differences (target newer than x86_64)
 - Target-only packages (with -bin version comparison)
 - Orphaned split packages (removed upstream but still in target)
+- Broken dependencies (target packages depending on something not available)
+- Unsatisfied version constraints (includes SONAME drift — e.g. a package links to libfoo.so=5 but target provides libfoo.so=6)
+- Missing packages blocked by blacklisted dependencies (with dep chain)
 
 **Command Line Options**:
 - `--blacklist FILE`: Skip blacklisted packages
@@ -191,6 +197,9 @@ Fields added during processing:
 - `--target-newer`: Show packages where target architecture is newer
 - `--target-only`: Show target architecture only packages
 - `--orphaned`: Show orphaned split packages (removed upstream)
+- `--broken-deps`: Show target packages with unresolvable dependencies
+- `--unsatisfied-deps`: Show target packages with unsatisfied version constraints (SONAME drift)
+- `--blocked-by-blacklist`: Show missing packages blocked by blacklisted deps
 - `--target-only-files`: Print filenames of target-only packages in core/extra
 
 #### `find_dependents.py`
@@ -244,9 +253,18 @@ Fields added during processing:
 - `--no-rsync`: Skip rsync, use existing mirror data
 
 #### `generate_report.py`
-**Purpose**: Calculate repo stats and publish to DynamoDB.
+**Purpose**: Calculate repo stats, reconcile DynamoDB state, and publish to `ArchBuilder-RepoStats`.
 
-Parses local `.db` files to count packages per repo, calculates outdated ARCH=any counts, checks which packages are in testing repos, and writes all stats to the `ArchBuilder-RepoStats` DynamoDB table.
+Parses local `.db` files (in parallel) to count packages per repo, calculates outdated ARCH=any counts, checks which packages are in testing repos, and writes all stats to the `ArchBuilder-RepoStats` DynamoDB table.
+
+Also reconciles drift between `ArchBuilder-Latest` and `ArchBuilder-Builds` when `build_packages.py` isn't running:
+- Revives stale QUEUED/BUILDING entries in Latest back to their true last terminal status
+- Deletes stale QUEUED/BUILDING rows from Builds (from aborted builds)
+- Reverts stale RETRY entries when no retry is pending in `auto_builder_failures.json`
+- General drift fix: for every Latest entry, compares against the true newest Builds entry in parallel (32-way), correcting any mismatch
+
+**Command Line Options**:
+- `-v`, `--verbose`: Show progress and timing for each step
 
 #### `dynamo_reporter.py`
 **Purpose**: DynamoDB/S3 reporting module used by build scripts.
