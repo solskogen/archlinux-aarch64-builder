@@ -943,8 +943,8 @@ echo "CHECKDEPENDS_END"
                         from concurrent.futures import wait, FIRST_COMPLETED
                         done, _ = wait(futures.keys(), timeout=5, return_when=FIRST_COMPLETED)
                         done_set = done
-                    if not done_set and futures:
-                        continue
+                    # Note: fall through even with no completions — ramp-up may be able to launch
+                    # more (e.g. after 20s + CPU-idle gate passes) while existing builds run.
 
                     # Process completions
                     for done in done_set:

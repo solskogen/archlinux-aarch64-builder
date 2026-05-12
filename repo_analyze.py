@@ -8,7 +8,7 @@ from packaging import version
 
 from utils import (
     load_blacklist, get_target_architecture, is_version_newer,
-    load_all_packages_parallel
+    load_all_packages_parallel, ArchVersionComparator
 )
 
 
@@ -93,19 +93,27 @@ def find_package_name_mismatches(x86_bases, x86_by_basename, target_by_basename,
     return mismatches
 
 
-def find_outdated_any_packages(target_by_basename, target_packages, x86_bases, target_arch):
+def find_outdated_any_packages(target_by_basename, target_packages, x86_bases, target_arch, x86_packages):
     """Find ARCH=any packages that are outdated compared to x86_64"""
     outdated = []
     
     for basename, pkg_names in target_by_basename.items():
         if basename not in x86_bases:
             continue
-        x86_version = x86_bases[basename]['version']
         x86_arch = x86_bases[basename].get('arch', 'unknown')
         
         for pkg_name in pkg_names:
             pkg = target_packages[pkg_name]
             target_pkg_arch = pkg.get('arch') or ('any' if pkg.get('filename', '').endswith('any.pkg.tar.zst') else 'unknown')
+            
+            # Compare against the actual x86 package of the same name, not basename —
+            # split packages (e.g. firefox-i18n-*) can lag behind their siblings during
+            # a partial rebuild, and using x86_bases[basename]['version'] gives an
+            # arbitrary sibling's version.
+            x86_pkg = x86_packages.get(pkg_name)
+            if not x86_pkg:
+                continue  # Not present under the same name on x86; skip
+            x86_version = x86_pkg['version']
             
             # Only report if target package is 'any' AND x86_64 package is also 'any'
             if target_pkg_arch == 'any' and x86_arch == 'any':
@@ -271,6 +279,164 @@ def find_orphaned_split_packages(x86_packages, target_packages, x86_bases):
     return orphans
 
 
+# --- Dependency health checks ----------------------------------------------
+
+def _parse_dep(dep_str):
+    """
+    Parse a pacman dep string into (name, op, version).
+    
+    Examples:
+        'glibc'             -> ('glibc', None, None)
+        'glibc>=2.41'       -> ('glibc', '>=', '2.41')
+        'libfoo.so=5-64'    -> ('libfoo.so', '=', '5-64')
+    """
+    import re
+    m = re.match(r'^([^<>=]+)(<=|>=|<|>|=)(.+)$', dep_str.strip())
+    if m:
+        return m.group(1).strip(), m.group(2), m.group(3).strip()
+    return dep_str.strip(), None, None
+
+
+def _constraint_satisfied(op, required, actual):
+    """Check if `actual` version satisfies `op required`."""
+    if op is None or actual is None:
+        return True
+    cmp = ArchVersionComparator.compare(actual, required)
+    return {'=': cmp == 0, '<': cmp < 0, '<=': cmp <= 0,
+            '>': cmp > 0, '>=': cmp >= 0}.get(op, True)
+
+
+def _build_target_provides_index(target_packages):
+    """
+    Build two lookups:
+      provides_name -> list of (provider_pkg, provided_version_or_None)
+      
+    Includes:
+      - Each package's own name (maps to its own version)
+      - Each package's basename
+      - Each PROVIDES entry (with version if present)
+    """
+    idx = {}
+    for name, pkg in target_packages.items():
+        ver = pkg.get('version')
+        idx.setdefault(name, []).append((name, ver))
+        basename = pkg.get('basename', name)
+        if basename != name:
+            idx.setdefault(basename, []).append((name, ver))
+        for provide in pkg.get('provides', []):
+            p_name, _, p_ver = _parse_dep(provide)
+            idx.setdefault(p_name, []).append((name, p_ver or ver))
+    return idx
+
+
+def find_broken_and_outdated_deps(target_packages, target_arch):
+    """
+    Scan every target package's runtime depends. Report:
+      - broken: dep name not resolvable in target at all
+      - unsatisfied: dep resolved but version constraint not met (covers SONAME drift)
+    
+    Only checks 'depends' (runtime) — makedepends don't affect shipped packages.
+    """
+    broken = []
+    unsatisfied = []
+    provides_idx = _build_target_provides_index(target_packages)
+    
+    for pkg_name, pkg in target_packages.items():
+        for dep_str in pkg.get('depends', []):
+            dep_name, op, req_ver = _parse_dep(dep_str)
+            providers = provides_idx.get(dep_name)
+            
+            if not providers:
+                broken.append(f"{pkg_name} depends on '{dep_str}' — not available on {target_arch}")
+                continue
+            
+            # Check if any provider satisfies the version constraint
+            if op is None:
+                continue  # No constraint, already satisfied by existence
+            
+            satisfied = False
+            details = []
+            for provider, actual_ver in providers:
+                if _constraint_satisfied(op, req_ver, actual_ver):
+                    satisfied = True
+                    break
+                details.append(f"{provider} provides {dep_name}={actual_ver or '(unversioned)'}")
+            
+            if not satisfied:
+                # Classify: SONAME drift (e.g. libfoo.so=5-64) vs normal version constraint
+                is_soname = '.so' in dep_name and op == '='
+                label = 'SONAME drift' if is_soname else 'unsatisfied'
+                unsatisfied.append(
+                    f"[{label}] {pkg_name} needs '{dep_str}' — target has: {'; '.join(details)}"
+                )
+    
+    return broken, unsatisfied
+
+
+def find_blocked_by_blacklist(missing_pkgbase, x86_packages, x86_bases,
+                               target_provides, blacklist):
+    """
+    For each missing pkgbase, walk its dependency chain. If any transitive dep
+    basename is blacklisted, the package is blocked — report the chain.
+    
+    Only considers runtime depends + makedepends (what actually must be built).
+    """
+    if not blacklist:
+        return []
+    
+    # Build reverse: x86 pkg_name -> basename (with provides)
+    x86_name_to_base = {}
+    for name, pkg in x86_packages.items():
+        x86_name_to_base[name] = pkg['basename']
+        for provide in pkg.get('provides', []):
+            p_name, _, _ = _parse_dep(provide)
+            x86_name_to_base.setdefault(p_name, pkg['basename'])
+    
+    def _matches_blacklist(basename):
+        for pat in blacklist:
+            if fnmatch.fnmatch(basename, pat):
+                return pat
+        return None
+    
+    blocked = []
+    for basename in missing_pkgbase:
+        if basename not in x86_bases:
+            continue
+        # BFS through deps
+        visited = {basename}
+        queue = [(basename, [basename])]
+        blockers = []
+        while queue:
+            current, path = queue.pop(0)
+            if current not in x86_bases:
+                continue
+            pkg = x86_bases[current]
+            for dep in pkg.get('depends', []) + pkg.get('makedepends', []):
+                dep_name, _, _ = _parse_dep(dep)
+                dep_base = x86_name_to_base.get(dep_name, dep_name)
+                if dep_base in visited:
+                    continue
+                visited.add(dep_base)
+                # Skip if already provided on target (not blocking us)
+                if dep_name in target_provides or dep_base in target_provides:
+                    continue
+                pat = _matches_blacklist(dep_base)
+                if pat:
+                    chain = ' -> '.join(path + [dep_base])
+                    blockers.append(f"{chain} [matches '{pat}']")
+                    continue  # Don't recurse through blacklisted nodes
+                if dep_base in x86_bases:
+                    queue.append((dep_base, path + [dep_base]))
+        if blockers:
+            blocked.append(f"{basename}: blocked by {blockers[0]}"
+                           + (f" (+{len(blockers)-1} more paths)" if len(blockers) > 1 else ""))
+    
+    return blocked
+
+
+# ---------------------------------------------------------------------------
+
+
 def print_section(title, items, show_empty=True):
     """Print a section with title and items"""
     if items:
@@ -304,6 +470,12 @@ def main():
                         help=f'Show {target_arch} only packages')
     parser.add_argument('--orphaned', action='store_true',
                         help='Show orphaned split packages (removed upstream but still in target)')
+    parser.add_argument('--broken-deps', action='store_true',
+                        help='Show target packages with unresolvable dependencies')
+    parser.add_argument('--unsatisfied-deps', action='store_true',
+                        help='Show target packages with unsatisfied version constraints (includes SONAME drift)')
+    parser.add_argument('--blocked-by-blacklist', action='store_true',
+                        help='Show missing packages blocked by blacklisted dependencies')
     parser.add_argument('--target-only-files', action='store_true',
                         help=f'Print filenames of {target_arch}-only packages in core/extra')
     # Legacy aliases
@@ -370,7 +542,8 @@ def main():
     
     # Determine what to show
     show_all = not any([args.outdated_any, args.missing_any, args.repo_issues, 
-                        args.target_newer, args.target_only, args.orphaned])
+                        args.target_newer, args.target_only, args.orphaned,
+                        args.broken_deps, args.unsatisfied_deps, args.blocked_by_blacklist])
     
     # Collect results
     results = {
@@ -379,7 +552,7 @@ def main():
             target_packages, x86_provides, target_provides, target_arch
         ) if show_all else [],
         'outdated_any': find_outdated_any_packages(
-            target_by_basename, target_packages, x86_bases, target_arch
+            target_by_basename, target_packages, x86_bases, target_arch, x86_packages
         ) if show_all or args.outdated_any else [],
         'missing_any': find_missing_any_packages(
             x86_bases, x86_packages, target_bases
@@ -404,10 +577,12 @@ def main():
         print_section("Outdated 'any' Packages in AArch64", results['outdated_any'])
     
     if show_all or args.missing_any:
-        print_section("Missing 'any' Packages in AArch64", results['missing_any'])
+        print_section("Missing 'any' Packages in AArch64", results['missing_any'],
+                      show_empty=not show_all)
     
     if show_all or args.repo_issues:
-        print_section("Repository Issues", results['repo_issues'])
+        print_section("Repository Issues", results['repo_issues'],
+                      show_empty=not show_all)
     
     if show_all or args.target_only:
         if results['target_only']:
@@ -424,6 +599,19 @@ def main():
     if show_all or args.orphaned:
         orphans = find_orphaned_split_packages(x86_packages, target_packages, x86_bases)
         print_section("Orphaned Split Packages (removed upstream)", orphans)
+    
+    if show_all or args.broken_deps or args.unsatisfied_deps:
+        broken, unsatisfied = find_broken_and_outdated_deps(target_packages, target_arch)
+        if show_all or args.broken_deps:
+            print_section("Broken Dependencies (dep not available on target)", broken)
+        if show_all or args.unsatisfied_deps:
+            print_section("Unsatisfied Dependencies (includes SONAME drift)", unsatisfied)
+    
+    if show_all or args.blocked_by_blacklist:
+        blocked = find_blocked_by_blacklist(
+            missing_pkgbase, x86_packages, x86_bases, target_provides, blacklist
+        )
+        print_section("Missing Packages Blocked by Blacklisted Deps", blocked)
     
     if show_all and not any(results.values()):
         print("No issues found")
