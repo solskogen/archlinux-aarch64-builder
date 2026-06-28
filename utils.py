@@ -783,6 +783,14 @@ def find_missing_dependencies(packages, x86_packages, target_packages):
             provide_name = provide.split('=')[0]
             target_provides[provide_name] = pkg
     
+    # Build provides mapping for x86_64 packages (resolves soname deps to package names)
+    x86_provides = {}
+    for name, pkg in x86_packages.items():
+        for provide in pkg.get('provides', []):
+            provide_name = provide.split('=')[0]
+            if provide_name not in x86_provides:
+                x86_provides[provide_name] = name
+    
     def check_dependencies_recursive(pkg_list):
         """Recursively check dependencies and add missing ones"""
         new_missing = set()
@@ -803,10 +811,15 @@ def find_missing_dependencies(packages, x86_packages, target_packages):
                     continue
                 
                 # Only consider it missing if it exists in x86_64
-                if dep_name in x86_packages:
+                # Resolve soname/virtual deps through provides mapping
+                resolved_name = dep_name
+                if dep_name not in x86_packages and dep_name in x86_provides:
+                    resolved_name = x86_provides[dep_name]
+                
+                if resolved_name in x86_packages:
                     # Check if the pkgbase exists and is up-to-date in target
-                    x86_pkg = x86_packages[dep_name]
-                    x86_basename = x86_pkg.get('basename', dep_name)
+                    x86_pkg = x86_packages[resolved_name]
+                    x86_basename = x86_pkg.get('basename', resolved_name)
                     
                     # Skip if pkgbase exists in target and is up-to-date or newer
                     if x86_basename in target_provides:
@@ -814,8 +827,8 @@ def find_missing_dependencies(packages, x86_packages, target_packages):
                         if not is_version_newer(target_pkg['version'], x86_pkg['version']):
                             continue
                     
-                    missing_deps.add(dep_name)
-                    new_missing.add(dep_name)
+                    missing_deps.add(resolved_name)
+                    new_missing.add(resolved_name)
                     processed.add(dep_name)
         
         # Recursively check dependencies of newly found missing packages

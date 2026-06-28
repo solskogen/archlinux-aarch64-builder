@@ -7,9 +7,9 @@ discord
 teamspeak3-server
 wine-mono
 cozy-desktop
-hsa-amd-aqlprofile-bin
 intel-oneapi-base-toolkit
 intel-oneapi-basekit
+oneccl
 
 #does not make sense on aarch64
 syslinux
@@ -22,28 +22,27 @@ libx86
 thermald
 xf86-video-vesa
 xf86-video-intel
-amdsmi
 iucode-tool
 fasm
 framework-system
 xf86-input-vmmouse
-#virtualbox
 virtualbox-host-modules-arch
 vpl-gpu-rt
 mesa-amber
 libva-intel-driver
 libvpl-tools
 fastflowlm
+intel-lpmd
+intel-oneapi-toolkit
 
 #isn't supported on aarch64
 dmd
-intel-media-sdk
+#intel-media-sdk
 boxxy
 bugstalker
 bumblebee
 embree3
 teeworlds
-wavegain
 yabridge
 yate
 hyperscan
@@ -53,7 +52,6 @@ nvidia-cg-toolkit
 smlnj
 broadcom-wl
 rpp
-#rocprofiler
 occt
 
 #packages that we don't have (yet)

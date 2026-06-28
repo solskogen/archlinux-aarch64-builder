@@ -91,7 +91,7 @@ def _promote_if_testing_has_packages():
     if has_packages:
         run_step(["sudo", "sh", MOVE_SCRIPT],
                  "Moving testing packages to stable")
-
+        run_step(["./generate_report.py"], "Refreshing report")
 
 
 def _background_reporter(stop_event):
@@ -165,7 +165,6 @@ def run_cycle(args):
             except Exception:
                 pass
         _promote_if_testing_has_packages()
-        run_step(["./generate_report.py"], "Refreshing report")
         return False
 
     # Filter out previously failed packages (same version)
@@ -360,22 +359,9 @@ def main():
             if args.once or not running:
                 break
 
-            if built:
-                continue
-
-            # Skip wait if there are packages to retry
-            try:
-                import json as _json
-                _fp = _json.loads(Path("auto_builder_failures.json").read_text()) if Path("auto_builder_failures.json").exists() else {}
-                has_retry = any(isinstance(v, dict) and v.get("count", 0) < 2 for v in _fp.values())
-            except Exception:
-                has_retry = False
-            if has_retry:
-                print(f"[{timestamp()}] Packages pending retry, starting next cycle immediately")
-                continue
-
-            print(f"[{timestamp()}] Next cycle in {args.interval}s")
-            for i in range(args.interval):
+            wait = 10 if built else args.interval
+            print(f"[{timestamp()}] Next cycle in {wait}s")
+            for i in range(wait):
                 if not running:
                     break
                 time.sleep(1)

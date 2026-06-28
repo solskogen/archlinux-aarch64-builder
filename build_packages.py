@@ -471,7 +471,7 @@ echo "CHECKDEPENDS_END"
                 pass  # Don't fail if we can't write the footer
             # Upload log and update DynamoDB
             dr = self._get_dynamo()
-            if dr and not self.dry_run:
+            if dr and not self.dry_run and not self.no_reporting:
                 end_iso = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
                 dur = int((datetime.datetime.now(datetime.timezone.utc) - build_start_ts).total_seconds())
                 avg_cpu_pct = None
@@ -607,6 +607,19 @@ echo "CHECKDEPENDS_END"
                 provide_name = provide.split('=')[0].strip()
                 provides_map[provide_name] = pkg_name
         
+        # Map split package names to their pkgbase (e.g. python-protobuf -> protobuf)
+        # so that dependency failure cascading works across split packages
+        basenames_in_build = {pkg.get('basename', pkg['name']): pkg['name'] for pkg in packages}
+        try:
+            from utils import load_x86_64_packages
+            x86_pkgs = load_x86_64_packages(download=False)
+            for name, pkg_data in x86_pkgs.items():
+                base = pkg_data.get('basename', name)
+                if base in basenames_in_build and name not in provides_map:
+                    provides_map[name] = basenames_in_build[base]
+        except Exception:
+            pass
+        
         # Filter out packages with skip=1
         packages = [pkg for pkg in packages if not pkg.get('skip', 0) == PACKAGE_SKIP_FLAG]
         
@@ -641,7 +654,7 @@ echo "CHECKDEPENDS_END"
         if continue_build and Path("last_successful.txt").exists():
             already_built = set(Path("last_successful.txt").read_text().strip().split('\n'))
         dr = self._get_dynamo()
-        if dr and not self.dry_run:
+        if dr and not self.dry_run and not self.no_reporting:
             self._build_ids = dr.mark_queued([p for p in packages if p['name'] not in already_built])
         else:
             self._build_ids = {}
@@ -718,15 +731,16 @@ echo "CHECKDEPENDS_END"
         # Adaptive ramp-up state. Rules:
         #   - parallel_jobs is the hard cap (never exceeded).
         #   - First launch is immediate (no CPU sample yet).
-        #   - Subsequent launches gated by either:
-        #       (a) a build completed since the last launch (slot opened naturally), OR
-        #       (b) ≥20s have passed since the last launch AND CPU idle ≥ 25%.
-        #   - If CPU is too busy, we skip launching and re-check every poll cycle.
+        #   - Subsequent launches: check CPU idle ≥ 25%.
+        #     - If yes → launch immediately.
+        #     - If no → wait at least 20s before sampling again to let the
+        #       previous launch actually claim its CPU share.
         RAMP_WAIT_SECS = 20.0
         IDLE_THRESHOLD_PCT = 25.0
+        LAUNCH_COOLDOWN_SECS = 3.0  # Pause between finishing one build and starting the next
         ramp_state = {
-            'last_launch': 0.0,
-            'last_completion': 0.0,
+            'last_gate_check': 0.0,   # last time we sampled CPU and decided "busy"
+            'last_launch': 0.0,       # last time we launched a build
             'gated_logged': False,
         }
 
@@ -739,22 +753,22 @@ echo "CHECKDEPENDS_END"
             if n_running == 0:
                 return True
             now = _time.time()
-            since_launch = now - ramp_state['last_launch']
-            # If a build completed after the last launch, slot freed naturally — launch immediately
-            if ramp_state['last_completion'] > ramp_state['last_launch']:
-                return True
-            # Otherwise require 20s since last launch before sampling CPU
-            if since_launch < RAMP_WAIT_SECS:
+            # Brief cooldown after a launch to let it start consuming CPU
+            if now - ramp_state['last_launch'] < LAUNCH_COOLDOWN_SECS:
                 return False
-            # Enough time has passed — check CPU headroom
+            # If we recently sampled CPU and found it busy, don't re-sample for 20s.
+            if now - ramp_state['last_gate_check'] < RAMP_WAIT_SECS:
+                return False
+            # Sample CPU idle (1s sample). 25% is the floor.
             idle = _cpu_idle_pct()
-            if idle >= IDLE_THRESHOLD_PCT:
-                ramp_state['gated_logged'] = False
-                return True
-            if not ramp_state['gated_logged']:
-                print(f"  [ramp-up] CPU idle {idle:.1f}% < {IDLE_THRESHOLD_PCT}%, holding at {n_running}/{parallel_jobs}")
-                ramp_state['gated_logged'] = True
-            return False
+            if idle < IDLE_THRESHOLD_PCT:
+                ramp_state['last_gate_check'] = _time.time()
+                if not ramp_state['gated_logged']:
+                    print(f"  [ramp-up] CPU idle {idle:.1f}% < {IDLE_THRESHOLD_PCT}%, holding at {n_running}/{parallel_jobs}")
+                    ramp_state['gated_logged'] = True
+                return False
+            ramp_state['gated_logged'] = False
+            return True
 
         def _mark_launched():
             ramp_state['last_launch'] = _time.time()
@@ -762,6 +776,10 @@ echo "CHECKDEPENDS_END"
 
         def _mark_completed():
             ramp_state['last_completion'] = _time.time()
+            # Reset CPU gate so we re-sample on next launch attempt
+            ramp_state['last_gate_check'] = 0.0
+            # Enforce LAUNCH_COOLDOWN_SECS pause before next build
+            ramp_state['last_launch'] = _time.time()
 
         # Build remaining_deps: for each package, which in-list packages must complete first
         all_pkg_names = {pkg['name'] for pkg in packages[start_index:]}
@@ -939,9 +957,12 @@ echo "CHECKDEPENDS_END"
                     # Quick poll for completions
                     done_set = {f for f in futures if f.done()}
                     if not done_set and futures:
-                        # Wait briefly for any future to complete (handles both fast skips and slow builds)
+                        # Use short timeout if packages are waiting to launch (cooldown period)
+                        # Use longer timeout if we're just waiting for builds to finish
+                        has_ready = bool(get_ready())
+                        poll_timeout = LAUNCH_COOLDOWN_SECS + 0.5 if has_ready else 5
                         from concurrent.futures import wait, FIRST_COMPLETED
-                        done, _ = wait(futures.keys(), timeout=5, return_when=FIRST_COMPLETED)
+                        done, _ = wait(futures.keys(), timeout=poll_timeout, return_when=FIRST_COMPLETED)
                         done_set = done
                     # Note: fall through even with no completions — ramp-up may be able to launch
                     # more (e.g. after 20s + CPU-idle gate passes) while existing builds run.
@@ -1022,6 +1043,7 @@ echo "CHECKDEPENDS_END"
                 if self._interrupted:
                     break
                 i, pkg = pkg_by_key[key]
+                _t0 = _time.time()
                 success = self._build_single_package(i, pkg, len(packages),
                                                     cycle_info, cycle_stage_1_success, provides_map, failed_packages,
                                                     failed_lock, success_lock, cycle_lock)
@@ -1041,7 +1063,8 @@ echo "CHECKDEPENDS_END"
                     if self.stop_on_failure:
                         print(f"Stopping build process due to failure in {pkg['name']}")
                         break
-                self._ingest_report()
+                if _time.time() - _t0 > 10:
+                    self._ingest_report()
 
         # Clean up temp chroots
         if not self.preserve_chroot and not failed_packages:
@@ -1072,15 +1095,22 @@ echo "CHECKDEPENDS_END"
         print(f"  Failed: {len(failed_packages)}")
         print(f"{'='*SEPARATOR_WIDTH}")
         
-        # Clean up stale QUEUED records from this cycle
+        # Clean up stale QUEUED/BUILDING records from this cycle
         dr = self._get_dynamo()
         if dr and not self.dry_run and self._build_ids:
             try:
                 table = dr._get_ddb().Table("ArchBuilder-Builds")
+                latest = dr._get_ddb().Table("ArchBuilder-Latest")
                 for name, bid in self._build_ids.items():
                     resp = table.get_item(Key={"PkgName": name, "BuildId": bid}, ProjectionExpression="#s", ExpressionAttributeNames={"#s": "Status"})
-                    if resp.get("Item", {}).get("Status") == "QUEUED":
+                    status = resp.get("Item", {}).get("Status")
+                    if status in ("QUEUED", "BUILDING"):
                         table.delete_item(Key={"PkgName": name, "BuildId": bid})
+                        # Reconcile Latest: find the true latest non-transient status
+                        r = table.query(KeyConditionExpression="PkgName = :p", ExpressionAttributeValues={":p": name}, ScanIndexForward=False, Limit=1, ProjectionExpression="#s", ExpressionAttributeNames={"#s": "Status"})
+                        items = r.get("Items", [])
+                        if items and items[0]["Status"] not in ("QUEUED", "BUILDING"):
+                            latest.put_item(Item={"PkgName": name, "Status": items[0]["Status"]})
             except Exception as e:
                 print(f"Warning: Failed to clean up QUEUED records: {e}")
         
@@ -1103,6 +1133,11 @@ echo "CHECKDEPENDS_END"
                 successful = set(state_file.read_text().strip().split('\n'))
                 if pkg_name in successful:
                     print(f"\n[{i}/{total_packages}] Skipping {pkg_name} (already built successfully)")
+                    # Clean up QUEUED record since we're not building
+                    dr = self._get_dynamo()
+                    if dr and pkg_name in self._build_ids and not self.no_reporting:
+                        table = dr._get_ddb().Table("ArchBuilder-Builds")
+                        table.delete_item(Key={"PkgName": pkg_name, "BuildId": self._build_ids[pkg_name]})
                     return True
             except Exception:
                 pass

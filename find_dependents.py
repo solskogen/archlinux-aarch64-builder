@@ -130,13 +130,14 @@ def load_packages():
     
     db_files = [
         (f"core_{target_arch}.db", "core"),
-        (f"extra_{target_arch}.db", "extra")
+        (f"extra_{target_arch}.db", "extra"),
+        (f"forge_{target_arch}.db", "forge")
     ]
     
     for db_file, repo_name in db_files:
         db_path = Path(db_file)
         if db_path.exists():
-            repo_packages = parse_database_file(db_path)
+            repo_packages = parse_database_file(db_path, include_any=True)
             for pkg in repo_packages.values():
                 pkg['repo'] = repo_name
             packages.update(repo_packages)
@@ -178,6 +179,18 @@ def main():
     if not packages:
         print("No packages found", file=sys.stderr)
         sys.exit(1)
+
+    # Validate that queried packages exist
+    all_names = set(packages.keys())
+    all_basenames = {pkg['basename'] for pkg in packages.values()}
+    all_provides = set()
+    for pkg in packages.values():
+        for p in pkg.get('provides', []):
+            all_provides.add(p.split('=')[0].split('>')[0].split('<')[0])
+    for name in args.package:
+        if name not in all_names and name not in all_basenames and name not in all_provides:
+            print(f"Error: package '{name}' not found in database", file=sys.stderr)
+            sys.exit(1)
 
     # Build set of names to ignore: requested names plus their pkgbase equivalents.
     ignore_set = set()

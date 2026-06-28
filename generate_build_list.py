@@ -665,7 +665,8 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
         basename = pkg['basename']
         if basename not in target_bases:
             target_bases[basename] = {'version': pkg['version']}
-        elif is_version_newer(target_bases[basename]['version'], pkg['version']):
+        elif name == basename:
+            # Prefer the version of the main package (name matches basename)
             target_bases[basename] = {'version': pkg['version']}
     
     newer_in_x86 = []
@@ -2207,5 +2208,5 @@ if __name__ == "__main__":
             for pkg_name in sorted(set(outdated_toolchain)):
                 print(f"  - {pkg_name}")
             print(f"\nConsider running a bootstrap build:")
-            print(f"  ./build_packages.py --bootstrap-toolchain")
+            print(f"  ./bootstrap_toolchain.py")
             print(f"{'='*60}")
