@@ -382,7 +382,7 @@ echo "$fullver"
                 if pkg.get('force_latest', False):
                     info(f"[{i}/{total}] Processing {name} (updating to latest commit)...")
                     # Stash changes, checkout main, pull, then restore
-                    stash_result = subprocess.run(["git", "stash"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
+                    stash_result = subprocess.run(["git", "stash", "--include-untracked"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
                     has_changes = "No local changes to save" not in stash_result.stdout
                     
                     # Get the default branch dynamically or use override
@@ -451,7 +451,7 @@ echo "$fullver"
                     subprocess.run(["git", "fetch", "--tags"], cwd=pkg_repo_dir, check=True, capture_output=True)
                     
                     # Stash changes before checkout
-                    stash_result = subprocess.run(["git", "stash"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
+                    stash_result = subprocess.run(["git", "stash", "--include-untracked"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
                     has_changes = "No local changes to save" not in stash_result.stdout
                     
                     # Try different tag formats - replace : with - for git tags
@@ -710,14 +710,26 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
             for dep in all_deps:
                 dep_name = extract_dep_name(dep)
                 # Check dep name and its pkgbase against blacklist
-                if bl.matches(dep_name):
-                    blacklisted_dep = dep_name
-                    break
-                if full_x86_packages and dep_name in full_x86_packages:
+                is_dep_blacklisted = bl.matches(dep_name)
+                if not is_dep_blacklisted and full_x86_packages and dep_name in full_x86_packages:
                     dep_basename = full_x86_packages[dep_name].get('basename', dep_name)
                     if dep_basename != dep_name and bl.matches(dep_basename):
-                        blacklisted_dep = dep_name
-                        break
+                        is_dep_blacklisted = True
+                if is_dep_blacklisted:
+                    # Dep is blacklisted - but check if something ELSE provides it in target
+                    # (e.g. vectorscan provides hyperscan)
+                    if dep_name in target_provides:
+                        provider = target_provides[dep_name]
+                        provider_name = provider['name'] if isinstance(provider, dict) else dep_name
+                        provider_basename = provider.get('basename', provider_name) if isinstance(provider, dict) else dep_name
+                        # If the provider is the blacklisted package itself, block it
+                        if bl.matches(provider_name) or bl.matches(provider_basename):
+                            blacklisted_dep = dep_name
+                            break
+                        # Otherwise an alternative provides it - allow
+                        continue
+                    blacklisted_dep = dep_name
+                    break
             if blacklisted_dep:
                 skipped_packages.append(f"{basename} (depends on blacklisted package: {blacklisted_dep})")
                 continue

@@ -190,12 +190,14 @@ class PackageBuilder:
         """Create temporary chroot for package"""
         import datetime
         timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S")
-        temp_copy_name = f"temp-{pkg_name}-{timestamp}"
+        # Sanitize pkg_name for systemd-nspawn machine name (no + allowed)
+        safe_name = pkg_name.replace('+', 'x')
+        temp_copy_name = f"temp-{safe_name}-{timestamp}"
         temp_copy_path = self.chroot_path / temp_copy_name
         while temp_copy_path.exists():
             # If timestamp collision, add microseconds
             timestamp = datetime.datetime.now().strftime("%Y%m%d%H%M%S%f")[:14]
-            temp_copy_name = f"temp-{pkg_name}-{timestamp}"
+            temp_copy_name = f"temp-{safe_name}-{timestamp}"
             temp_copy_path = self.chroot_path / temp_copy_name
         with self.temp_copies_lock:
             self.temp_copies.append(temp_copy_path)

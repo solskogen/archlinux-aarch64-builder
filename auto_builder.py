@@ -256,8 +256,7 @@ def run_cycle(args):
     _sync_db()
 
     post_pipeline = (
-        "sync && sleep 3"
-        " && sudo sh " + MOVE_SCRIPT + ""
+        "sudo sh " + MOVE_SCRIPT + ""
         " && (fd -I pkg.tar.zst pkgbuilds | xargs rm -v )"
     )
     run_step(post_pipeline, "Post-build pipeline", shell=True)

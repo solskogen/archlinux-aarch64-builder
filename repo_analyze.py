@@ -37,7 +37,7 @@ def group_by_basename(packages):
     return bases, by_basename, repo_count
 
 
-def is_blacklisted(basename, pkg_data, blacklist):
+def is_blacklisted(basename, pkg_data, blacklist, x86_packages=None, target_provides=None):
     """Check if package or its dependencies are blacklisted"""
     for pattern in blacklist:
         if fnmatch.fnmatch(basename, pattern):
@@ -46,9 +46,19 @@ def is_blacklisted(basename, pkg_data, blacklist):
     all_deps = pkg_data.get('depends', []) + pkg_data.get('makedepends', [])
     for dep in all_deps:
         dep_name = dep.split('=')[0].split('>')[0].split('<')[0]
+        # Skip if already provided by target repo (e.g. vectorscan provides hyperscan)
+        if target_provides and dep_name in target_provides:
+            continue
         for pattern in blacklist:
             if fnmatch.fnmatch(dep_name, pattern):
                 return True
+        # Also check dep's pkgbase
+        if x86_packages and dep_name in x86_packages:
+            dep_basename = x86_packages[dep_name].get('basename', dep_name)
+            if dep_basename != dep_name:
+                for pattern in blacklist:
+                    if fnmatch.fnmatch(dep_basename, pattern):
+                        return True
     return False
 
 
@@ -508,7 +518,7 @@ def main():
     missing_pkgbase = [
         basename for basename in x86_bases
         if (basename not in target_bases and 
-            not is_blacklisted(basename, x86_bases[basename], blacklist) and
+            not is_blacklisted(basename, x86_bases[basename], blacklist, x86_packages, target_provides) and
             x86_bases[basename].get('arch') != 'any')
     ]
     
