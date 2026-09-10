@@ -25,15 +25,31 @@ GCC_REPO_URL = "https://gitlab.archlinux.org/solskogen/gcc.git"
 GCC_BRANCH = "experimental"
 
 # Toolchain configuration - staged build
-STAGE1_PACKAGES = [
-    "linux-api-headers", "glibc", "binutils", "gcc", "gmp", "mpfr", "libmpc", "libisl"
+# One round = a full rebuild of the toolchain in dependency order, following the
+# declared deps: binutils needs glibc; gmp needs glibc; mpfr needs gmp; libmpc
+# needs gmp+mpfr; libisl needs gmp; gcc needs binutils, libmpc and libisl. The
+# previous lists built gcc before libmpc/libisl, so gcc was always compiled
+# against the *old* support libraries.
+_TOOLCHAIN_ROUND = [
+    "glibc", "binutils", "gmp", "mpfr", "libmpc", "libisl", "gcc"
 ]
 
-STAGE2_PACKAGES = [
-    "glibc", "binutils", "gcc", "gmp", "mpfr", "libmpc", "libisl", "libtool", "valgrind"
-]
+# Round 1 bootstraps from whatever is currently published.
+STAGE1_PACKAGES = ["linux-api-headers"] + _TOOLCHAIN_ROUND
 
-ALL_BOOTSTRAP_PACKAGES = list(dict.fromkeys(STAGE1_PACKAGES + STAGE2_PACKAGES))
+# Round 2 rebuilds everything again, so that no shipped artifact was produced by
+# the pre-existing toolchain.
+STAGE2_PACKAGES = list(_TOOLCHAIN_ROUND)
+
+# gcc self-bootstraps internally (it compiles itself three times and compares
+# stage 2 against stage 3), so the compiler is self-consistent regardless of what
+# built it. glibc and binutils have no such internal check and are built exactly
+# once per round, so rebuild them here with the final compiler. libtool and
+# valgrind are leaves that only consume the finished toolchain.
+STAGE3_PACKAGES = ["glibc", "binutils", "libtool", "valgrind"]
+
+ALL_BOOTSTRAP_PACKAGES = list(dict.fromkeys(
+    STAGE1_PACKAGES + STAGE2_PACKAGES + STAGE3_PACKAGES))
 
 REQUIRED_TOOLS = ['makechrootpkg', 'pkgctl', 'repo-upload', 'arch-nspawn']
 
@@ -85,7 +101,18 @@ class BootstrapBuilder(BuildUtils):
         # Create directories
         self.build_dir.mkdir(exist_ok=True)
         self.logs_dir.mkdir(exist_ok=True)
-        
+
+        # makechrootpkg leaves its flock files behind, so a previous run's
+        # build-*.lock / root.lock linger in the chroot dir. Clear them here the
+        # same way build_packages.py does, so a fresh run starts clean.
+        if self.chroot_path.exists() and not self.dry_run:
+            for lock_file in self.chroot_path.glob("*.lock"):
+                try:
+                    lock_file.unlink()
+                    print(f"Removed stale lock file: {lock_file}")
+                except Exception:
+                    pass
+
         # Setup chroot using shared utility
         self.setup_chroot(self.chroot_path, self.cache_path)
     
@@ -124,9 +151,24 @@ class BootstrapBuilder(BuildUtils):
             print(f"ERROR: Failed to clear cache: {e}")
             sys.exit(1)  # Cache corruption is fatal for bootstrap
     
-    def bootstrap_build_package(self, pkg_name):
-        """Build a single package in bootstrap mode"""
+    def bootstrap_build_package(self, pkg_name, fast_gcc=False, stage_num=None):
+        """Build a single package in bootstrap mode.
+
+        fast_gcc requests the cheap non-bootstrapped gcc build. makechrootpkg
+        bind-mounts the package directory at /startdir (and only forwards
+        SOURCE_DATE_EPOCH/BUILDTOOL/BUILDTOOLVER into the container, so an
+        environment variable would not reach the PKGBUILD), hence the request is
+        signalled with a marker file the gcc PKGBUILD tests for.
+
+        stage_num names the chroot copy after the stage, so glibc built in stage 1
+        and again in stage 3 no longer share one opaque "build-glibc" directory.
+        Each copy is ~2-4GB and, being unique per (stage, package), is never
+        reused, so it is removed again after a successful build; a failed build
+        keeps its copy for inspection.
+        """
         pkg_dir = self.build_dir / pkg_name
+        fast_marker = pkg_dir / ".gcc-fast-bootstrap"
+        copy_name = f"build-s{stage_num}-{pkg_name}" if stage_num else f"build-{pkg_name}"
         
         if not pkg_dir.exists() and not self.dry_run:
             if pkg_name == "gcc":
@@ -151,7 +193,7 @@ class BootstrapBuilder(BuildUtils):
             self.format_dry_run(f"Would bootstrap build {pkg_name}", [
                 f"arch-nspawn {self.chroot_path}/root pacman -Syu --noconfirm {' '.join(all_toolchain)}",
                 f"sudo rm -rf {self.cache_path}",
-                f"makechrootpkg -l build-{pkg_name} -r {self.chroot_path} -d {self.cache_path} -c -u -- --ignorearch",
+                f"makechrootpkg -l {copy_name} -r {self.chroot_path} -d {self.cache_path} -c -u -- --ignorearch",
                 f"repo-upload *.pkg.tar.zst --arch {self.target_arch} --repo {target_repo}",
                 f"sudo rm -rf {self.cache_path}"
             ])
@@ -173,7 +215,14 @@ class BootstrapBuilder(BuildUtils):
         
         # Clear pacman cache before build
         self.clear_cache()
-        
+
+        # Signal the cheap gcc build. Removed again in the finally below so a
+        # crashed round-1 build can never leave it behind and silently turn a
+        # later, load-bearing gcc into a non-bootstrapped one.
+        if fast_gcc:
+            print("Using fast (non-bootstrapped) gcc build for this round")
+            fast_marker.touch()
+
         # Build package
         try:
             env = os.environ.copy()
@@ -189,7 +238,7 @@ class BootstrapBuilder(BuildUtils):
             
             cmd = [
                 "makechrootpkg",
-                "-l", f"build-{pkg_name}",
+                "-l", copy_name,
                 "-r", str(self.chroot_path),
                 "-d", str(self.cache_path),
                 "-c", "-u",
@@ -240,12 +289,30 @@ class BootstrapBuilder(BuildUtils):
             
             # Clear cache after successful build to force using newly uploaded packages
             self.clear_cache()
-            
+
+            # Drop the chroot copy now that it succeeded. It is unique per
+            # (stage, package) so it would never be reused, and each one is
+            # 2-4GB. A failed build skips this and keeps its copy to inspect.
+            copy_path = self.chroot_path / copy_name
+            for target in (copy_path, Path(f"{copy_path}.lock")):
+                try:
+                    if target.is_dir():
+                        subprocess.run(["sudo", "rm", "-rf", "--one-file-system",
+                                        str(target)], check=True)
+                    elif target.exists():
+                        subprocess.run(["sudo", "rm", "-f", str(target)], check=True)
+                except Exception as e:
+                    print(f"Warning: could not remove {target}: {e}")
+
             return True
             
         except subprocess.CalledProcessError as e:
             print(f"ERROR: Failed to bootstrap build {pkg_name}: {e}")
             sys.exit(1)
+        finally:
+            # Never leave the marker behind: a stale one would silently downgrade
+            # the stage 2/3 gcc to a non-bootstrapped build.
+            fast_marker.unlink(missing_ok=True)
     
     def build_stage(self, stage_name, packages, stage_num, total_stages):
         """Build a stage of packages"""
@@ -263,7 +330,12 @@ class BootstrapBuilder(BuildUtils):
                 continue
                 
             print(f"\n--- Building {pkg_name} ({i + 1}/{len(packages)}) ---")
-            success = self.bootstrap_build_package(pkg_name)
+            # The round-1 gcc is a throwaway: it exists only to rebuild the
+            # toolchain from current source and is replaced in stage 2, so skip
+            # its expensive internal bootstrap/PGO. See bootstrap_build_package.
+            success = self.bootstrap_build_package(
+                pkg_name, fast_gcc=(stage_num == 1 and pkg_name == "gcc"),
+                stage_num=stage_num)
             if not success:
                 print(f"ERROR: Failed to build {pkg_name}")
                 sys.exit(1)
@@ -334,6 +406,9 @@ class BootstrapBuilder(BuildUtils):
         print(f"Target architecture: {self.target_arch}")
         print(f"Stage 1: {len(STAGE1_PACKAGES)} packages")
         print(f"Stage 2: {len(STAGE2_PACKAGES)} packages")
+        print(f"Stage 3: {len(STAGE3_PACKAGES)} packages")
+        print(f"Total build invocations: "
+              f"{len(STAGE1_PACKAGES) + len(STAGE2_PACKAGES) + len(STAGE3_PACKAGES)}")
         
         # Lock file in current directory (not BUILD_ROOT which gets cleared)
         lock_file = Path("bootstrap.lock")
@@ -412,19 +487,22 @@ class BootstrapBuilder(BuildUtils):
             self.clear_cache()
             
             # Build stages
+            #
+            # A stage can only return 0 when every package in it was skipped,
+            # which is exactly what --continue/--start-from are supposed to do:
+            # build_stage() already sys.exit(1)s on a real build failure. The old
+            # "built == 0 -> error" guards therefore fired spuriously whenever
+            # --continue resumed past a completed stage, so they are gone.
             total_built = 0
-            
-            stage1_built = self.build_stage("Stage 1 - Initial Build", STAGE1_PACKAGES, 1, 2)
-            if stage1_built == 0 and len(STAGE1_PACKAGES) > 0:
-                print("ERROR: Stage 1 failed - no packages were built")
-                sys.exit(1)
-            total_built += stage1_built
-            
-            stage2_built = self.build_stage("Stage 2 - Final Rebuild", STAGE2_PACKAGES, 2, 2)
-            if stage2_built == 0 and len(STAGE2_PACKAGES) > 0:
-                print("ERROR: Stage 2 failed - no packages were built")
-                sys.exit(1)
-            total_built += stage2_built
+
+            total_built += self.build_stage(
+                "Stage 1 - Initial Build", STAGE1_PACKAGES, 1, 3)
+
+            total_built += self.build_stage(
+                "Stage 2 - Rebuild With Current-Source Tools", STAGE2_PACKAGES, 2, 3)
+
+            total_built += self.build_stage(
+                "Stage 3 - Final libc/linker With Final Compiler", STAGE3_PACKAGES, 3, 3)
             
             print(f"\n=== Bootstrap Summary ===")
             print(f"Successfully built: {total_built} packages total")

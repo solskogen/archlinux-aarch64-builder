@@ -17,6 +17,7 @@ Key features:
 import json
 import sys
 import os
+import fnmatch
 import subprocess
 import signal
 import argparse
@@ -43,8 +44,43 @@ class PackageBuilder:
 
     # Packages that cannot build concurrently (e.g., port conflicts in tests)
     MUTEX_GROUPS = [
-        {'firefox', 'firefox-developer-edition'},
+        {'firefox', 'firefox-developer-edition', 'librewolf'},
     ]
+
+    # Whole families that cannot build concurrently, matched with fnmatch.
+    # Every package matching the same pattern excludes every other one, so new
+    # electron majors (and the -bin repackages) are covered without editing this
+    # list. Electron builds are huge, so several at once thrash RAM and disk.
+    MUTEX_PATTERNS = [
+        'electron*',
+    ]
+
+    @classmethod
+    def _mutex_keys(cls, pkg_name):
+        """Identify every mutex family a package belongs to.
+
+        Literal groups and patterns each yield a distinct key, and a conflict is
+        simply two packages sharing a key. Using the pattern itself as the key is
+        what makes electron40 and electron41 collide while leaving unrelated
+        packages alone.
+        """
+        keys = set()
+        for idx, group in enumerate(cls.MUTEX_GROUPS):
+            if pkg_name in group:
+                keys.add(f"group:{idx}")
+        for pattern in cls.MUTEX_PATTERNS:
+            if fnmatch.fnmatch(pkg_name, pattern):
+                keys.add(f"pattern:{pattern}")
+        return keys
+
+    @classmethod
+    def _has_mutex_conflict(cls, pkg_name, running_names):
+        """True if pkg_name shares a mutex family with an already-running build."""
+        keys = cls._mutex_keys(pkg_name)
+        if not keys:
+            return False
+        return any(keys & cls._mutex_keys(other)
+                   for other in running_names if other != pkg_name)
 
     @staticmethod
     def _get_dynamo():
@@ -107,6 +143,37 @@ class PackageBuilder:
         dr = self._get_dynamo()
         if dr:
             dr.sync_repo_stats()
+
+    def _drop_queued_record(self, pkg_name, build_id):
+        """Delete a QUEUED/BUILDING Builds row and keep Latest consistent.
+
+        Deleting the row on its own strands Latest on QUEUED whenever the package has
+        no other build history, and nothing can repair it afterwards because there is
+        no status left to derive one from. Reconcile here instead: fall back to the
+        newest remaining real result, or drop the Latest entry when there is none.
+        """
+        dr = self._get_dynamo()
+        if not dr:
+            return
+        try:
+            builds = dr._get_ddb().Table("ArchBuilder-Builds")
+            latest = dr._get_ddb().Table("ArchBuilder-Latest")
+            builds.delete_item(Key={"PkgName": pkg_name, "BuildId": build_id})
+            resp = builds.query(
+                KeyConditionExpression="PkgName = :p",
+                ExpressionAttributeValues={":p": pkg_name},
+                ScanIndexForward=False, Limit=1,
+                ProjectionExpression="#s",
+                ExpressionAttributeNames={"#s": "Status"})
+            items = resp.get("Items", [])
+            if items:
+                if items[0]["Status"] not in ("QUEUED", "BUILDING"):
+                    latest.put_item(Item={"PkgName": pkg_name,
+                                          "Status": items[0]["Status"]})
+            else:
+                latest.delete_item(Key={"PkgName": pkg_name})
+        except Exception as e:
+            print(f"Warning: Failed to clean up QUEUED record for {pkg_name}: {e}")
 
     def _signal_handler(self, signum, frame):
         """
@@ -761,6 +828,16 @@ echo "CHECKDEPENDS_END"
             # If we recently sampled CPU and found it busy, don't re-sample for 20s.
             if now - ramp_state['last_gate_check'] < RAMP_WAIT_SECS:
                 return False
+            # Check load average first (smooths out bursty workloads).
+            # If 1-minute load exceeds core count, the system is oversubscribed.
+            ncpus = os.cpu_count() or 1
+            load1 = os.getloadavg()[0]
+            if load1 > ncpus * 0.9:
+                ramp_state['last_gate_check'] = now
+                if not ramp_state['gated_logged']:
+                    print(f"  [ramp-up] load {load1:.1f} > {ncpus*0.9:.0f} (90% of {ncpus} cores), holding at {n_running}/{parallel_jobs}")
+                    ramp_state['gated_logged'] = True
+                return False
             # Sample CPU idle (1s sample). 25% is the floor.
             idle = _cpu_idle_pct()
             if idle < IDLE_THRESHOLD_PCT:
@@ -939,12 +1016,7 @@ echo "CHECKDEPENDS_END"
                     i, pkg = pkg_by_key[key]
                     # Check mutex groups
                     running_names = {pkg_by_key[futures[f]][1]['name'] for f in futures}
-                    skip_mutex = False
-                    for group in self.MUTEX_GROUPS:
-                        if pkg['name'] in group and running_names & group:
-                            skip_mutex = True
-                            break
-                    if skip_mutex:
+                    if self._has_mutex_conflict(pkg['name'], running_names):
                         continue
                     future = executor.submit(self._build_single_package, i, pkg, len(packages),
                                            cycle_info, cycle_stage_1_success, provides_map, failed_packages,
@@ -1011,12 +1083,7 @@ echo "CHECKDEPENDS_END"
                             break
                         i, pkg = pkg_by_key[key]
                         # Check mutex groups - skip if a conflicting package is running
-                        skip_mutex = False
-                        for group in self.MUTEX_GROUPS:
-                            if pkg['name'] in group and running_names & group:
-                                skip_mutex = True
-                                break
-                        if skip_mutex:
+                        if self._has_mutex_conflict(pkg['name'], running_names):
                             continue
                         future = executor.submit(self._build_single_package, i, pkg, len(packages),
                                                cycle_info, cycle_stage_1_success, provides_map, failed_packages,
@@ -1102,17 +1169,13 @@ echo "CHECKDEPENDS_END"
         if dr and not self.dry_run and self._build_ids:
             try:
                 table = dr._get_ddb().Table("ArchBuilder-Builds")
-                latest = dr._get_ddb().Table("ArchBuilder-Latest")
                 for name, bid in self._build_ids.items():
                     resp = table.get_item(Key={"PkgName": name, "BuildId": bid}, ProjectionExpression="#s", ExpressionAttributeNames={"#s": "Status"})
                     status = resp.get("Item", {}).get("Status")
                     if status in ("QUEUED", "BUILDING"):
-                        table.delete_item(Key={"PkgName": name, "BuildId": bid})
-                        # Reconcile Latest: find the true latest non-transient status
-                        r = table.query(KeyConditionExpression="PkgName = :p", ExpressionAttributeValues={":p": name}, ScanIndexForward=False, Limit=1, ProjectionExpression="#s", ExpressionAttributeNames={"#s": "Status"})
-                        items = r.get("Items", [])
-                        if items and items[0]["Status"] not in ("QUEUED", "BUILDING"):
-                            latest.put_item(Item={"PkgName": name, "Status": items[0]["Status"]})
+                        # Drops the row and reconciles Latest, including the case
+                        # where no build history remains at all.
+                        self._drop_queued_record(name, bid)
             except Exception as e:
                 print(f"Warning: Failed to clean up QUEUED records: {e}")
         
@@ -1138,8 +1201,7 @@ echo "CHECKDEPENDS_END"
                     # Clean up QUEUED record since we're not building
                     dr = self._get_dynamo()
                     if dr and pkg_name in self._build_ids and not self.no_reporting:
-                        table = dr._get_ddb().Table("ArchBuilder-Builds")
-                        table.delete_item(Key={"PkgName": pkg_name, "BuildId": self._build_ids[pkg_name]})
+                        self._drop_queued_record(pkg_name, self._build_ids[pkg_name])
                     return True
             except Exception:
                 pass

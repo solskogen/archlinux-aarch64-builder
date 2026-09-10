@@ -553,6 +553,49 @@ def load_target_arch_packages(download=True, urls=None, include_testing=False, v
     
     return load_database_packages(urls, f'_{target_arch}', download, verbose=verbose)
 
+# Upstream rsync source for the local x86_64 mirror. Both consumers sync the
+# same tree, so the URL and the rsync invocation live here instead of being
+# duplicated (and drifting) per script.
+RSYNC_SOURCE = config.get('paths', 'rsync_source',
+                          fallback='rsync://mirror.koddos.net/archlinux/')
+
+
+def rsync_mirror(dry_run=False, progress=True, quiet=False):
+    """
+    Sync the upstream x86_64 mirror into paths.mirror_path.
+
+    The whole repo tree is synced -- databases *and* pool packages -- because
+    both callers read from it:
+      - generate_build_list.py compares versions using {repo}/os/x86_64/{repo}.db
+      - sync_any_packages.py copies the -any package files those databases name
+
+    Returns:
+        bool: True on success
+    """
+    mirror_path = config.get('paths', 'mirror_path', fallback='')
+    if not mirror_path:
+        print("ERROR: paths.mirror_path not set in config.ini")
+        return False
+
+    cmd = ["sudo", "rsync", "-a", "--delete"]
+    if not quiet:
+        cmd.append("-v")
+    if progress:
+        cmd.append("--progress")
+    cmd += [RSYNC_SOURCE, mirror_path.rstrip('/') + "/"]
+
+    if dry_run:
+        print(f"DRY RUN: {' '.join(cmd)}")
+        return True
+
+    print(f"Syncing x86_64 mirror: {RSYNC_SOURCE} -> {mirror_path}")
+    result = subprocess.run(cmd)
+    if result.returncode != 0:
+        print(f"ERROR: rsync failed (exit {result.returncode})")
+        return False
+    return True
+
+
 def load_blacklist(blacklist_file):
     """
     Load blacklisted packages with wildcard support.

@@ -324,22 +324,25 @@ function toggleTz() {
 async function setFilter(s) {
   statusFilter = statusFilter === s ? null : s;
   showCount = 50;
-  // When filtering by status, verify each matching package's true latest build
+  render();  // Render immediately — Latest table is authoritative via server reconcile
+  // Background verification: fetch full history in parallel, update view if anything drifted
   if (statusFilter) {
-    const matching = allBuilds.filter(b => b.s === statusFilter);
-    for (const b of matching) {
-      // Fetch all builds for this package to find the real latest
-      if (b._verified) continue;
+    const matching = allBuilds.filter(b => b.s === statusFilter && !b._verified);
+    if (!matching.length) return;
+    const before = matching.map(b => b.s);
+    await Promise.all(matching.map(async b => {
       try {
         const resp = await fetch(API_BASE + '/builds/' + encodeURIComponent(b.p));
         const items = JSON.parse((await resp.text()).replace(/,\s*\]/g, ']'));
         ingestItems(items);
       } catch(e) {}
       b._verified = true;
-    }
+    }));
     rebuildLatest();
+    // Only re-render if something actually changed
+    const after = matching.map(b => allBuilds.find(x => x.p === b.p)?.s);
+    if (before.some((s, i) => s !== after[i])) render();
   }
-  render();
 }
 
 function sortTable(col) {

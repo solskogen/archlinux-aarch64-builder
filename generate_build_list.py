@@ -41,7 +41,7 @@ from utils import (
     PACKAGE_SKIP_FLAG, parse_pkgbuild_deps, parse_database_file, X86_64_MIRROR,
     PKGBUILDS_DIR, SEPARATOR_WIDTH, get_target_architecture,
     compare_bin_package_versions, find_missing_dependencies,
-    load_packages_with_any, config, load_packages_unified
+    load_packages_with_any, config, load_packages_unified, rsync_mirror
 )
 
 # ============================================================
@@ -1526,13 +1526,7 @@ if __name__ == "__main__":
 
     # Rsync x86_64 mirror if requested
     if args.rsync:
-        mirror_path = config.get('paths', 'mirror_path', fallback='')
-        if mirror_path:
-            info("Syncing x86_64 mirror...")
-            subprocess.run(["sudo", "rsync", "-av", "--delete", "--progress",
-                          "rsync://geo.mirror.pkgbuild.com/packages/", mirror_path + "/"])
-        else:
-            print("ERROR: paths.mirror_path not set in config.ini")
+        if not rsync_mirror(quiet=args.quiet):
             sys.exit(1)
     
     # Validate --preserve-order requires --packages
