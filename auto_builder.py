@@ -14,7 +14,9 @@ Usage:
 import argparse
 import subprocess
 import os
+import re
 import sys
+import json
 import signal
 import time
 import datetime
@@ -40,6 +42,55 @@ config.read('config.ini')
 
 REPOS_PATH = config.get('paths', 'repos_path', fallback='/mnt/repos')
 MOVE_SCRIPT = config.get('paths', 'move_to_release_script', fallback=f'{REPOS_PATH}/move-from-testing-to-release.sh')
+
+
+class GenerateFailed(Exception):
+    """generate_build_list.py exited non-zero."""
+
+
+# build_packages.py names logs "{pkg}-{%Y%m%d-%H%M%S}-build.log" and ends each one
+# with "==> Build finished: {pkg} {version} ({time}) [{STATUS}]". The footer can be
+# preceded on the same line by terminal escape codes from makechrootpkg.
+LOG_NAME_RE = re.compile(r'^(?P<pkg>.+)-(?P<ts>\d{8}-\d{6})-build\.log$')
+LOG_FOOTER_RE = re.compile(r'==> Build finished: \S+ .*\[(?P<status>[A-Z]+)\]\s*$')
+
+
+def _build_logs(logs_dir=Path("logs")):
+    """Map package name -> [(timestamp, path), ...] sorted oldest first.
+
+    Names are parsed exactly, so "python" never picks up python-pytorch's logs.
+    """
+    logs = {}
+    for path in logs_dir.glob("*-build.log"):
+        m = LOG_NAME_RE.match(path.name)
+        if m:
+            logs.setdefault(m["pkg"], []).append((m["ts"], path))
+    for entries in logs.values():
+        entries.sort()
+    return logs
+
+
+def _log_status(path):
+    """Status from the build footer (SUCCESS/FAILED), or None if there is none."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(0, f.tell() - 4096))
+            tail = f.read().decode(errors="replace")
+    except OSError:
+        return None
+    for line in reversed(tail.splitlines()):
+        m = LOG_FOOTER_RE.search(line)
+        if m:
+            return m["status"]
+    return None
+
+
+def _write_json_atomic(path, data):
+    """Write JSON via a temporary file so a crash never leaves a truncated file."""
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(json.dumps(data, indent=2))
+    os.replace(tmp, path)
 
 
 def signal_handler(signum, frame):
@@ -94,6 +145,96 @@ def _promote_if_testing_has_packages():
         run_step(["./generate_report.py"], "Refreshing report")
 
 
+def _remove_built_package_files():
+    """Delete built *.pkg.tar.zst (and .sig) files left in pkgbuilds/ after upload."""
+    removed = 0
+    for path in Path("pkgbuilds").glob("*/*.pkg.tar.zst*"):
+        try:
+            path.unlink()
+            removed += 1
+        except OSError as e:
+            print(f"[{timestamp()}] Warning: could not remove {path}: {e}")
+    if removed:
+        print(f"[{timestamp()}] Removed {removed} built package file(s) from pkgbuilds/")
+
+
+def _cleanup_success_logs():
+    """Delete all logs of a package whose newest build log ends in [SUCCESS].
+
+    Matching is on the exact package name and the footer line only. The previous
+    shell pipeline globbed logs/${pkg}-*, so a successful "python" build deleted
+    python-pytorch's failure logs, and `grep -l SUCCESS` matched the word anywhere,
+    e.g. in test output of a build that then failed.
+    """
+    removed = 0
+    for pkg, entries in _build_logs().items():
+        if _log_status(entries[-1][1]) != "SUCCESS":
+            continue
+        for _ts, path in entries:
+            path.unlink(missing_ok=True)
+            removed += 1
+    print(f"[{timestamp()}] Cleanup: removed {removed} log(s) of successfully built packages")
+
+
+def _record_failures(failed_packages, failed_file):
+    """Fold failed_packages.json from this cycle into the failure tracker.
+
+    A package that has no build log of its own this cycle was skipped because a
+    dependency failed. It is marked SKIPPED but not counted: counting it would
+    exclude it as "failed twice" even after the dependency has been fixed.
+    """
+    failed_json = Path("failed_packages.json")
+    if not failed_json.exists():
+        return
+    try:
+        new_failures = json.loads(failed_json.read_text())
+    except (OSError, ValueError) as e:
+        print(f"[{timestamp()}] Warning: could not read {failed_json}: {e}; keeping it")
+        return
+
+    logs = _build_logs()
+    counted = skipped = 0
+    for pkg in new_failures.get("packages", []):
+        name = pkg["name"]
+        ver = pkg.get("version", "unknown")
+        repo = pkg.get("repo", "extra")
+        attempted = bool(logs.get(name))
+
+        if attempted:
+            existing = failed_packages.get(name, {})
+            if isinstance(existing, str):
+                existing = {"version": existing, "count": 1}  # legacy format
+            if isinstance(existing, dict) and existing.get("version") == ver:
+                existing["count"] = existing.get("count", 1) + 1
+            else:
+                existing = {"version": ver, "count": 1}
+            failed_packages[name] = existing
+            counted += 1
+        else:
+            skipped += 1
+
+        # Reporting is best-effort: a DynamoDB error must not lose the tracking.
+        try:
+            bid = dynamo_get_build_id(name)
+            if bid and _get_build_status(name, bid) != "SUCCESS":
+                if not attempted:
+                    dynamo_update_build(name, bid, "SKIPPED", repo=repo)
+                elif failed_packages[name]["count"] < 2:
+                    dynamo_update_build(name, bid, "RETRY", repo=repo)
+        except Exception as e:
+            print(f"[{timestamp()}] Warning: status update for {name} failed: {e}")
+
+    try:
+        _write_json_atomic(failed_file, failed_packages)
+    except OSError as e:
+        print(f"[{timestamp()}] ERROR: could not write {failed_file}: {e}; "
+              f"keeping {failed_json} so the failures are not lost")
+        return
+    failed_json.unlink()
+    print(f"[{timestamp()}] Tracking {len(failed_packages)} failed packages "
+          f"({counted} build failure(s) recorded, {skipped} dependency skip(s) not counted)")
+
+
 def _background_reporter(stop_event):
     """Background thread: sync DB every 30s so the web page sees updates."""
     while not stop_event.is_set():
@@ -117,7 +258,6 @@ def run_cycle(args):
     failed_file = Path("auto_builder_failures.json")
     failed_packages = {}
     if failed_file.exists():
-        import json
         try:
             failed_packages = json.loads(failed_file.read_text())
         except Exception:
@@ -143,8 +283,7 @@ def run_cycle(args):
     gen_cmd += args.generate_args
 
     if not run_step(gen_cmd, "Generating build list"):
-        print(f"[{timestamp()}] generate_build_list.py failed, exiting")
-        sys.exit(1)
+        raise GenerateFailed()
 
     # Check if there's anything to build
     packages_file = Path("packages_to_build.json")
@@ -152,7 +291,6 @@ def run_cycle(args):
         print(f"[{timestamp()}] No packages to build")
         # Clear retry entries - if nothing to build, nothing to retry
         if failed_file.exists():
-            import json
             try:
                 fp = json.loads(failed_file.read_text())
                 pruned = {k: v for k, v in fp.items() if isinstance(v, dict) and v.get("count", 0) >= 2}
@@ -169,7 +307,6 @@ def run_cycle(args):
 
     # Filter out previously failed packages (same version)
     if failed_packages:
-        import json
         data = json.loads(packages_file.read_text())
         original_count = len(data.get("packages", []))
 
@@ -208,7 +345,7 @@ def run_cycle(args):
         if filtered:
             print(f"[{timestamp()}] Skipped {filtered} packages (failed or depend on failed)")
         if not data["packages"]:
-            print(f"[{timestamp()}] No new packages to build (all failed or blocked, delete auto_builder_failures.json to retry)")
+            print(f"[{timestamp()}] No new packages to build (all failed or blocked; restart auto_builder.py to retry them)")
             packages_file.unlink()
             _promote_if_testing_has_packages()
             return False
@@ -255,59 +392,29 @@ def run_cycle(args):
     run_step(["./generate_report.py"], "Ingesting build logs")
     _sync_db()
 
-    post_pipeline = (
-        "sudo sh " + MOVE_SCRIPT + ""
-        " && (fd -I pkg.tar.zst pkgbuilds | xargs rm -v )"
-    )
-    run_step(post_pipeline, "Post-build pipeline", shell=True)
+    # Promote only a complete, uninterrupted cycle. A failed cycle can leave a
+    # rebuilt library in testing whose dependents did not rebuild against it;
+    # moving that to stable breaks the dependents. It stays in testing, and the
+    # next clean cycle (which builds or skips those dependents) promotes it.
+    # On Ctrl+C/SIGTERM the build was cut short, so nothing is promoted either.
+    if success and running:
+        run_step(["sudo", "sh", MOVE_SCRIPT], "Moving testing packages to stable")
+        # Refresh repo stats after move (clears in_testing)
+        run_step(["./generate_report.py"], "Refreshing report")
+    elif not running:
+        print(f"[{timestamp()}] Interrupted: not promoting testing packages")
+    else:
+        print(f"[{timestamp()}] Build had failures: leaving packages in testing, not promoting")
 
-    # Refresh repo stats after move (clears in_testing)
-    run_step(["./generate_report.py"], "Refreshing report")
+    # Built package files are already uploaded; drop the local copies
+    _remove_built_package_files()
 
-    # Final report + upload + cleanup
-    post_cleanup = (
-        "grep -l SUCCESS logs/*-build.log | while read f; do"
-        "   pkg=$(echo \"$f\" | sed 's|logs/||;s|-[0-9]\\{8\\}-.*||');"
-        "   rm -fv logs/${pkg}-*-build.log;"
-        " done"
-    )
     _sync_db()
-    run_step(post_cleanup, "Cleanup", shell=True)
+    _cleanup_success_logs()
 
     # Record any new failures (only if build wasn't interrupted)
-    failed_json = Path("failed_packages.json")
-    if failed_json.exists() and running:
-        import json, glob
-        try:
-            new_failures = json.loads(failed_json.read_text())
-            for pkg in new_failures.get("packages", []):
-                name = pkg["name"]
-                ver = pkg.get("version", "unknown")
-                # Increment count if same version, reset if new version
-                existing = failed_packages.get(name, {})
-                if isinstance(existing, str):
-                    existing = {"version": existing, "count": 1}  # Legacy upgrade
-                if isinstance(existing, dict) and existing.get("version") == ver:
-                    existing["count"] = existing.get("count", 1) + 1
-                else:
-                    existing = {"version": ver, "count": 1}
-                failed_packages[name] = existing
-                # Update DB status: RETRY if first failure, keep FAILED if second
-                # Only update if the latest build isn't already SUCCESS
-                bid = dynamo_get_build_id(name)
-                if bid:
-                    current = _get_build_status(name, bid)
-                    if current not in ("SUCCESS",):
-                        if existing["count"] < 2:
-                            dynamo_update_build(name, bid, "RETRY", repo=pkg.get("repo", "extra"))
-                        elif not any(glob.glob(f"logs/{name}-*-build.log")):
-                            dynamo_update_build(name, bid, "SKIPPED",
-                                                repo=pkg.get("repo", "extra"))
-            failed_file.write_text(json.dumps(failed_packages, indent=2))
-            print(f"[{timestamp()}] Tracking {len(failed_packages)} failed packages")
-        except Exception:
-            pass
-        failed_json.unlink()
+    if running:
+        _record_failures(failed_packages, failed_file)
 
     print(f"[{timestamp()}] Build cycle {'completed' if success else 'finished with failures'}")
     _sync_db()
@@ -324,6 +431,9 @@ def main():
                         help="Blacklist file (default: blacklist.txt)")
     parser.add_argument("-q", "--quiet", action="store_true",
                         help="Quiet mode for generate_build_list")
+    parser.add_argument("--max-generate-failures", type=int, default=5,
+                        help="Exit after this many consecutive generate_build_list.py "
+                             "failures (default: 5); earlier ones are retried next cycle")
     parser.add_argument("--generate-args", nargs=argparse.REMAINDER, default=[],
                         help="Extra args passed to generate_build_list.py")
 
@@ -345,6 +455,14 @@ def main():
 
     lock_file.write_text(str(os.getpid()))
 
+    # Every start retries all previously failed packages from scratch. Done only
+    # after the lock is taken, so a second instance that exits above cannot wipe
+    # the failure tracking of the one that is actually running.
+    failures_file = Path("auto_builder_failures.json")
+    if failures_file.exists():
+        failures_file.unlink()
+        print(f"Removed {failures_file} (previous failures will be retried)")
+
     try:
         print(f"[{timestamp()}] Auto builder started (PID {os.getpid()}, interval: {args.interval}s)")
         os.environ["AUTO_BUILDER"] = "1"
@@ -352,8 +470,21 @@ def main():
         dynamo_update_stat("auto_builder_pid", str(os.getpid()))
         _sync_db()
 
+        consecutive_gen_failures = 0
         while running:
-            built = run_cycle(args)
+            try:
+                built = run_cycle(args)
+                consecutive_gen_failures = 0
+            except GenerateFailed:
+                # Usually transient (mirror/network). A persistent cause such as a
+                # git conflict in pkgbuilds/ needs a human, so give up eventually.
+                consecutive_gen_failures += 1
+                print(f"[{timestamp()}] generate_build_list.py failed "
+                      f"({consecutive_gen_failures}/{args.max_generate_failures} in a row)")
+                if consecutive_gen_failures >= args.max_generate_failures:
+                    print(f"[{timestamp()}] Giving up: generate_build_list.py keeps failing, fix it and restart")
+                    sys.exit(1)
+                built = False
 
             if args.once or not running:
                 break

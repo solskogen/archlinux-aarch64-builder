@@ -30,7 +30,7 @@ For automated continuous building:
 The auto builder:
 - Syncs ARCH=any packages from upstream x86_64 mirror
 - Generates build lists and builds outdated packages
-- Tracks failed packages (won't retry same version twice)
+- Tracks failed packages (won't retry same version twice; the failure list is cleared on each start, so restarting retries them)
 - Promotes packages from testing to stable repos
 - Reports build status to DynamoDB (live web dashboard at `reports/latest.html`)
 - Shows real-time build status (QUEUED → BUILDING → SUCCESS/FAILED)
