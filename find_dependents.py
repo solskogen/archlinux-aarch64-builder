@@ -123,8 +123,14 @@ def find_rebuild_order(target_packages, packages, max_depth=None):
     return result
 
 
-def load_packages():
-    """Load packages from database files"""
+def load_packages(include_any=True):
+    """
+    Load packages from database files.
+
+    include_any is kept True here so callers always get the complete picture;
+    main() filters ARCH=any out of the *result* set instead of the loaded set,
+    so an ARCH=any package can still be named on the command line.
+    """
     target_arch = get_target_architecture()
     packages = {}
     
@@ -137,7 +143,7 @@ def load_packages():
     for db_file, repo_name in db_files:
         db_path = Path(db_file)
         if db_path.exists():
-            repo_packages = parse_database_file(db_path, include_any=True)
+            repo_packages = parse_database_file(db_path, include_any=include_any)
             for pkg in repo_packages.values():
                 pkg['repo'] = repo_name
             packages.update(repo_packages)
@@ -166,6 +172,12 @@ def main():
     parser.add_argument('--makedepends-only', action='store_true', help='Build dependencies only')
     parser.add_argument('--ignore-self', action='store_true',
                         help='Exclude the queried package(s) from the output, even if they appear (e.g. a split package depending on its own pkgbase)')
+    parser.add_argument('-a', '--include-any', action='store_true',
+                        help='Include ARCH=any packages in the results. They are '
+                             'excluded by default: being architecture-independent they '
+                             'are synced from x86_64 rather than rebuilt, so they are '
+                             'noise when planning rebuilds. An ARCH=any package can '
+                             'still be queried either way.')
     args = parser.parse_args()
     
     if args.depends_only and args.makedepends_only:
@@ -179,6 +191,22 @@ def main():
     if not packages:
         print("No packages found", file=sys.stderr)
         sys.exit(1)
+
+    # ARCH=any packages are dropped from what gets scanned, not from what gets
+    # loaded. Filtering at load time would make `find_dependents.py sip` fail
+    # validation with "not found" just because sip happens to be ARCH=any, even
+    # though "what depends on sip?" is a perfectly good question. Keeping the full
+    # set also means provides, basenames and --ignore-self still resolve against
+    # every package.
+    any_names = {n for n, p in packages.items() if p.get('arch') == 'any'}
+    if args.include_any:
+        scan = packages
+    else:
+        scan = {n: p for n, p in packages.items() if n not in any_names}
+        if not scan:
+            print("No architecture-specific packages found (try --include-any)",
+                  file=sys.stderr)
+            sys.exit(1)
 
     # Validate that queried packages exist
     all_names = set(packages.keys())
@@ -206,7 +234,7 @@ def main():
                     ignore_set.add(pname)
 
     if args.rebuild_order:
-        results = find_rebuild_order(args.package, packages, max_depth=args.depth)
+        results = find_rebuild_order(args.package, scan, max_depth=args.depth)
         if args.ignore_self:
             results = [r for r in results if r not in ignore_set]
         if results:
@@ -214,7 +242,11 @@ def main():
         else:
             print(f"No reverse dependencies found for {' '.join(args.package)}", file=sys.stderr)
     elif args.forward:
+        # Resolved against the full set, so an ARCH=any package can still be the
+        # subject of the query; its ARCH=any dependencies are filtered afterwards.
         results = find_dependencies(args.package[0], packages, check_depends, check_makedepends)
+        if not args.include_any:
+            results = [r for r in results if r not in any_names]
         if args.ignore_self:
             results = [r for r in results if r not in ignore_set]
         if results:
@@ -222,7 +254,7 @@ def main():
         else:
             print(f"No dependencies found for {args.package[0]}", file=sys.stderr)
     else:
-        results = find_dependents(args.package[0], packages, check_depends, check_makedepends)
+        results = find_dependents(args.package[0], scan, check_depends, check_makedepends)
         if args.ignore_self:
             results = [r for r in results if r not in ignore_set]
         if results:

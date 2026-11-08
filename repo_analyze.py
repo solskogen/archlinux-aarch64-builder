@@ -141,16 +141,33 @@ def find_outdated_any_packages(target_by_basename, target_packages, x86_bases, t
     return outdated
 
 
-def find_missing_any_packages(x86_bases, x86_packages, target_bases):
-    """Find ARCH=any packages missing from target architecture"""
+def find_missing_any_packages(x86_bases, x86_packages, target_bases,
+                              target_packages=None, target_provides=None):
+    """
+    Find ARCH=any packages missing from target architecture.
+
+    Presence is decided per package *name*, not per pkgbase. The same package can
+    legitimately be built from a different pkgbase on the target: aarch64 ships
+    libclc, wasi-compiler-rt and wasi-libc++ as split packages of `llvm` (and as
+    native aarch64 rather than any), whereas x86_64 builds each from its own
+    standalone pkgbase. Testing only the pkgbase reported all three as missing
+    while they were in fact present, and newer.
+
+    A package satisfied through provides counts as present too, matching how
+    find_package_name_mismatches() and the --missing-pkgbase report treat it.
+    """
     missing = []
-    
+    target_packages = target_packages or {}
+    target_provides = target_provides or {}
+
     for basename in x86_bases:
         if basename in target_bases:
             continue
         for pkg_name, pkg in x86_packages.items():
             if pkg['basename'] == basename:
                 if pkg.get('arch') == 'any' or pkg.get('filename', '').endswith('any.pkg.tar.zst'):
+                    if pkg_name in target_packages or pkg_name in target_provides:
+                        break   # present under its own name; only the pkgbase differs
                     missing.append(f"{pkg_name}: x86_64={pkg['version']} ({pkg['repo']})")
                     break
     
@@ -565,7 +582,7 @@ def main():
             target_by_basename, target_packages, x86_bases, target_arch, x86_packages
         ) if show_all or args.outdated_any else [],
         'missing_any': find_missing_any_packages(
-            x86_bases, x86_packages, target_bases
+            x86_bases, x86_packages, target_bases, target_packages, target_provides
         ) if show_all or args.missing_any else [],
         'repo_issues': find_repo_issues(
             target_bases, x86_bases, target_repo_count, target_arch

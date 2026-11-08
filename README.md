@@ -198,6 +198,7 @@ When overrides are specified, the system clones from the custom URL and checks o
 | `auto_builder.py` | Continuous build daemon (generate → build → promote cycle) |
 | `repo_analyze.py` | Analyze differences between x86_64 and target repos |
 | `find_dependents.py` | Query package dependency relationships |
+| `find_package_files.py` | Find which packages ship a given path (like `pacman -F`) |
 | `sync_any_packages.py` | Sync ARCH=any packages from x86_64 to target testing repos |
 | `generate_report.py` | Calculate repo stats and publish to DynamoDB |
 | `dynamo_reporter.py` | DynamoDB/S3 reporting module (build status, logs, stats) |
@@ -282,10 +283,14 @@ When overrides are specified, the system clones from the custom URL and checks o
 
 | Option | Description |
 |--------|-------------|
-| `PACKAGE` | Package name to query (positional) |
+| `PACKAGE` | Package name(s) to query (positional) |
 | `-f, --forward` | Show dependencies OF this package (default: show dependents) |
+| `-r, --rebuild-order` | Show all reverse deps in topological build order (pkgbase names) |
+| `-d, --depth N` | Max dependency depth for `-r` (default: unlimited) |
 | `--depends-only` | Runtime dependencies only |
 | `--makedepends-only` | Build dependencies only |
+| `--ignore-self` | Exclude the queried package(s) from the output |
+| `-a, --include-any` | Include ARCH=any packages in results. Excluded by default, since they are synced from x86_64 rather than rebuilt; an ARCH=any package can still be queried either way |
 
 ## Build Reporting
 
