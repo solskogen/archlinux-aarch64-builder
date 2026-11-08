@@ -30,8 +30,27 @@ from utils import (
     validate_package_name, safe_path_join, PACKAGE_SKIP_FLAG,
     BuildUtils, BUILD_ROOT, CACHE_PATH, TEMP_CHROOT_ID_MIN, TEMP_CHROOT_ID_MAX, 
     SEPARATOR_WIDTH, GIT_COMMAND_TIMEOUT, import_gpg_keys, upload_packages,
-    safe_command_execution
+    safe_command_execution, target_carch
 )
+
+# Haskell packages cannot take part in two-stage cycle resolution: GHC embeds a
+# per-compile ABI hash in every .so/.hi, so a stage-2 rebuild is inconsistent with
+# whatever was linked against stage 1. generate_build_list.py uses this same test
+# to break makedepends-induced cycles among them; build_packages() needs it too,
+# because it rebuilds the dependency graph from scratch. Kept identical to the
+# definition in generate_build_list.py.
+GHC_TOOLCHAIN = {'ghc', 'ghc-libs', 'haskell-hadrian', 'alex', 'happy', 'cabal-install'}
+
+
+def _is_ghc_compiled(pkg):
+    """True if pkg belongs to, or is compiled by, the GHC toolchain."""
+    if pkg.get('name') in GHC_TOOLCHAIN:
+        return True
+    for dep in pkg.get('depends') or []:
+        if dep.split('=')[0].split('>')[0].split('<')[0].strip() == 'ghc-libs':
+            return True
+    return False
+
 
 class PackageBuilder:
     """
@@ -307,63 +326,66 @@ class PackageBuilder:
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"Rsync failed: {e}")
         
-        # Update package database
-        print("Updating package database in temporary chroot...")
-        try:
-            subprocess.run([
-                "sudo", "arch-nspawn", 
-                "-c", str(self.cache_dir),
-                str(temp_copy_path), "pacman", "-Suy", "--noconfirm"
-            ], check=True)
-        except subprocess.CalledProcessError as e:
-            print(f"Warning: Failed to update package database: {e}")
-        
-        # Parse and install only checkdepends (makechrootpkg handles depends/makedepends)
+        # Update the chroot and pre-install checkdepends in a single transaction.
+        # One `pacman -Suy <pkgs>` instead of `-Suy` followed by `-Sy <pkgs>` saves
+        # an arch-nspawn spawn (~2.4s) plus a redundant DB sync -- ~2.9s per build,
+        # measured -- and drops the partial-upgrade pattern: a bare `-Sy <pkgs>`
+        # refreshes the DB then installs targets *without* upgrading, which can pull
+        # in packages built against newer libraries than the chroot still holds.
+        # That is the same class of breakage the DB refresh in _execute_build below
+        # works around. With no checkdepends (or --no-check) this degrades to
+        # exactly the previous plain `-Suy`.
+        #
+        # makechrootpkg installs depends/makedepends itself, so only checkdepends
+        # are pre-installed here. Failure stays non-fatal: makechrootpkg attempts
+        # its own dep install later, and if that genuinely fails the build fails
+        # with a proper log file showing the pacman error. The retry covers the
+        # shared-cache race between concurrent builds.
         depends, makedepends, checkdepends = self._parse_pkgbuild_deps(pkg_dir)
-        if checkdepends and not self.no_check:
-            print(f"Installing checkdepends: {' '.join(checkdepends)}")
-            # Pre-installing checkdepends is an optimization to warm the chroot's
-            # pacman DB. If it fails (e.g. due to a shared-cache race between
-            # concurrent builds), we log and continue — makechrootpkg will attempt
-            # its own dep install later, and if that truly fails the build will
-            # fail with a proper log file showing the pacman error.
-            env = os.environ.copy()
-            env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
-            cmd = [
-                "sudo", "arch-nspawn",
-                "-c", str(self.cache_dir),
-                str(temp_copy_path),
-                "pacman", "-Sy", "--noconfirm"
-            ] + checkdepends
-            for attempt in (1, 2):
-                try:
-                    subprocess.run(cmd, check=True, env=env)
-                    break
-                except subprocess.CalledProcessError as e:
-                    if attempt == 1:
-                        print(f"Warning: checkdepends install failed (attempt {attempt}), retrying: {e}")
-                        import time as _time
-                        _time.sleep(2)
-                    else:
-                        print(f"Warning: checkdepends install failed after retry: {e}")
-                        print("  Continuing — makechrootpkg will retry dep install itself")
-                except KeyboardInterrupt:
-                    sys.exit(1)
+        targets = checkdepends if (checkdepends and not self.no_check) else []
+        if targets:
+            print(f"Updating chroot and installing checkdepends: {' '.join(targets)}")
+        else:
+            print("Updating package database in temporary chroot...")
+        env = os.environ.copy()
+        env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
+        cmd = [
+            "sudo", "arch-nspawn",
+            "-c", str(self.cache_dir),
+            str(temp_copy_path),
+            "pacman", "-Suy", "--noconfirm"
+        ] + targets
+        for attempt in (1, 2):
+            try:
+                subprocess.run(cmd, check=True, env=env)
+                break
+            except subprocess.CalledProcessError as e:
+                if attempt == 1:
+                    print(f"Warning: chroot update failed (attempt {attempt}), retrying: {e}")
+                    import time as _time
+                    _time.sleep(2)
+                else:
+                    print(f"Warning: chroot update failed after retry: {e}")
+                    print("  Continuing — makechrootpkg will retry dep install itself")
+            except KeyboardInterrupt:
+                sys.exit(1)
 
     def _parse_pkgbuild_deps(self, pkg_dir):
         """Parse PKGBUILD dependencies using bash"""
         import shlex
         temp_script = f"""#!/bin/bash
 cd {shlex.quote(str(pkg_dir))}
+CARCH={shlex.quote(target_carch())}
 source PKGBUILD 2>/dev/null || exit 1
+_d="depends_${{CARCH}}[@]"; _m="makedepends_${{CARCH}}[@]"; _c="checkdepends_${{CARCH}}[@]"
 echo "DEPENDS_START"
-printf '%s\\n' "${{depends[@]}}"
+printf '%s\\n' "${{depends[@]}}" "${{!_d}}"
 echo "DEPENDS_END"
 echo "MAKEDEPENDS_START"
-printf '%s\\n' "${{makedepends[@]}}"
+printf '%s\\n' "${{makedepends[@]}}" "${{!_m}}"
 echo "MAKEDEPENDS_END"
 echo "CHECKDEPENDS_START"
-printf '%s\\n' "${{checkdepends[@]}}"
+printf '%s\\n' "${{checkdepends[@]}}" "${{!_c}}"
 echo "CHECKDEPENDS_END"
 """
         
@@ -434,18 +456,21 @@ echo "CHECKDEPENDS_END"
         env = os.environ.copy()
         env['SOURCE_DATE_EPOCH'] = str(int(subprocess.run(['date', '+%s'], capture_output=True, text=True).stdout.strip()))
         
-        # Last-second DB refresh: other parallel builds may have uploaded new packages
-        # since _prepare_build_environment ran. makechrootpkg's internal `pacman -S`
-        # uses this DB, so if it's stale we get "Maximum file size exceeded" errors.
-        try:
-            subprocess.run([
-                "sudo", "arch-nspawn",
-                "-c", str(self.cache_dir),
-                str(temp_copy_path), "pacman", "-Sy", "--noconfirm"
-            ], check=True, capture_output=True, text=True, errors='replace')
-        except subprocess.CalledProcessError as e:
-            print(f"Warning: Failed to refresh pacman DB before build: {e}")
-        
+        # DB freshness before the build is handled by makechrootpkg's own -u below,
+        # which runs `pacman -Syuu` inside its container immediately before it
+        # installs depends/makedepends. That is both better placed than a separate
+        # `arch-nspawn ... pacman -Sy` here (it closes the window right where the
+        # deps are resolved, rather than one spawn earlier) and safer: a bare -Sy
+        # refreshes the DB without upgrading, leaving the DB ahead of the installed
+        # system, and makechrootpkg's --syncdeps would then resolve deps from the
+        # newer DB into the older chroot -- the partial-upgrade pattern. It also
+        # saves an arch-nspawn spawn (~2.4s per build).
+        #
+        # Note this does NOT cover checkdepends: chroot-config/makepkg.conf sets
+        # BUILDENV=(... !check ...), so makepkg leaves CHECKFUNC unset and
+        # resolve_deps() is called with makedepends only. Those are still
+        # pre-installed in _prepare_build_environment.
+
         # Check if PKGBUILD arch array contains aarch64
         pkgbuild_path = pkg_dir / "PKGBUILD"
         use_ignorearch = True
@@ -463,7 +488,7 @@ echo "CHECKDEPENDS_END"
         
         cmd = [
             "makechrootpkg", "-l", temp_copy_path.name, "-r", str(self.chroot_path),
-            "-d", str(self.cache_dir), "-t", "/tmp:size=100G",
+            "-d", str(self.cache_dir), "-u", "-t", "/tmp:size=100G",
             "--"
         ]
         if use_ignorearch:
@@ -574,9 +599,24 @@ echo "CHECKDEPENDS_END"
             uploaded_count = upload_packages(pkg_dir, target_repo, self.dry_run)
             print(f"Successfully uploaded {uploaded_count} packages to {target_repo}")
             
-            # Clear built packages from cache to prevent stale/corrupted cache issues
+            # Seed the shared pacman cache with what we just built, rather than
+            # deleting it. With --parallel-jobs many builds need a just-published
+            # package at the same moment, and pacman downloads into the shared cache
+            # via <file>.part then renames -- so concurrent downloads of the same
+            # file race and leave a truncated archive:
+            #   :: File .../gtk4-1:4.24.1-1-aarch64.pkg.tar.zst is corrupted
+            #   error: failed to commit transaction (invalid or corrupted package)
+            # which took down gtk4, glycin and lorem in successive runs. Pre-placing
+            # our own output means those files are already cached and never fetched,
+            # removing the contention. SigLevel is Never for these repos so no
+            # detached signature is needed.
+            #
+            # This also covers what the previous "clear the cache" behaviour was for:
+            # a rebuild at an identical version-release used to leave a stale file
+            # shadowing the new one, and overwriting it fixes that directly, whereas
+            # deleting it merely forced a re-download (and fed the race above).
             if not self.dry_run:
-                self._clear_packages_from_cache(pkg_name, pkg_dir)
+                self._seed_cache_with_built_packages(pkg_name, pkg_dir)
         
         print(f"Successfully built {pkg_name}")
         self._update_last_successful(pkg_name)
@@ -650,6 +690,7 @@ echo "CHECKDEPENDS_END"
     def build_packages(self, packages_file, blacklist_file=None, continue_build=False, parallel_jobs=1, keep_going=False):
         """Build all packages from JSON file"""
         self._keep_going = keep_going
+        self._parallel_jobs = parallel_jobs
         # Load packages
         with open(packages_file, 'r') as f:
             data = json.load(f)
@@ -874,20 +915,70 @@ echo "CHECKDEPENDS_END"
         # If a cycle forms, these can safely be dropped — checkdepends only affect
         # test runs, and pacman installs them from the repo at build time regardless.
         checkonly_edges = set()  # set of (key, dep_key) tuples
+        # Strongest dep type seen per edge (depends > makedepends > checkdepends),
+        # mirroring generate_build_list.py's edge_types. Needed by the GHC pass
+        # below, which may drop makedepends edges but must never drop a depends one.
+        dep_edge_types = {}  # (key, dep_key) -> 'depends' | 'makedepends' | 'checkdepends'
+        _DEP_PRIO = {'depends': 0, 'makedepends': 1, 'checkdepends': 2}
+        # First pass: register every key before any deps are resolved. This has to
+        # be separate, because a dep on a cycle package that appears later in the
+        # list would otherwise fall through to its bare name below — and a bare
+        # name is not a node in remaining_deps (cycle packages only ever exist as
+        # name#s1/name#s2). _find_sccs would then treat it as a childless leaf and
+        # never see cycles routed through it, so the checkonly_edges that exist to
+        # break those cycles would never be dropped and the scheduler would
+        # deadlock (e.g. diffutils -> python -> zstd -> lz4 -checkdep-> diffutils).
+        for i, pkg in enumerate(packages[start_index:], start_index):
+            cycle_stage = pkg.get('cycle_stage')
+            key = f"{pkg['name']}#s{cycle_stage}" if cycle_stage else pkg['name']
+            pkg_by_key[key] = (i + 1, pkg)
+
         for i, pkg in enumerate(packages[start_index:], start_index):
             pkg_name = pkg['name']
             cycle_stage = pkg.get('cycle_stage')
             cycle_group = pkg.get('cycle_group')
             # Unique key: name for normal, name#stage for cycle
             key = f"{pkg_name}#s{cycle_stage}" if cycle_stage else pkg_name
-            pkg_by_key[key] = (i + 1, pkg)
 
             deps = set()
+            # Rank of each member inside its cycle, as chosen by
+            # generate_build_list.py. Intra-cycle edges from a lower rank to a
+            # higher one are kept; back-edges are dropped. That is what breaks the
+            # cycle while still serialising real dependencies -- dropping *all*
+            # intra-cycle edges (the old behaviour) left gtk4#s1 and libadwaita#s1
+            # with no edge between them, so a parallel run could start libadwaita
+            # before gtk4 had finished and build it against the repo's old gtk4.
+            cycle_ranks = {}
+            if cycle_group is not None and cycle_group in cycle_info:
+                for cn in cycle_info[cycle_group]:
+                    other = pkg_by_key.get(f"{cn}#s{cycle_stage}")
+                    if other and other[1].get('cycle_rank') is not None:
+                        cycle_ranks[cn] = other[1]['cycle_rank']
+            my_rank = pkg.get('cycle_rank')
+
+            def _intra_cycle_forward_deps(stage):
+                """Same-cycle providers that must precede this package at `stage`."""
+                out = set()
+                if my_rank is None or not cycle_ranks:
+                    return out
+                own = cycle_info.get(cycle_group, set())
+                for dep_type in ('depends', 'makedepends'):
+                    for dep_str in pkg.get(dep_type, []) or []:
+                        dn = dep_str.split('=')[0].split('>')[0].split('<')[0].strip()
+                        resolved = resolve_dep(dn)
+                        if (resolved and resolved != pkg_name and resolved in own
+                                and cycle_ranks.get(resolved, my_rank) < my_rank):
+                            out.add(f"{resolved}#s{stage}")
+                return out
+
             if cycle_stage == 2:
                 # Stage 2 depends on all stage 1 packages in same cycle
                 if cycle_group is not None and cycle_group in cycle_info:
                     for cn in cycle_info[cycle_group]:
                         deps.add(f"{cn}#s1")
+                # ...plus the forward intra-cycle edges at stage 2, so a member's
+                # final build follows the final build of what it depends on.
+                deps |= _intra_cycle_forward_deps(2)
             else:
                 # Normal deps from filtered dependency lists
                 # For cycle stage 1: skip deps within the same cycle (that's the whole point of stage 1)
@@ -908,8 +999,7 @@ echo "CHECKDEPENDS_END"
                         if resolved and resolved != pkg_name and resolved in all_pkg_names:
                             # Skip in-cycle deps for stage 1 (breaking the cycle)
                             if cycle_stage == 1 and resolved in own_cycle_names:
-                                continue
-                            # For cycle packages, depend on stage 2 if it exists, else stage 1
+                                continue                            # For cycle packages, depend on stage 2 if it exists, else stage 1
                             if f"{resolved}#s2" in pkg_by_key:
                                 dep_key = f"{resolved}#s2"
                             elif f"{resolved}#s1" in pkg_by_key:
@@ -917,9 +1007,17 @@ echo "CHECKDEPENDS_END"
                             else:
                                 dep_key = resolved
                             deps.add(dep_key)
+                            prev_type = dep_edge_types.get((key, dep_key))
+                            if prev_type is None or _DEP_PRIO[dep_type] < _DEP_PRIO[prev_type]:
+                                dep_edge_types[(key, dep_key)] = dep_type
                             # Mark edge as checkdepends-only if not in runtime_providers
                             if dep_type == 'checkdepends' and resolved not in runtime_providers:
                                 checkonly_edges.add((key, dep_key))
+                # Re-add the intra-cycle edges that the chosen rank order permits.
+                # Only forward edges (lower rank -> higher) are kept, so the result
+                # is still acyclic, but libadwaita#s1 now waits for gtk4#s1.
+                if cycle_stage == 1:
+                    deps |= _intra_cycle_forward_deps(1)
             remaining_deps[key] = deps
 
         # Break cycles in remaining_deps by dropping checkdepends-only edges.
@@ -978,6 +1076,43 @@ echo "CHECKDEPENDS_END"
                     dropped_edges += len(to_remove)
         if dropped_edges:
             print(f"Broke {dropped_edges} checkdepends-only edges in {sum(1 for s in sccs_found if len(s) > 1)} SCC(s)")
+
+        # Second pass: Haskell cycles. generate_build_list.py already breaks these
+        # when it orders the list ("Broke N makedepends/checkdepends edges among
+        # Haskell packages to produce a DAG"), but we rebuild the graph from the
+        # JSON dep lists and so re-create them. The checkonly pass above cannot
+        # help: the GHC bootstrap cycle runs through makedepends, not checkdepends
+        # (ghc --makedepends--> alex --makedepends--> ghc, likewise happy /
+        # haskell-hadrian / haskell-hscolour). Left intact, no key ever has zero
+        # remaining deps, so the parallel scheduler launches nothing at all and
+        # reports every package as unresolvable, while the sequential path is
+        # unaffected because it ignores the graph and walks the list in order.
+        #
+        # Only SCCs whose members are *all* GHC-compiled are touched, and only
+        # makedepends/checkdepends edges are dropped -- a depends cycle among them
+        # is a genuine packaging bug that generate_build_list.py warns about, and
+        # must stay visible. The build tool is still installed from the repo at
+        # build time; only the ordering hint goes away.
+        ghc_dropped = 0
+        ghc_sccs = 0
+        for scc in _find_sccs(remaining_deps):
+            if len(scc) <= 1:
+                continue
+            pkgs_in_scc = [pkg_by_key[n][1] for n in scc if n in pkg_by_key]
+            if len(pkgs_in_scc) != len(scc) or not all(_is_ghc_compiled(p) for p in pkgs_in_scc):
+                continue
+            ghc_sccs += 1
+            scc_set = set(scc)
+            for node in scc:
+                to_remove = {d for d in remaining_deps[node]
+                             if d in scc_set
+                             and dep_edge_types.get((node, d)) in ('makedepends', 'checkdepends')}
+                if to_remove:
+                    remaining_deps[node] -= to_remove
+                    ghc_dropped += len(to_remove)
+        if ghc_dropped:
+            print(f"Broke {ghc_dropped} makedepends/checkdepends edges among Haskell "
+                  f"packages in {ghc_sccs} SCC(s) to produce a DAG")
 
         completed_keys = set()
         failed_keys = set()
@@ -1282,6 +1417,39 @@ done
         except Exception as e:
             print(f"Warning: Failed to extract package filenames from PKGBUILD: {e}")
             return []
+
+    def _seed_cache_with_built_packages(self, pkg_name, pkg_dir):
+        """Place freshly built packages into the shared pacman cache.
+
+        Written to a unique temporary name and renamed into place, so a concurrent
+        pacman never observes a partially written file. Existing entries are
+        replaced, which is what makes a same-version rebuild pick up the new build
+        instead of a stale cached one.
+        """
+        try:
+            built = [f for f in pkg_dir.glob('*.pkg.tar.*')
+                     if not f.name.endswith('.sig')]
+            if not built:
+                return
+            seeded = 0
+            for src in built:
+                dst = self.cache_dir / src.name
+                tmp = self.cache_dir / f'.{src.name}.seed-{os.getpid()}'
+                try:
+                    subprocess.run(['cp', '--preserve=timestamps', str(src), str(tmp)],
+                                   check=True, capture_output=True)
+                    os.replace(tmp, dst)
+                    seeded += 1
+                except Exception as e:
+                    print(f"  Warning: could not seed cache with {src.name}: {e}")
+                    try:
+                        tmp.unlink(missing_ok=True)
+                    except Exception:
+                        pass
+            if seeded:
+                print(f"Seeded pacman cache with {seeded} freshly built package(s)")
+        except Exception as e:
+            print(f"Warning: Failed to seed pacman cache: {e}")
 
     def _clear_packages_from_cache(self, pkg_name, pkg_dir):
         """Clear packages from pacman cache after successful upload"""

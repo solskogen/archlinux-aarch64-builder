@@ -41,7 +41,8 @@ from utils import (
     PACKAGE_SKIP_FLAG, parse_pkgbuild_deps, parse_database_file, X86_64_MIRROR,
     PKGBUILDS_DIR, SEPARATOR_WIDTH, get_target_architecture,
     compare_bin_package_versions, find_missing_dependencies,
-    load_packages_with_any, config, load_packages_unified, rsync_mirror
+    load_packages_with_any, config, load_packages_unified, rsync_mirror,
+    load_database_packages
 )
 
 # ============================================================
@@ -225,6 +226,12 @@ def write_results(packages, args):
     }
     with open(output_file, "w") as f:
         json.dump(output_data, f, indent=2)
+
+    # A new build list invalidates build_packages.py --continue progress, which
+    # refers to the previous list. Only reset it here, once a list is actually
+    # written: deleting it on startup also wiped it for --help, --dry-run and runs
+    # refused because auto_builder.py holds the lock.
+    Path("last_successful.txt").unlink(missing_ok=True)
     
 
 def load_package_overrides():
@@ -490,7 +497,10 @@ echo "$fullver"
                                 # Reset to clean state before updating to latest
                                 subprocess.run(["git", "reset", "--hard"], cwd=pkg_repo_dir, check=True, capture_output=True)
                                 subprocess.run(["git", "fetch", "origin"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
-                                subprocess.run(["git", "reset", "--hard", "origin/main"], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
+                                head = subprocess.run(["git", "symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
+                                                      cwd=pkg_repo_dir, capture_output=True, text=True)
+                                upstream = head.stdout.strip() if head.returncode == 0 and head.stdout.strip() else "origin/main"
+                                subprocess.run(["git", "reset", "--hard", upstream], cwd=pkg_repo_dir, check=True, capture_output=True, text=True)
                             except subprocess.CalledProcessError as pull_error:
                                 print(f"Warning: Failed to pull latest commit for {basename}: {pull_error}")
                                 if pull_error.stderr:
@@ -553,6 +563,16 @@ echo "$fullver"
                     f.cancel()
                 raise
     
+    # A package whose PKGBUILD could not be fetched cannot be built; keeping it only
+    # moves the failure into build_packages.py ("PKGBUILD not found") and, through
+    # the dependency graph, blocks everything that depends on it.
+    unfetched = [p for p in packages_to_fetch
+                 if not (Path(PKGBUILDS_DIR) / p.get('basename', p['name']) / "PKGBUILD").exists()]
+    if unfetched:
+        names = ', '.join(sorted(p['name'] for p in unfetched))
+        print(f"WARNING: dropping {len(unfetched)} package(s) with no PKGBUILD: {names}")
+        packages_to_fetch = [p for p in packages_to_fetch if p not in unfetched]
+
     # Return combined list with blacklisted packages (unchanged) and fetched packages (with updated deps)
     all_packages = packages_to_fetch + blacklisted_packages
     
@@ -688,18 +708,6 @@ def compare_versions(x86_packages, target_packages, force_packages=None, blackli
         
         if blacklist_reason:
             skipped_packages.append(f"{basename} ({blacklist_reason})")
-            # Only add blacklisted packages to output if explicitly requested
-            if force_packages and basename in force_packages:
-                newer_in_x86.append({
-                    'name': basename,
-                    'force_latest': use_latest,
-                    'use_aur': basename in aur_packages,
-                    'skip': 1,
-                    'depends': x86_data.get('depends', []),
-                    'makedepends': x86_data.get('makedepends', []),
-                    'provides': x86_data.get('provides', []),
-                    **x86_data
-                })
             continue
         
         # Check if package depends on blacklisted packages
@@ -901,10 +909,17 @@ def find_strongly_connected_components(graph):
                     break
             sccs.append(component)
     
-    for node in graph:
-        if node not in index:
-            strongconnect(node)
-    
+    # Recursion depth equals the longest dependency chain; a --rebuild-repo run can
+    # exceed Python's default limit of 1000. Same approach as build_packages.py.
+    old_limit = sys.getrecursionlimit()
+    sys.setrecursionlimit(max(old_limit, len(graph) + 100))
+    try:
+        for node in list(graph):
+            if node not in index:
+                strongconnect(node)
+    finally:
+        sys.setrecursionlimit(old_limit)
+
     return sccs
 
 def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=None):
@@ -938,11 +953,7 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
             if split_name not in all_provides:
                 all_provides[split_name] = basename
     
-    # Build dependency graph - only consider packages in our build list
-    graph = defaultdict(set)  # pkg -> set of packages that depend on it
-    reverse_graph = defaultdict(set)  # pkg -> set of packages it depends on
-    in_degree = defaultdict(int)  # pkg -> number of dependencies
-
+    # Build the ordering graph - only consider packages in our build list
     # Separate runtime-only reverse graph for SCC detection.
     # Cycles through checkdepends alone do NOT require two-stage rebuild
     # (they only affect check() during test runs, which can use whatever
@@ -965,9 +976,6 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
                 return True
         return False
 
-    for pkg in packages:
-        in_degree[pkg['name']] = 0
-    
     # Build the dependency graph
     for pkg in packages:
         pkg_name = pkg['name']
@@ -980,7 +988,17 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
         if _is_ghc_compiled(pkg):
             runtime_dep_types = ('depends',)
         else:
-            runtime_dep_types = ('depends', 'makedepends')
+            # checkdepends are included because build_packages.py pre-installs them
+            # (chroot-config/makepkg.conf sets !check, so makepkg itself never
+            # resolves them) and because build_packages.py's own scheduler graph
+            # includes them. Leaving them out here made the two scripts disagree
+            # about the graph, which is the same class of bug that previously
+            # deadlocked parallel builds. Concretely it ordered pygobject before
+            # gtk4 even though pygobject checkdepends on gtk4, because gtk4
+            # makedepends on python-gobject (pkgbase pygobject) -- a genuine cycle
+            # that belongs in the two-stage mechanism rather than being silently
+            # resolved one way.
+            runtime_dep_types = ('depends', 'makedepends', 'checkdepends')
         runtime_deps_resolved = set()
         for dep_type in runtime_dep_types:
             for dep_str in pkg.get(dep_type, []):
@@ -997,70 +1015,7 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
         for provider_pkg in runtime_deps_resolved:
             runtime_reverse_graph[pkg_name].add(provider_pkg)
 
-        # Collect all dependencies (including checkdepends) for the full graph
-        all_deps = []
-        for dep_type in ['depends', 'makedepends', 'checkdepends']:
-            all_deps.extend(pkg.get(dep_type, []))
-        
-        # Process each dependency (remove duplicates to avoid counting same dependency multiple times)
-        seen_deps = set()
-        for dep_str in all_deps:
-            # Extract package name (remove version constraints)
-            dep_name = extract_dep_name(dep_str)
-            if dep_name in seen_deps or dep_name == pkg_name:  # Skip duplicates and self-deps
-                continue
-            seen_deps.add(dep_name)
-            
-            # Resolve provides relationships
-            provider_pkg = None
-            if dep_name in pkg_map:
-                provider_pkg = dep_name
-            elif dep_name in all_provides:
-                provider_pkg = all_provides[dep_name]
-            
-            # Create edge if dependency provider is in our build list
-            if provider_pkg and provider_pkg in pkg_map and provider_pkg != pkg_name:
-                # provider_pkg must be built before pkg_name
-                graph[provider_pkg].add(pkg_name)
-                reverse_graph[pkg_name].add(provider_pkg)
-                in_degree[pkg_name] += 1
-    
-    # Add transitive dependencies for packages not in build list
-    for pkg in packages:
-        pkg_name = pkg['name']
-        
-        # Check ALL dependency types that are NOT in our build list
-        all_deps = []
-        for dep_type in ['depends', 'makedepends', 'checkdepends']:
-            all_deps.extend(pkg.get(dep_type, []))
-        
-        for dep_str in all_deps:
-            dep_name = extract_dep_name(dep_str)
-            
-            # Skip if dep is in our build list (already handled)
-            if dep_name in pkg_map:
-                continue
-                
-            # Look up dep in full package databases
-            dep_pkg = None
-            if all_x86_packages and dep_name in all_x86_packages:
-                dep_pkg = all_x86_packages[dep_name]
-            elif all_target_packages and dep_name in all_target_packages:
-                dep_pkg = all_target_packages[dep_name]
-                
-            if dep_pkg:
-                # Check what this dependency depends on
-                for transitive_dep_str in dep_pkg.get('depends', []):
-                    transitive_dep_name = extract_dep_name(transitive_dep_str)
-                    
-                    # If the transitive dependency IS in our build list, create edge
-                    if transitive_dep_name in pkg_map and transitive_dep_name != pkg_name:
-                        # Only increment in_degree if this is a NEW edge
-                        if transitive_dep_name not in reverse_graph[pkg_name]:
-                            graph[transitive_dep_name].add(pkg_name)
-                            reverse_graph[pkg_name].add(transitive_dep_name)
-                            in_degree[pkg_name] += 1
-    
+
     # Find strongly connected components (cycles)
     sccs = find_strongly_connected_components(runtime_reverse_graph)
 
@@ -1094,351 +1049,158 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
             print(f"  Cycle {i+1} ({len(scc)} packages): {', '.join(sorted(scc))}")
         print(f"{'='*SEPARATOR_WIDTH}\n")
 
-    # Identify actual cycles (SCCs with more than one node or self-loops)
-    cycles = []
-    cycle_map = {}  # pkg_name -> cycle_id
-    
-    for scc in sccs:
-        if len(scc) > 1 or (len(scc) == 1 and scc[0] in reverse_graph.get(scc[0], set())):
-            cycle_id = len(cycles)
-            cycles.append(scc)
-            for pkg_name in scc:
-                cycle_map[pkg_name] = cycle_id
-    
-    # Sort cycles by external dependency count (most depended upon first)
-    if cycles:
-        cycle_external_deps = []
-        for cycle_id, cycle_pkgs in enumerate(cycles):
-            external_dep_count = 0
-            cycle_pkg_set = set(cycle_pkgs)
-            
-            # Count how many packages outside this cycle depend on packages in this cycle
-            for pkg in packages:
-                if pkg['name'] in cycle_pkg_set:
-                    continue  # Skip packages in the same cycle
-                
-                # Check if this external package depends on any package in the cycle
-                all_deps = []
-                for dep_type in ['depends', 'makedepends', 'checkdepends']:
-                    all_deps.extend(pkg.get(dep_type, []))
-                
-                for dep_str in all_deps:
-                    dep_name = extract_dep_name(dep_str)
-                    
-                    # Resolve provides relationships
-                    provider_pkg = None
-                    if dep_name in pkg_map:
-                        provider_pkg = dep_name
-                    elif dep_name in all_provides:
-                        provider_pkg = all_provides[dep_name]
-                    
-                    # If dependency resolves to a package in this cycle, count it
-                    if provider_pkg and provider_pkg in cycle_pkg_set:
-                        external_dep_count += 1
-                        break  # Only count each external package once per cycle
-            
-            cycle_external_deps.append((cycle_id, external_dep_count, cycle_pkgs))
-        
-        # Sort cycles by external dependency count (descending - most depended upon first)
-        cycle_external_deps.sort(key=lambda x: x[1], reverse=True)
-        
-        # Reorder cycles based on priority
-        cycles = [cycle_pkgs for _, _, cycle_pkgs in cycle_external_deps]
-        
-        # Rebuild cycle_map with new ordering
-        cycle_map = {}
-        for cycle_id, cycle_pkgs in enumerate(cycles):
-            for pkg_name in cycle_pkgs:
-                cycle_map[pkg_name] = cycle_id
-    
-    # Process cycles, but first check for external dependencies
+    # Emit packages in topological order over the *condensation* of the ordering
+    # graph: every strongly connected component becomes one super-node, which is
+    # either a single ordinary package or a cycle built twice.
+    #
+    # This replaces an older three-phase scheme (cycle-external deps -> all cycles ->
+    # everything else) that could not express a constraint chain alternating between
+    # cycles and ordinary packages. With cycle A = {gtk4, libadwaita, ...} and cycle
+    # B = {gnome-shell, ...}, packages like tecla/mutter/gjs sit *between* them: they
+    # need cycle A and are needed by cycle B. The old phases had to place them either
+    # before every cycle (hence before gtk4) or after every cycle (hence after
+    # gnome-shell), and either way something linked against a stale dependency.
+    #
+    # The ordering graph is runtime_reverse_graph: depends + makedepends, resolved
+    # through provides and restricted to this build list, with GHC-compiled packages
+    # contributing depends only, and checkdepends included for everything else (see
+    # runtime_dep_types above). Deriving cycles and order from the same edge set is
+    # what guarantees the condensation is acyclic.
+    comp_of = {}
+    for comp_id, scc in enumerate(sccs):
+        for name in scc:
+            comp_of[name] = comp_id
+
+    is_cycle = {}
+    for comp_id, scc in enumerate(sccs):
+        is_cycle[comp_id] = (len(scc) > 1 or
+                             (len(scc) == 1 and scc[0] in runtime_reverse_graph.get(scc[0], set())))
+
+    comp_deps = defaultdict(set)   # comp -> comps that must be built first
+    comp_rdeps = defaultdict(set)  # comp -> comps waiting on it
+    for name, providers in runtime_reverse_graph.items():
+        cu = comp_of[name]
+        for provider in providers:
+            cv = comp_of[provider]
+            if cu != cv:
+                comp_deps[cu].add(cv)
+                comp_rdeps[cv].add(cu)
+
+    # Kahn over the condensation, level by level so packages that can be built
+    # concurrently share a build_stage. Within a level, components that more other
+    # components depend on go first, preserving the intent of the previous
+    # "most depended upon first" ordering.
+    indeg = {c: len(comp_deps[c]) for c in range(len(sccs))}
+    ready = [c for c in range(len(sccs)) if indeg[c] == 0]
+
     result = []
     current_stage = 0
-    processed_packages = set()
     sequence_counter = 0
-    
-    external_deps_for_cycles = set()
-    for cycle_id, cycle_pkgs in enumerate(cycles):
-        for pkg_name in cycle_pkgs:
-            pkg = pkg_map[pkg_name]
-            all_deps = []
-            for dep_type in ['depends', 'makedepends', 'checkdepends']:
-                all_deps.extend(pkg.get(dep_type, []))
-            
-            for dep_str in all_deps:
-                dep_name = extract_dep_name(dep_str)
-                
-                # Find the provider
-                provider_pkg = None
-                if dep_name in pkg_map:
-                    provider_pkg = dep_name
-                elif dep_name in all_provides:
-                    provider_pkg = all_provides[dep_name]
-                
-                # If dependency is outside all cycles, it's an external dependency
-                if provider_pkg and provider_pkg in pkg_map and provider_pkg != pkg_name:
-                    is_in_any_cycle = any(provider_pkg in cycle for cycle in cycles)
-                    if not is_in_any_cycle:
-                        external_deps_for_cycles.add(provider_pkg)
-    
-    # Recursively expand external deps to include all their transitive dependencies
-    # within the build list (so they're all built before the cycles)
-    cycle_pkg_set = set()
-    for cycle_pkgs in cycles:
-        cycle_pkg_set.update(cycle_pkgs)
-    
-    changed = True
-    while changed:
-        changed = False
-        for pkg_name in list(external_deps_for_cycles):
-            pkg = pkg_map[pkg_name]
-            all_deps = []
-            for dep_type in ['depends', 'makedepends', 'checkdepends']:
-                all_deps.extend(pkg.get(dep_type, []))
-            for dep_str in all_deps:
-                dep_name = extract_dep_name(dep_str)
-                provider_pkg = None
-                if dep_name in pkg_map:
-                    provider_pkg = dep_name
-                elif dep_name in all_provides:
-                    provider_pkg = all_provides[dep_name]
-                if (provider_pkg and provider_pkg in pkg_map and 
-                    provider_pkg not in external_deps_for_cycles and
-                    provider_pkg not in cycle_pkg_set):
-                    external_deps_for_cycles.add(provider_pkg)
-                    changed = True
-    
-    # First, build external dependencies of cycles
-    if external_deps_for_cycles:
-        external_packages = [pkg for pkg in packages if pkg['name'] in external_deps_for_cycles]
-        # Simple topological sort for external dependencies
-        ext_graph = defaultdict(set)
-        ext_in_degree = defaultdict(int)
-        
-        for pkg in external_packages:
-            ext_in_degree[pkg['name']] = 0
-        
-        for pkg in external_packages:
-            pkg_name = pkg['name']
-            all_deps = []
-            for dep_type in ['depends', 'makedepends', 'checkdepends']:
-                all_deps.extend(pkg.get(dep_type, []))
-            
-            seen_ext_providers = set()
-            for dep_str in all_deps:
-                dep_name = extract_dep_name(dep_str)
-                # Resolve through provides (e.g., llvm-libs -> llvm)
-                resolved = dep_name
-                if dep_name not in external_deps_for_cycles and dep_name in all_provides:
-                    resolved = all_provides[dep_name]
-                if resolved in external_deps_for_cycles and resolved != pkg_name:
-                    if resolved not in seen_ext_providers:
-                        seen_ext_providers.add(resolved)
-                        ext_graph[resolved].add(pkg_name)
-                        ext_in_degree[pkg_name] += 1
-        
-        # Topological sort for external dependencies (level-by-level)
-        queue = deque()
-        for pkg in external_packages:
-            if ext_in_degree[pkg['name']] == 0:
-                queue.append((pkg['name'], current_stage))
-        
-        while queue:
-            next_queue = deque()
-            stage_packages = []
-            
-            while queue:
-                pkg_name, stage = queue.popleft()
-                if stage == current_stage:
-                    stage_packages.append(pkg_name)
-                else:
-                    next_queue.append((pkg_name, stage))
-            
-            if not stage_packages:
-                current_stage += 1
-                queue = next_queue
-                continue
-            
-            for pkg_name in stage_packages:
-                pkg = pkg_map[pkg_name].copy()
+    cycles = []
+    emitted_comps = 0
+
+    while ready:
+        ready.sort(key=lambda c: (-len(comp_rdeps[c]), min(sccs[c])))
+        level, ready = ready, []
+        level_has_cycle = False
+
+        for c in level:
+            members = sccs[c]
+            emitted_comps += 1
+
+            if not is_cycle[c]:
+                pkg = pkg_map[members[0]].copy()
                 pkg['build_stage'] = current_stage
                 pkg['cycle_group'] = None
                 pkg['cycle_stage'] = None
                 pkg['_sequence'] = sequence_counter
                 sequence_counter += 1
                 result.append(pkg)
-                processed_packages.add(pkg_name)
-                
-                for dependent in ext_graph[pkg_name]:
-                    ext_in_degree[dependent] -= 1
-                    if ext_in_degree[dependent] == 0:
-                        next_queue.append((dependent, current_stage + 1))
-            
-            current_stage += 1
-            queue = next_queue
-    
-    # Now process cycles
-    for cycle_id, cycle_pkgs in enumerate(cycles):
-        # Best-effort ordering within cycle: sort by number of in-cycle dependents
-        # (most depended-on packages first, so e.g. glib2 builds before libdex)
-        cycle_pkg_set = set(cycle_pkgs)
-        dep_count = {name: 0 for name in cycle_pkgs}
-        for pkg_name in cycle_pkgs:
-            pkg = pkg_map[pkg_name]
-            all_deps = []
-            for dep_type in ['depends', 'makedepends', 'checkdepends']:
-                all_deps.extend(pkg.get(dep_type, []))
-            for dep_str in all_deps:
-                dep_name = extract_dep_name(dep_str)
-                provider = dep_name
-                if dep_name not in cycle_pkg_set and dep_name in all_provides:
-                    provider = all_provides[dep_name]
-                if provider in cycle_pkg_set and provider != pkg_name:
-                    dep_count[provider] += 1
-        sorted_cycle_pkgs = sorted(cycle_pkgs, key=lambda n: dep_count[n], reverse=True)
+            else:
+                level_has_cycle = True
+                cycle_id = len(cycles)
+                cycles.append(members)
+                # Order *both* stages by in-cycle dependent count, most depended-on
+                # first, so gtk4 precedes libadwaita/sysprof/glycin in each stage.
+                # A cycle has no valid total order by definition, but this at least
+                # means a member's final (stage 2) build links against the stage-2
+                # build of its in-cycle dependencies rather than their stage-1 one.
+                # Emitting stage 2 in raw SCC order instead put libadwaita's final
+                # build ahead of gtk4's, linking it against a gtk4 that was then
+                # immediately rebuilt.
+                # Order inside the cycle greedily: repeatedly emit a member whose
+                # in-cycle dependencies are already satisfied, and when none is (the
+                # cycle proper) emit the most-depended-on member, breaking only *its*
+                # dependencies. A cycle has no valid total order, so the aim is to
+                # break the edges that matter least.
+                #
+                # Breaking the hub's own deps is the right trade: gtk4 is needed by
+                # four other members, and its in-cycle deps (gdk-pixbuf2, sysprof,
+                # tinysparql, pygobject) are unversioned so the repo's copies satisfy
+                # them. Edges like gdk-pixbuf2 -> glycin and libadwaita -> gtk4 carry
+                # version constraints and fail the build outright when broken, which
+                # is what both a dependent-count ranking and a plain DFS postorder did.
+                member_set = set(members)
+                needs = {n: {p for p in runtime_reverse_graph.get(n, set())
+                             if p in member_set and p != n} for n in members}
+                dep_count = {n: 0 for n in members}
+                for n in members:
+                    for provider in needs[n]:
+                        dep_count[provider] += 1
 
-        # Add first build of cycle packages
-        for pkg_name in sorted_cycle_pkgs:
-            pkg = pkg_map[pkg_name].copy()
-            pkg['build_stage'] = current_stage
-            pkg['cycle_group'] = cycle_id
-            pkg['cycle_stage'] = 1
-            pkg['_sequence'] = sequence_counter
-            sequence_counter += 1
-            result.append(pkg)
-            processed_packages.add(pkg_name)
-        
-        # Add second build of cycle packages
-        for pkg_name in cycle_pkgs:
-            pkg = pkg_map[pkg_name].copy()
-            pkg['build_stage'] = current_stage + 1
-            pkg['cycle_group'] = cycle_id
-            pkg['cycle_stage'] = 2
-            pkg['_sequence'] = sequence_counter
-            sequence_counter += 1
-            result.append(pkg)
-        
-        current_stage += 2
-    
-    # Now process remaining packages with topological sort
-    remaining_packages = [pkg for pkg in packages if pkg['name'] not in processed_packages]
-    if remaining_packages:
-        # Build new graph without cycle packages.
-        # We construct edges as (provider, dependent, dep_type) and then break any
-        # cycles that form among all-GHC-compiled packages by dropping makedepends /
-        # checkdepends edges inside those SCCs. GHC packages cannot be resolved via
-        # two-stage cycles due to ABI-hash linking, so their build order must be a
-        # strict DAG — test-framework / build-tool makedepends that happen to cycle
-        # back are broken here. The test tool will still be installed from the repo
-        # at build time; only the build-order hint is removed.
-        remaining_set = {p['name'] for p in remaining_packages}
-        remaining_rev = defaultdict(set)  # pkg -> providers
-        edge_types = {}  # (pkg, provider) -> 'depends' | 'makedepends' | 'checkdepends'
+                remaining = set(members)
+                cycle_order = []
+                done = set()
+                while remaining:
+                    avail = [n for n in remaining if needs[n] <= done]
+                    pool = avail if avail else remaining
+                    pick = min(pool, key=lambda n: (-dep_count[n], n))
+                    cycle_order.append(pick)
+                    done.add(pick)
+                    remaining.discard(pick)
 
-        for pkg in remaining_packages:
-            pkg_name = pkg['name']
-            # First pass collects provider per dep type (depends wins over makedepends over checkdepends)
-            seen_providers = {}  # provider -> dep_type
-            for dep_type in ('depends', 'makedepends', 'checkdepends'):
-                for dep_str in pkg.get(dep_type, []):
-                    dep_name = extract_dep_name(dep_str)
-                    if dep_name == pkg_name:
-                        continue
-                    provider_pkg = None
-                    if dep_name in pkg_map:
-                        provider_pkg = dep_name
-                    elif dep_name in all_provides:
-                        provider_pkg = all_provides[dep_name]
-                    if not (provider_pkg and provider_pkg in pkg_map and provider_pkg != pkg_name):
-                        continue
-                    if provider_pkg in processed_packages:
-                        continue  # Dep was in an earlier cycle group — already built
-                    if provider_pkg not in remaining_set:
-                        continue
-                    # Keep the strongest edge type seen: depends > makedepends > checkdepends
-                    priority = {'depends': 0, 'makedepends': 1, 'checkdepends': 2}
-                    if provider_pkg in seen_providers:
-                        if priority[dep_type] < priority[seen_providers[provider_pkg]]:
-                            seen_providers[provider_pkg] = dep_type
-                    else:
-                        seen_providers[provider_pkg] = dep_type
-            for provider_pkg, dt in seen_providers.items():
-                remaining_rev[pkg_name].add(provider_pkg)
-                edge_types[(pkg_name, provider_pkg)] = dt
+                rank = {n: i for i, n in enumerate(cycle_order)}
 
-        # Find SCCs in the remaining-graph and drop makedepends/checkdepends edges
-        # inside SCCs whose members are all GHC-compiled (Haskell packages that can't
-        # two-stage). This converts makedepends-induced Haskell cycles into a DAG.
-        rem_sccs = find_strongly_connected_components(remaining_rev)
-        dropped = 0
-        for scc in rem_sccs:
-            if len(scc) <= 1:
-                continue
-            if not all(_is_ghc_compiled(pkg_map[n]) for n in scc):
-                # Non-GHC or mixed SCC at this stage shouldn't happen (those were
-                # caught by the earlier two-stage cycle detection). If it does,
-                # leave the edges intact so the topological sort fails visibly.
-                continue
-            scc_set = set(scc)
-            for node in scc:
-                to_drop = {p for p in remaining_rev[node]
-                           if p in scc_set and edge_types.get((node, p)) in ('makedepends', 'checkdepends')}
-                remaining_rev[node] -= to_drop
-                for p in to_drop:
-                    edge_types.pop((node, p), None)
-                dropped += len(to_drop)
-        if dropped:
-            print(f"Broke {dropped} makedepends/checkdepends edges among Haskell packages to produce a DAG")
+                for cycle_stage in (1, 2):
+                    for n in cycle_order:
+                        pkg = pkg_map[n].copy()
+                        pkg['build_stage'] = current_stage + (cycle_stage - 1)
+                        pkg['cycle_group'] = cycle_id
+                        pkg['cycle_stage'] = cycle_stage
+                        # Position within the cycle. build_packages.py keeps the
+                        # intra-cycle edges that point from a lower rank to a higher
+                        # one and drops only the back-edges, so members with a real
+                        # dependency (libadwaita on gtk4) are still serialised during
+                        # parallel builds instead of racing inside one stage.
+                        pkg['cycle_rank'] = rank[n]
+                        pkg['_sequence'] = sequence_counter
+                        sequence_counter += 1
+                        result.append(pkg)
 
-        # Build forward graph + in_degree from the (possibly edge-reduced) reverse graph
-        remaining_graph = defaultdict(set)
-        remaining_in_degree = defaultdict(int)
-        for pkg in remaining_packages:
-            remaining_in_degree[pkg['name']] = 0
-        for dependent, providers in remaining_rev.items():
-            for provider in providers:
-                remaining_graph[provider].add(dependent)
-                remaining_in_degree[dependent] += 1
-        
-        # Topological sort for remaining packages
-        queue = deque()
-        for pkg in remaining_packages:
-            if remaining_in_degree[pkg['name']] == 0:
-                queue.append((pkg['name'], current_stage))
-        
-        while queue:
-            next_queue = deque()
-            stage_packages = []
-            
-            while queue:
-                pkg_name, stage = queue.popleft()
-                if stage == current_stage:
-                    stage_packages.append(pkg_name)
-                else:
-                    next_queue.append((pkg_name, stage))
-            
-            if not stage_packages:
-                current_stage += 1
-                queue = next_queue
-                continue
-            
-            for pkg_name in stage_packages:
-                pkg = pkg_map[pkg_name].copy()
+            for dependent in comp_rdeps[c]:
+                indeg[dependent] -= 1
+                if indeg[dependent] == 0:
+                    ready.append(dependent)
+
+        current_stage += 2 if level_has_cycle else 1
+
+    if emitted_comps != len(sccs):
+        # Should be unreachable: the condensation of an SCC decomposition is acyclic.
+        leftover = [c for c in range(len(sccs)) if c not in {comp_of[n] for p in result for n in [p['name']]}]
+        print(f"WARNING: condensation did not fully order ({emitted_comps}/{len(sccs)} "
+              f"components); {len(leftover)} appended unordered")
+        for c in leftover:
+            for n in sccs[c]:
+                pkg = pkg_map[n].copy()
                 pkg['build_stage'] = current_stage
                 pkg['cycle_group'] = None
                 pkg['cycle_stage'] = None
                 pkg['_sequence'] = sequence_counter
                 sequence_counter += 1
                 result.append(pkg)
-                
-                for dependent in remaining_graph[pkg_name]:
-                    remaining_in_degree[dependent] -= 1
-                    if remaining_in_degree[dependent] == 0:
-                        next_queue.append((dependent, current_stage + 1))
-            
-            current_stage += 1
-            queue = next_queue
-    
+        current_stage += 1
+
+
     # Sort by build stage, then by cycle stage, then by sequence (preserves topological order)
     sorted_result = sorted(result, key=lambda x: (x['build_stage'], x.get('cycle_stage') or 0, x.get('_sequence', 0)))
     
@@ -1462,12 +1224,6 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
     return sorted_result
 
 if __name__ == "__main__":
-    # Clean up state from previous builds
-    try:
-        Path("last_successful.txt").unlink()
-    except FileNotFoundError:
-        pass
-    
     target_arch = get_target_architecture()
     
     parser = argparse.ArgumentParser(description=f'Generate build list by comparing Arch Linux package versions between x86_64 and {target_arch} repositories')
@@ -1552,6 +1308,9 @@ if __name__ == "__main__":
         # For local mode, create packages directly from local PKGBUILDs
         newer_packages = []
         for pkg_name in args.packages:
+            if not validate_package_name(pkg_name):
+                print(f"ERROR: Invalid package name: {pkg_name}")
+                sys.exit(1)
             pkg_dir = Path("pkgbuilds") / pkg_name
             if not pkg_dir.exists() or not (pkg_dir / "PKGBUILD").exists():
                 print(f"ERROR: Local PKGBUILD not found for {pkg_name} at {pkg_dir}/PKGBUILD")
@@ -1703,39 +1462,23 @@ if __name__ == "__main__":
                             break
                     
                     if not found_by_basename:
-                        # Check if package exists but is ARCH=any (filtered out)
-                        arch_any_found = False
-                        is_arch_any = False
-                        for repo in ['core', 'extra']:
-                            try:
-                                db_filename = f"{repo}_x86_64.db"
-                                if os.path.exists(db_filename):
-                                    with tarfile.open(db_filename, 'r:gz') as tar:
-                                        for member in tar.getmembers():
-                                            if member.name.endswith('/desc'):
-                                                desc_content = tar.extractfile(member).read().decode('utf-8')
-                                                lines = desc_content.strip().split('\n')
-                                                data = {}
-                                                current_key = None
-                                                
-                                                for line in lines:
-                                                    if line.startswith('%') and line.endswith('%'):
-                                                        current_key = line[1:-1]
-                                                        data[current_key] = []
-                                                    elif current_key and line:
-                                                        data[current_key].append(line)
-                                                
-                                                if ('NAME' in data and data['NAME'][0] == pkg_name) or \
-                                                   ('BASE' in data and data['BASE'][0] == pkg_name):
-                                                    if data.get('ARCH', [''])[0] == 'any':
-                                                        is_arch_any = True
-                                                    arch_any_found = True
-                                                    break
-                                        if arch_any_found:
-                                            break
-                            except Exception:
-                                continue
-                        
+                        # Not in the arch-specific set: check whether it is an
+                        # ARCH=any package, using the same loader (and so the same
+                        # local mirror) as everything else. The previous code read
+                        # {repo}_x86_64.db from the CWD, which does not exist when
+                        # paths.mirror_path is set, so every ARCH=any package was
+                        # reported as "not found".
+                        if '_x86_any' not in globals():
+                            _x86_any = load_database_packages(
+                                [f"{X86_64_MIRROR}/core/os/x86_64/core.db",
+                                 f"{X86_64_MIRROR}/extra/os/x86_64/extra.db"],
+                                '_x86_64', download=not args.no_update,
+                                include_any=True, verbose=verbose)
+                        _match = next((p for n, p in _x86_any.items()
+                                       if n == pkg_name or p['basename'] == pkg_name), None)
+                        arch_any_found = _match is not None
+                        is_arch_any = bool(_match) and _match.get('arch') == 'any'
+
                         if not arch_any_found:
                             print(f"ERROR: Package {pkg_name} not found in x86_64 repositories")
                             sys.exit(1)
@@ -1796,6 +1539,7 @@ if __name__ == "__main__":
         log("Ignoring blacklist (using --packages)")
     else:
         blacklist = load_blacklist(args.blacklist)
+    dep_blacklist = blacklist or load_blacklist(args.blacklist)
     
     # Load provides mapping once (doesn't change)
     log("Loading provides mapping from upstream databases...")
@@ -1862,6 +1606,28 @@ if __name__ == "__main__":
         if full_x86_packages:
             log("Checking for missing dependencies (including checkdepends)...")
             missing_deps = find_missing_dependencies(newer_packages, full_x86_packages, target_packages)
+
+            # Drop anything already queued. find_missing_dependencies() only asks
+            # "is this dependency absent from the target architecture?", so a
+            # package named explicitly on the command line gets reported as a
+            # missing dependency of one of its own siblings. With
+            #   --packages rpp rocal mivisionx
+            # where none of the three exist on the target yet, rocal depends on
+            # mivisionx and rpp, so it announced "Found 2 missing dependencies:
+            # mivisionx, rpp" despite both already being in the list. Nothing was
+            # ever added (the guard in the loop below caught it), but the message
+            # was wrong and it fed the bogus added_basenames calculation.
+            if missing_deps:
+                already_queued = set()
+                for pkg in newer_packages:
+                    already_queued.add(pkg['name'])
+                    already_queued.add(pkg.get('basename', pkg['name']))
+                missing_deps = {
+                    dep for dep in missing_deps
+                    if dep not in already_queued
+                    and full_x86_packages.get(dep, {}).get('basename', dep) not in already_queued
+                }
+
             if missing_deps:
                 print(f"Found {len(missing_deps)} missing dependencies: {', '.join(sorted(missing_deps))}")
                 
@@ -1890,13 +1656,17 @@ if __name__ == "__main__":
                             
                             dep_reasons[dep_name].append(f"{dep_type} for {pkg['name']}")
                 
+                added_basenames = []
                 for dep_name in missing_deps:
                     if dep_name in full_x86_packages:
                         pkg = full_x86_packages[dep_name]
                         basename = pkg['basename']
                         
+                        # --packages empties `blacklist` so explicitly named packages
+                        # build anyway; a dependency pulled in on their behalf was not
+                        # named, so it must still respect blacklist.txt.
                         is_blacklisted = False
-                        for pattern in blacklist:
+                        for pattern in dep_blacklist:
                             if fnmatch.fnmatch(dep_name, pattern) or fnmatch.fnmatch(basename, pattern):
                                 is_blacklisted = True
                                 break
@@ -1916,13 +1686,15 @@ if __name__ == "__main__":
                                 'use_aur': False,
                                 'added_reason': reason,
                             })
-                
-                # Parse PKGBUILDs only for newly added dependencies
-                added_basenames = []
-                for dep_name in missing_deps:
-                    if dep_name in full_x86_packages:
-                        basename = full_x86_packages[dep_name]['basename']
-                        if basename not in [p['name'] for p in newer_packages[:len(newer_packages) - len(missing_deps)]]:
+                            # Record what was actually appended. This used to be
+                            # inferred afterwards with
+                            #   newer_packages[:len(newer_packages) - len(missing_deps)]
+                            # which assumes every missing dep got appended. When some
+                            # were already in the list that slice chops off real
+                            # entries and misreports whichever package falls outside
+                            # it, so an already-queued package was re-fetched -- and
+                            # with --use-latest that is a real git fetch/reset, not
+                            # just a wasted message.
                             added_basenames.append(basename)
                 
                 if added_basenames:
@@ -1954,14 +1726,6 @@ if __name__ == "__main__":
                             for provide in pkg_data.get('provides', []):
                                 provide_name = provide.split('=')[0]
                                 build_list_provides[provide_name] = basename
-                    
-                    # Add common split package patterns for packages in build list
-                    basenames_in_build = {pkg.get('basename', pkg['name']) for pkg in newer_packages}
-                    for basename in basenames_in_build:
-                        for suffix in ['-headers', '-docs', '-devel', '-dev']:
-                            split_name = basename + suffix
-                            if split_name not in build_list_provides:
-                                build_list_provides[split_name] = basename
                     
                     # Add common split package patterns for packages in build list
                     basenames_in_build = {pkg.get('basename', pkg['name']) for pkg in newer_packages}
@@ -2049,13 +1813,13 @@ if __name__ == "__main__":
         # Separate packages that need updates vs rebuilds
         rebuild_packages = []
         update_packages = []
-        for pkg_name in args.packages:
-            if pkg_name in newer_packages:
-                pkg = newer_packages[pkg_name]
-                if pkg.get('version') == pkg.get('current_version'):
-                    rebuild_packages.append(pkg_name)
-                else:
-                    update_packages.append(pkg_name)
+        for pkg in newer_packages:
+            if pkg['name'] not in args.packages:
+                continue  # pulled in as a missing dependency
+            if pkg.get('version') == pkg.get('current_version'):
+                rebuild_packages.append(pkg['name'])
+            else:
+                update_packages.append(pkg['name'])
         
         rebuild_list = ', '.join(f"\033[1m{pkg}\033[0m" for pkg in rebuild_packages) if rebuild_packages else ""
         if rebuild_list:

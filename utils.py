@@ -88,6 +88,21 @@ def get_target_architecture():
         print(f"ERROR: Failed to read chroot-config/makepkg.conf: {e}")
         sys.exit(1)
 
+_TARGET_CARCH = None
+
+
+def target_carch():
+    """CARCH to evaluate PKGBUILDs with: the target architecture from
+    chroot-config/makepkg.conf, or the host's machine name if that is absent."""
+    global _TARGET_CARCH
+    if _TARGET_CARCH is None:
+        if Path("chroot-config/makepkg.conf").exists():
+            _TARGET_CARCH = get_target_architecture()
+        else:
+            _TARGET_CARCH = os.uname().machine
+    return _TARGET_CARCH
+
+
 def validate_package_name(pkg_name: str) -> bool:
     """
     Validate package name against Arch Linux naming rules.
@@ -312,17 +327,20 @@ cd {shlex.quote(str(pkg_dir))} || exit 1
 if [[ ! -f PKGBUILD ]]; then
     exit 1
 fi
+# Evaluate for the target architecture: PKGBUILDs add per-arch dependencies
+# through depends_$CARCH arrays and [[ $CARCH == ... ]] conditionals.
+CARCH={shlex.quote(target_carch())}
 source PKGBUILD 2>/dev/null || exit 1
+_d="depends_${{CARCH}}[@]"; _m="makedepends_${{CARCH}}[@]"; _c="checkdepends_${{CARCH}}[@]"
 
-# Extract global dependencies first
 echo "DEPENDS_START"
-printf '%s\\n' "${{depends[@]}}"
+printf '%s\\n' "${{depends[@]}}" "${{!_d}}"
 echo "DEPENDS_END"
 echo "MAKEDEPENDS_START"
-printf '%s\\n' "${{makedepends[@]}}"
+printf '%s\\n' "${{makedepends[@]}}" "${{!_m}}"
 echo "MAKEDEPENDS_END"
 echo "CHECKDEPENDS_START"
-printf '%s\\n' "${{checkdepends[@]}}"
+printf '%s\\n' "${{checkdepends[@]}}" "${{!_c}}"
 echo "CHECKDEPENDS_END"
 """
         
