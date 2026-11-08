@@ -4,11 +4,10 @@
 import argparse
 import fnmatch
 from pathlib import Path
-from packaging import version
 
 from utils import (
     load_blacklist, get_target_architecture, is_version_newer,
-    load_all_packages_parallel, ArchVersionComparator
+    load_all_packages_parallel, ArchVersionComparator, load_database_packages, config
 )
 
 
@@ -23,17 +22,33 @@ def build_provides_map(packages):
 
 
 def group_by_basename(packages):
-    """Group packages by basename, return (bases, by_basename, repo_count)"""
-    bases = {}
+    """Group packages by basename, return (bases, by_basename, repo_count).
+
+    bases[basename] is a merged view of all split packages of that base, not one
+    arbitrary sibling: depends/makedepends/provides are unioned across them, and
+    arch is 'any' only if every split package is ARCH=any. Using a single sibling
+    made blacklist checks miss a dependency declared by another split package.
+    """
     by_basename = {}
     repo_count = {}
-    
     for pkg_name, pkg_data in packages.items():
         basename = pkg_data['basename']
-        bases[basename] = pkg_data
         by_basename.setdefault(basename, []).append(pkg_name)
         repo_count.setdefault(basename, set()).add(pkg_data['repo'])
-    
+
+    bases = {}
+    for basename, names in by_basename.items():
+        members = [packages[n] for n in sorted(names)]
+        # Prefer the package named like the base as the representative
+        rep_pkg = packages.get(basename) if basename in names else members[0]
+        merged = dict(rep_pkg)
+        for key in ('depends', 'makedepends', 'provides'):
+            merged[key] = list(dict.fromkeys(d for m in members for d in m.get(key, [])))
+        arches = {m.get('arch') for m in members}
+        merged['arch'] = 'any' if arches == {'any'} else next(
+            (a for a in sorted(arches, key=str) if a != 'any'), rep_pkg.get('arch'))
+        bases[basename] = merged
+
     return bases, by_basename, repo_count
 
 
@@ -62,8 +77,8 @@ def is_blacklisted(basename, pkg_data, blacklist, x86_packages=None, target_prov
     return False
 
 
-def find_package_name_mismatches(x86_bases, x86_by_basename, target_by_basename, 
-                                  target_packages, x86_provides, target_provides, target_arch):
+def find_package_name_mismatches(x86_bases, x86_by_basename, target_by_basename,
+                                  target_packages, target_provides, target_arch):
     """Find packages where split package names differ between architectures"""
     mismatches = []
     
@@ -110,8 +125,7 @@ def find_outdated_any_packages(target_by_basename, target_packages, x86_bases, t
     for basename, pkg_names in target_by_basename.items():
         if basename not in x86_bases:
             continue
-        x86_arch = x86_bases[basename].get('arch', 'unknown')
-        
+
         for pkg_name in pkg_names:
             pkg = target_packages[pkg_name]
             target_pkg_arch = pkg.get('arch') or ('any' if pkg.get('filename', '').endswith('any.pkg.tar.zst') else 'unknown')
@@ -124,14 +138,14 @@ def find_outdated_any_packages(target_by_basename, target_packages, x86_bases, t
             if not x86_pkg:
                 continue  # Not present under the same name on x86; skip
             x86_version = x86_pkg['version']
-            
+            x86_arch = x86_pkg.get('arch') or 'unknown'
+
             # Only report if target package is 'any' AND x86_64 package is also 'any'
             if target_pkg_arch == 'any' and x86_arch == 'any':
-                try:
-                    if version.parse(pkg['version']) < version.parse(x86_version):
-                        outdated.append(f"{pkg_name}: {target_arch}={pkg['version']}, x86_64={x86_version}")
-                except Exception:
-                    pass
+                # pacman ordering, not PEP 440: Arch versions such as 1:8.19.0-1 or
+                # 2.3+r24+g7c175c4-1 do not parse as PEP 440 and were silently skipped.
+                if is_version_newer(pkg['version'], x86_version):
+                    outdated.append(f"{pkg_name}: {target_arch}={pkg['version']}, x86_64={x86_version}")
             # Report architecture changes
             elif target_pkg_arch == 'any' and x86_arch != 'any':
                 outdated.append(f"{pkg_name}: {target_arch}={pkg['version']} (any), x86_64={x86_version} (ARCH CHANGED to {x86_arch})")
@@ -174,34 +188,44 @@ def find_missing_any_packages(x86_bases, x86_packages, target_bases,
     return missing
 
 
-def find_repo_issues(target_bases, x86_bases, target_repo_count, target_arch):
-    """Find repository mismatches and duplicates"""
-    issues = []
-    
-    # Packages in multiple repos on target
-    for basename, repos in target_repo_count.items():
+def find_repo_issues(target_bases, x86_bases, target_arch, use_existing_db=False):
+    """Find repository mismatches and duplicates.
+
+    Each target repo is loaded separately through the normal loader (honouring
+    --use-existing-db), because the merged package dict keeps only one copy of a
+    package present in several repos. This used to re-parse
+    {core,extra,forge}_<arch>.db from the CWD, silently checking less when those
+    files were absent. Each package or pkgbase is reported once.
+    """
+    base_url = config.get('build', 'target_base_url')
+    repo_pkgs = {}
+    for repo in ('core', 'extra', 'forge'):
+        repo_pkgs[repo] = load_database_packages(
+            [f"{base_url}/{repo}/os/{target_arch}/{repo}.db"], f'_{target_arch}',
+            download=not use_existing_db, include_any=True)
+
+    issues = {}  # subject -> message; first finding per subject wins
+    where = {}   # package name -> set of repos
+    base_where = {}
+    for repo, pkgs in repo_pkgs.items():
+        for name, pkg in pkgs.items():
+            where.setdefault(name, set()).add(repo)
+            base_where.setdefault(pkg['basename'], set()).add(repo)
+    for name, repos in sorted(where.items()):
         if len(repos) > 1:
-            issues.append(f"{basename}: present in {', '.join(sorted(repos))} on {target_arch}")
-    
-    # Check for cross-repo duplicates by parsing raw DB files
-    from utils import parse_database_file, get_target_architecture
-    _target_arch = get_target_architecture()
-    pkg_repos = {}  # pkg_name -> set of repos
-    for db_file, repo_name in [(f'core_{_target_arch}.db', 'core'), (f'extra_{_target_arch}.db', 'extra'), (f'forge_{_target_arch}.db', 'forge')]:
-        for name in parse_database_file(db_file, include_any=True):
-            pkg_repos.setdefault(name, set()).add(repo_name)
-    for name, repos in sorted(pkg_repos.items()):
+            issues.setdefault(name, f"{name}: present in {', '.join(sorted(repos))} on {target_arch}")
+    for base, repos in sorted(base_where.items()):
         if len(repos) > 1:
-            issues.append(f"{name}: present in {', '.join(sorted(repos))} on {target_arch}")
-    
+            issues.setdefault(base, f"{base}: present in {', '.join(sorted(repos))} on {target_arch}")
+
     # Repo mismatches between architectures
     for basename, target_data in target_bases.items():
         if basename in x86_bases:
             x86_repo = x86_bases[basename]['repo']
             if target_data['repo'] != x86_repo:
-                issues.append(f"{basename}: {target_arch} in {target_data['repo']}, x86_64 in {x86_repo}")
-    
-    return issues
+                issues.setdefault(basename, f"{basename}: {target_arch} in {target_data['repo']}, x86_64 in {x86_repo}")
+
+    return list(issues.values())
 
 
 def find_target_newer(target_bases, x86_bases, target_arch):
@@ -250,16 +274,13 @@ def get_bin_package_version_info(basename, target_data, x86_packages):
     if target_pkgver == x86_pkgver:
         return f" \033[32m[matches x86_64 {x86_counterpart}]\033[0m"
     
-    try:
-        if version.parse(target_pkgver) > version.parse(x86_pkgver):
-            return f" \033[36m[NEWER than x86_64 {x86_counterpart}: {x86_version}]\033[0m"
-        return f" \033[31m[OUTDATED - x86_64 {x86_counterpart}: {x86_version}]\033[0m"
-    except Exception:
-        return f" [x86_64 {x86_counterpart}: {x86_version}]"
+    if ArchVersionComparator.compare(target_pkgver, x86_pkgver) > 0:
+        return f" \033[36m[NEWER than x86_64 {x86_counterpart}: {x86_version}]\033[0m"
+    return f" \033[31m[OUTDATED - x86_64 {x86_counterpart}: {x86_version}]\033[0m"
 
 
-def find_target_only(target_bases, target_packages, target_by_basename, x86_bases, 
-                     x86_packages, x86_provides, target_arch):
+def find_target_only(target_bases, target_packages, target_by_basename, x86_bases,
+                     x86_packages, target_arch):
     """Find packages that only exist on target architecture"""
     only = []
     
@@ -272,8 +293,12 @@ def find_target_only(target_bases, target_packages, target_by_basename, x86_base
         if isinstance(arch, set):
             arch = list(arch)[0] if arch else target_arch
         
+        def _filename(name):
+            p = target_packages.get(name, target_data)
+            return p.get('filename') or f"{name}-{p['version']}-{p.get('arch') or arch}.pkg.tar.zst"
+
         if len(pkg_names) == 1 and pkg_names[0] == basename:
-            filename = f"{basename}-{target_data['version']}-{arch}.pkg.tar.zst"
+            filename = _filename(basename)
             # For packages with incorrect basename grouping, use the actual package data
             actual_pkg_data = target_packages.get(basename, target_data)
             version_info = get_bin_package_version_info(basename, actual_pkg_data, x86_packages)
@@ -283,11 +308,11 @@ def find_target_only(target_bases, target_packages, target_by_basename, x86_base
             only.append(line)
         else:
             for pkg_name in pkg_names:
-                filename = f"{pkg_name}-{target_data['version']}-{arch}.pkg.tar.zst"
+                filename = _filename(pkg_name)
                 # Use actual package data for version info
                 actual_pkg_data = target_packages.get(pkg_name, target_data)
                 version_info = get_bin_package_version_info(pkg_name, actual_pkg_data, x86_packages)
-                line = f"{pkg_name}: {target_data['version']} ({target_data['repo']}) (file: {filename}){version_info}"
+                line = f"{pkg_name}: {actual_pkg_data['version']} ({actual_pkg_data['repo']}) (file: {filename}){version_info}"
                 if target_data['repo'] in ['core', 'extra']:
                     line = f"\033[31m{line}\033[0m"
                 only.append(line)
@@ -528,7 +553,6 @@ def main():
     print("Processing packages...")
     x86_bases, x86_by_basename, _ = group_by_basename(x86_packages)
     target_bases, target_by_basename, target_repo_count = group_by_basename(target_packages)
-    x86_provides = build_provides_map(x86_packages)
     target_provides = build_provides_map(target_packages)
     
     # Find missing pkgbase (not blacklisted, exclude ARCH=any)
@@ -575,8 +599,8 @@ def main():
     # Collect results
     results = {
         'mismatches': find_package_name_mismatches(
-            x86_bases, x86_by_basename, target_by_basename, 
-            target_packages, x86_provides, target_provides, target_arch
+            x86_bases, x86_by_basename, target_by_basename,
+            target_packages, target_provides, target_arch
         ) if show_all else [],
         'outdated_any': find_outdated_any_packages(
             target_by_basename, target_packages, x86_bases, target_arch, x86_packages
@@ -585,14 +609,14 @@ def main():
             x86_bases, x86_packages, target_bases, target_packages, target_provides
         ) if show_all or args.missing_any else [],
         'repo_issues': find_repo_issues(
-            target_bases, x86_bases, target_repo_count, target_arch
+            target_bases, x86_bases, target_arch, args.use_existing_db
         ) if show_all or args.repo_issues else [],
         'target_newer': find_target_newer(
             target_bases, x86_bases, target_arch
         ) if show_all or args.target_newer else [],
         'target_only': find_target_only(
             target_bases, target_packages, target_by_basename, x86_bases,
-            x86_packages, x86_provides, target_arch
+            x86_packages, target_arch
         ) if show_all or args.target_only else [],
     }
     
