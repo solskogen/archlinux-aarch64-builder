@@ -289,6 +289,63 @@ class PackageBuilder:
             self.temp_copies.append(temp_copy_path)
         return temp_copy_path
 
+    def _drop_mismatched_cached_sources(self, pkg_dir):
+        """Remove cached downloads in SRCDEST whose checksum does not match this PKGBUILD.
+
+        SRCDEST is shared by all packages, and makepkg reuses any file of the right
+        name found there without re-downloading, even when it then fails the
+        checksum. Different packages download different patches under the same
+        name (eight PKGBUILDs in the OpenSSL 4 rebuild fetch their own
+        "openssl-4.patch"), so whichever ran first poisoned the rest. Removing the
+        mismatching file makes makepkg fetch the right one. VCS sources and SKIP
+        checksums are left alone.
+        """
+        import hashlib, shlex
+        srcdest = os.environ.get('SRCDEST')
+        if not srcdest:
+            r = subprocess.run(['bash', '-c', 'source /etc/makepkg.conf 2>/dev/null; '
+                                '[[ -r ~/.makepkg.conf ]] && source ~/.makepkg.conf; echo "$SRCDEST"'],
+                               capture_output=True, text=True)
+            srcdest = r.stdout.strip()
+        if not srcdest or not Path(srcdest).is_dir():
+            return
+        algos = ('sha256', 'sha512', 'b2', 'sha1', 'md5', 'sha384', 'sha224')
+        script = (f"cd {shlex.quote(str(pkg_dir))}; CARCH={shlex.quote(target_carch())}; "
+                  "source PKGBUILD >/dev/null 2>&1 || exit 1\n"
+                  "for a in " + ' '.join(algos) + "; do\n"
+                  "  for v in '' _$CARCH; do\n"
+                  "    s=\"source$v[@]\"; c=\"${a}sums$v[@]\"; s=(\"${!s}\"); c=(\"${!c}\")\n"
+                  "    (( ${#c[@]} )) || continue\n"
+                  "    for i in \"${!s[@]}\"; do printf '%s\\t%s\\t%s\\n' \"$a\" \"${c[i]}\" \"${s[i]}\"; done\n"
+                  "  done\n"
+                  "done\n")
+        r = subprocess.run(['bash', '-c', script], capture_output=True, text=True, timeout=30)
+        seen = set()
+        for line in r.stdout.splitlines():
+            try:
+                algo, want, src = line.split('\t', 2)
+            except ValueError:
+                continue
+            name, _, url = src.partition('::') if '::' in src else ('', '', src)
+            if '://' not in url or url.split('://', 1)[0].split('+')[0] in ('git', 'svn', 'hg', 'bzr', 'fossil'):
+                continue
+            name = name or url.split('#', 1)[0].rstrip('/').rsplit('/', 1)[-1]
+            cached = Path(srcdest) / name
+            if want == 'SKIP' or name in seen or not cached.is_file():
+                continue
+            seen.add(name)
+            h = hashlib.blake2b() if algo == 'b2' else hashlib.new(algo)
+            with open(cached, 'rb') as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b''):
+                    h.update(chunk)
+            if h.hexdigest() != want.lower():
+                print(f"Removing cached {cached}: {algo}sum does not match this PKGBUILD "
+                      f"(likely another package's file of the same name)")
+                try:
+                    cached.unlink()
+                except OSError as e:
+                    print(f"  Warning: could not remove it: {e}")
+
     def _prepare_build_environment(self, temp_copy_path, pkg_name, pkg_dir):
         """Setup chroot environment and install dependencies"""
         root_chroot = self.chroot_path / "root"
@@ -315,6 +372,8 @@ class PackageBuilder:
                 except subprocess.CalledProcessError as e:
                     print(f"Warning: Failed to clear cache: {e}")
         
+        self._drop_mismatched_cached_sources(pkg_dir)
+
         # Create temp chroot
         print(f"Creating temporary chroot: {temp_copy_path.name}")
         try:
