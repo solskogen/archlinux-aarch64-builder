@@ -931,17 +931,26 @@ def sort_by_build_order(packages, all_x86_packages=None, all_target_packages=Non
     # Create package name to package mapping
     pkg_map = {pkg['name']: pkg for pkg in packages}
     
-    # Build provides mapping from ALL packages (x86_64 + target) for dependency resolution
+    # Build provides mapping from ALL packages (x86_64 + target) for dependency resolution.
+    # Real package names take precedence over provides, as in pacman: a dependency on
+    # "mariadb-libs" installs the package of that name (pkgbase mariadb), not
+    # mariadb-lts-libs, which merely provides it. Letting the provide overwrite the
+    # name ordered libsasl/apr-util against mariadb-lts while build_packages.py (which
+    # maps real split-package names) waited for mariadb, and the two disagreeing
+    # graphs deadlocked the parallel scheduler.
     all_provides = {}
     if all_x86_packages and all_target_packages:
         for pkg_dict in [all_x86_packages, all_target_packages]:
             for pkg_name, pkg_data in pkg_dict.items():
                 basename = pkg_data.get('basename', pkg_name)
-                all_provides[pkg_name] = basename  # Map package name to basename
-                all_provides[basename] = basename
                 for provide in pkg_data.get('provides', []):
                     provide_name = provide.split('=')[0].strip()
                     all_provides[provide_name] = basename  # Map provides to basename
+        for pkg_dict in [all_x86_packages, all_target_packages]:
+            for pkg_name, pkg_data in pkg_dict.items():
+                basename = pkg_data.get('basename', pkg_name)
+                all_provides[pkg_name] = basename  # Real names override provides
+                all_provides[basename] = basename
     
     # Add common split package patterns for packages in build list
     # This handles cases like linux providing linux-headers, linux-docs, etc.
