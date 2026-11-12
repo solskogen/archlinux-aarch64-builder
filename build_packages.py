@@ -678,8 +678,31 @@ echo "CHECKDEPENDS_END"
                 self._seed_cache_with_built_packages(pkg_name, pkg_dir)
         
         print(f"Successfully built {pkg_name}")
-        self._update_last_successful(pkg_name)
+        self._update_last_successful(self._progress_key(pkg_data))
         return True
+
+    @staticmethod
+    def _progress_key(pkg):
+        """Key a build entry is recorded under in last_successful.txt.
+
+        Cycle members are built twice, so each stage gets its own entry (name#s1,
+        name#s2). Recording only the name could not tell the two apart: --continue
+        rebuilt every finished stage 2 on each restart (all of a 22-member cycle,
+        rust included), and a stage-2 failure looked done because stage 1 had
+        already recorded the name.
+        """
+        stage = pkg.get('cycle_stage')
+        return f"{pkg['name']}#s{stage}" if stage else pkg['name']
+
+    @staticmethod
+    def _is_recorded(pkg, successful):
+        """True if this build entry finished in an earlier run."""
+        key = PackageBuilder._progress_key(pkg)
+        if key in successful:
+            return True
+        # Files written before keys were stage-aware hold plain names, which stage 1
+        # recorded. Trust them for stage 1 only; stage 2 is unknown, so rebuild it.
+        return pkg.get('cycle_stage') == 1 and pkg['name'] in successful
 
     def _find_last_successful_package(self, packages):
         """Find packages that haven't been built successfully yet"""
@@ -688,11 +711,11 @@ echo "CHECKDEPENDS_END"
             return None
         
         try:
-            # Read all successful package names
+            # Read all successful build entries
             successful = set(state_file.read_text().strip().split('\n'))
-            # Find first package not in successful set
+            # Find first entry not recorded as built
             for i, pkg in enumerate(packages):
-                if pkg['name'] not in successful:
+                if not self._is_recorded(pkg, successful):
                     return i - 1 if i > 0 else None
             # All packages were successful
             return len(packages) - 1
@@ -821,10 +844,11 @@ echo "CHECKDEPENDS_END"
         # Mark packages as QUEUED (skip already-built ones in --continue mode)
         already_built = set()
         if continue_build and Path("last_successful.txt").exists():
-            already_built = set(Path("last_successful.txt").read_text().strip().split('\n'))
+            _recorded = set(Path("last_successful.txt").read_text().strip().split('\n'))
+            already_built = {self._progress_key(p) for p in packages if self._is_recorded(p, _recorded)}
         dr = self._get_dynamo()
         if dr and not self.dry_run and not self.no_reporting:
-            self._build_ids = dr.mark_queued([p for p in packages if p['name'] not in already_built])
+            self._build_ids = dr.mark_queued([p for p in packages if self._progress_key(p) not in already_built])
         else:
             self._build_ids = {}
         
@@ -859,17 +883,16 @@ echo "CHECKDEPENDS_END"
         success_lock = threading.Lock()
         cycle_lock = threading.Lock()
         
-        # When continuing, populate cycle_stage_1_success with packages that were already built
-        if continue_build:
-            last_successful_index = self._find_last_successful_package(packages)
-            if last_successful_index is not None:
-                for pkg in packages[:last_successful_index + 1]:
-                    cycle_group = pkg.get('cycle_group')
-                    cycle_stage = pkg.get('cycle_stage')
-                    if cycle_group is not None and cycle_stage == 1:
-                        if cycle_group not in cycle_stage_1_success:
-                            cycle_stage_1_success[cycle_group] = set()
-                        cycle_stage_1_success[cycle_group].add(pkg['name'])
+        # When continuing, mark the cycle members whose stage 1 already finished, so
+        # their stage 2 is allowed to run. Taken from the recorded entries rather
+        # than a list prefix: with parallel builds the recorded set has gaps.
+        if continue_build and Path("last_successful.txt").exists():
+            _recorded = set(Path("last_successful.txt").read_text().strip().split('\n'))
+            for pkg in packages:
+                cycle_group = pkg.get('cycle_group')
+                if (cycle_group is not None and pkg.get('cycle_stage') == 1
+                        and self._is_recorded(pkg, _recorded)):
+                    cycle_stage_1_success.setdefault(cycle_group, set()).add(pkg['name'])
         
         # Build cycle info map for display
         cycle_info = {}
@@ -1384,14 +1407,15 @@ echo "CHECKDEPENDS_END"
         """Build a single package with proper cycle and dependency handling"""
         pkg_name = pkg['name']
         
-        # Skip if already built successfully (for --continue mode)
-        # Don't skip cycle stage 2 — must rebuild even if stage 1 succeeded
+        # Skip if this build entry (stage-aware for cycle members) already
+        # succeeded in an earlier run (for --continue mode)
         state_file = Path("last_successful.txt")
-        if state_file.exists() and pkg.get('cycle_stage') != 2:
+        if state_file.exists():
             try:
                 successful = set(state_file.read_text().strip().split('\n'))
-                if pkg_name in successful:
-                    print(f"\n[{i}/{total_packages}] Skipping {pkg_name} (already built successfully)")
+                if self._is_recorded(pkg, successful):
+                    _label = self._progress_key(pkg)
+                    print(f"\n[{i}/{total_packages}] Skipping {_label} (already built successfully)")
                     # Clean up QUEUED record since we're not building
                     dr = self._get_dynamo()
                     if dr and pkg_name in self._build_ids and not self.no_reporting:
